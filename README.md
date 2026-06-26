@@ -258,3 +258,23 @@ Naukri specific
 ├── vacancy_count
 └── work_from_home_type
 ```
+
+## Custom Job Search Script
+
+`linkedin_job_search.py` — Melbourne Embedded Systems job scraper tailored to Ian Chang's resume.
+
+### Setup & Run
+
+```bash
+# 1. Create virtual environment
+python3 -m venv .venv
+source .venv/bin/activate
+
+# 2. Install dependencies
+pip install pandas python-jobspy
+
+# 3. Run the search
+python linkedin_job_search.py
+```
+
+Your prompt should show `(.venv)` after `source`. To exit the venv later: `deactivate`.
