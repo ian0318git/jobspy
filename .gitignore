@@ -8,3 +8,7 @@
 *.pyc
 .env
 dist
+.venv/
+*.pdf
+kanban_jobs_*.json
+melbourne_embedded_jobs_*.csv
