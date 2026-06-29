@@ -313,6 +313,33 @@ pip install flask
 python job_board.py
 ```
 
+Open `http://192.168.44.128:5000` in Chrome.
+
+### ⚠️ Background Execution (Required for Auto-Scheduler)
+
+The auto-scheduler **only works while `job_board.py` is running**. If you close the terminal or Ctrl+C, scheduled searches will not fire.
+
+**Run persistently in background:**
+
+```bash
+source .venv/bin/activate
+nohup python job_board.py > job_board.log 2>&1 &
+```
+
+To check it's still running:
+
+```bash
+ps aux | grep job_board
+```
+
+To stop:
+
+```bash
+pkill -f job_board.py
+```
+
+Resource usage at idle: **~0.1% CPU, ~32 MB RAM** — negligible for any modern machine.
+
 ### Features
 
 | Feature | Description |

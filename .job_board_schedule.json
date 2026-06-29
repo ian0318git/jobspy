@@ -1,0 +1,12 @@
+{
+  "enabled": true,
+  "interval_hours": 12,
+  "last_run": null,
+  "next_run": "2026-06-29 22:00",
+  "mode": "times",
+  "times": [
+    "06:00",
+    "22:00"
+  ],
+  "last_run_date": null
+}
