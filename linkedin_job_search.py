@@ -85,8 +85,10 @@ HOURS_OLD = 168  # 7 days
 # ═══════════════════════════════════════════════════════════════════════════════
 # Output
 # ═══════════════════════════════════════════════════════════════════════════════
+OUTPUT_DIR = "search_results"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-OUTPUT_CSV = f"melbourne_embedded_jobs_{timestamp}.csv"
+OUTPUT_CSV = os.path.join(OUTPUT_DIR, f"melbourne_embedded_jobs_{timestamp}.csv")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ENGINE 1 — Semantic Depth Brain
@@ -796,7 +798,7 @@ def main():
     print(f"      ✅ Eligible (BVA-compatible):               {len(eligible)}")
 
     # ── Kanban JSON ──────────────────────────────────────────────────────────
-    kanban_file = f"kanban_jobs_{timestamp}.json"
+    kanban_file = os.path.join(OUTPUT_DIR, f"kanban_jobs_{timestamp}.json")
     kanban_entries = []
 
     for _, row in filtered.head(40).iterrows():
@@ -836,7 +838,7 @@ def main():
 
     # ── Also save blocked jobs to a separate file for reference ──────────────
     if len(blocked) > 0:
-        blocked_file = f"blocked_clearance_jobs_{timestamp}.json"
+        blocked_file = os.path.join(OUTPUT_DIR, f"blocked_clearance_jobs_{timestamp}.json")
         blocked_entries = []
         for _, row in blocked.iterrows():
             blocked_entries.append({
