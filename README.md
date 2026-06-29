@@ -263,6 +263,14 @@ Naukri specific
 
 `linkedin_job_search.py` — Melbourne Embedded Systems job scraper tailored to Ian Chang's resume.
 
+### 🧠 Three Intelligent Engines
+
+| Engine | What it does |
+|--------|-------------|
+| **Semantic Depth Brain** | 4-layer signal system (Silicon → Kernel → Hardware → Embedded) distinguishes hardcore embedded from generic IT/AI/cloud noise. Purity scoring filters out false matches. |
+| **IC / Lead Dual Track** | Classifies every job as Individual Contributor, Leadership, or Hybrid. Embraces both Senior/Principal/Staff IC and Manager/Director paths. |
+| **Security Clearance Red Line** | Detects NV1/NV2/Baseline/AGSVA clearance + citizenship/PR requirements. Auto-blocks unobtainable jobs (Bridging Visa A ≠ citizen/PR). |
+
 ### Setup & Run
 
 ```bash
@@ -278,3 +286,47 @@ python linkedin_job_search.py
 ```
 
 Your prompt should show `(.venv)` after `source`. To exit the venv later: `deactivate`.
+
+### Output
+
+All results go to `search_results/`:
+```
+search_results/
+├── kanban_jobs_20260629_0610.json           ← Kanban board data
+├── blocked_clearance_jobs_20260629_0610.json ← Blocked clearance jobs
+└── melbourne_embedded_jobs_20260629_0610.csv ← Full CSV export
+```
+
+Each run creates timestamped files — historical results are never overwritten.
+
+---
+
+## 📋 Kanban Job Board (Web UI)
+
+`job_board.py` — Flask web app at `http://192.168.44.128:5000`
+
+### Launch
+
+```bash
+source .venv/bin/activate
+pip install flask
+python job_board.py
+```
+
+### Features
+
+| Feature | Description |
+|--------|-------------|
+| 📂 **Historical Browser** | Dropdown to switch between past search results |
+| 💾 **Cross-File Status** | Applied/Interview/Offer status persists by job URL across search runs |
+| 🔍 **Re-Search** | One-click button triggers `linkedin_job_search.py` with live console output |
+| ⏰ **Auto-Scheduler** | Configurable daily times (e.g. 06:00 & 22:00) or interval (every N hours) |
+| 🏷️ **Smart Cards** | Color-coded by relevance tier, shows embedded depth, score, purity, career track |
+| 🔗 **Direct Links** | Each card links to the original LinkedIn/Indeed job posting |
+| 🔎 **Filtering** | Filter by tier, career track, source + keyword search |
+| 🚫 **Clearance Tags** | NV1/NV2/Baseline blocked jobs flagged with red badge |
+| 📥 **Status Management** | Five statuses: New → Applied → Interview → Offer → Rejected |
+
+### Status Persistence
+
+Job status is stored in `.job_statuses.json` keyed by job URL. When the same job appears in a future search, its previous status is automatically restored. Even if a job is delisted and disappears from new searches, switching back to an older search file preserves your tracking history.
