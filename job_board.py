@@ -7,14 +7,14 @@ Usage:
     pip install flask
     python job_board.py
 
-    Then open Chrome → http://localhost:3000
+    Then open Chrome → http://192.168.44.128:5000
 
-The board auto-loads the latest kanban_jobs_*.json and lets you:
-  - View jobs in a Kanban board (New → Applied → Interview → Offer → Rejected)
-  - Move cards between columns (status persists to JSON)
-  - Filter by relevance tier, career track, source, embedded depth
-  - Search by keyword
-  - See stats summary
+Features:
+  - Full-width job cards with compact status controls
+  - Status filter tabs (New / Applied / Interview / Offer / Rejected)
+  - Relevance-tier color coding, embedded depth badges
+  - Filter by tier, career track, source + keyword search
+  - One-click status updates, auto-persist to JSON
 """
 
 import json
@@ -22,7 +22,7 @@ import glob
 import os
 from datetime import datetime
 
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, jsonify, request
 
 # ── Config ───────────────────────────────────────────────────────────────────
 PORT = 5000
@@ -31,38 +31,30 @@ os.chdir(SCRIPT_DIR)
 
 app = Flask(__name__)
 
-# ── Kanban column definitions ────────────────────────────────────────────────
-KANBAN_COLUMNS = [
-    {"id": "New",         "emoji": "📥", "label": "New",          "color": "#6366f1"},
-    {"id": "Applied",     "emoji": "📝", "label": "Applied",      "color": "#f59e0b"},
-    {"id": "Interview",   "emoji": "📞", "label": "Interview",    "color": "#8b5cf6"},
-    {"id": "Offer",       "emoji": "🎉", "label": "Offer",        "color": "#10b981"},
-    {"id": "Rejected",    "emoji": "❌", "label": "Rejected",     "color": "#6b7280"},
+# ── Status definitions ───────────────────────────────────────────────────────
+STATUSES = [
+    {"id": "New",       "emoji": "📥", "label": "New"},
+    {"id": "Applied",   "emoji": "📝", "label": "Applied"},
+    {"id": "Interview", "emoji": "📞", "label": "Interview"},
+    {"id": "Offer",     "emoji": "🎉", "label": "Offer"},
+    {"id": "Rejected",  "emoji": "❌", "label": "Rejected"},
 ]
 
-# Relevance tier colors
+# Relevance tier colors (HSL-friendly for dark theme)
 TIER_COLORS = {
-    "🔥🔥 Bare-Metal Gold":  "#fbbf24",
-    "🔥 Strong Match":       "#f97316",
-    "✅ Good Match":         "#22c55e",
-    "⚠️ Possible Match":     "#eab308",
-    "🤔 Weak Signal":        "#9ca3af",
-    "❌ IT Noise / Irrelevant": "#6b7280",
+    "🔥🔥 Bare-Metal Gold":      "#fbbf24",
+    "🔥 Strong Match":           "#f97316",
+    "✅ Good Match":             "#22c55e",
+    "⚠️ Possible Match":         "#eab308",
+    "🤔 Weak Signal":            "#9ca3af",
+    "❌ IT Noise / Irrelevant":  "#6b7280",
 }
 
-TIER_ORDER = [
-    "🔥🔥 Bare-Metal Gold",
-    "🔥 Strong Match",
-    "✅ Good Match",
-    "⚠️ Possible Match",
-    "🤔 Weak Signal",
-    "❌ IT Noise / Irrelevant",
-]
+TIER_ORDER = list(TIER_COLORS.keys())
 
 # ── Data loading ─────────────────────────────────────────────────────────────
 
 def find_latest_kanban():
-    """Find the most recent kanban JSON file."""
     files = glob.glob(os.path.join(SCRIPT_DIR, "kanban_jobs_*.json"))
     if not files:
         return None
@@ -70,13 +62,11 @@ def find_latest_kanban():
 
 
 def load_jobs():
-    """Load jobs from the latest kanban JSON."""
     path = find_latest_kanban()
     if not path:
         return [], None
     with open(path, "r", encoding="utf-8") as f:
         jobs = json.load(f)
-    # Ensure every job has the fields we need
     for j in jobs:
         j.setdefault("status", "New")
         j.setdefault("notes", "")
@@ -84,29 +74,25 @@ def load_jobs():
 
 
 def save_jobs(jobs, filename):
-    """Persist jobs back to JSON."""
     path = os.path.join(SCRIPT_DIR, filename)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(jobs, f, indent=2, ensure_ascii=False)
 
 
-# In-memory state (loaded at startup)
 JOBS, DATA_FILE = load_jobs()
 
 # ── Routes ───────────────────────────────────────────────────────────────────
 
 @app.route("/")
 def index():
-    """Serve the main Kanban board."""
     return _HTML
 
 
 @app.route("/api/jobs")
 def api_jobs():
-    """Return all jobs as JSON."""
     return jsonify({
         "data_file": DATA_FILE,
-        "columns": KANBAN_COLUMNS,
+        "statuses": STATUSES,
         "tier_order": TIER_ORDER,
         "tier_colors": TIER_COLORS,
         "jobs": JOBS,
@@ -116,34 +102,26 @@ def api_jobs():
 
 @app.route("/api/jobs/<int:job_index>", methods=["PATCH"])
 def api_update_job(job_index):
-    """Update a job's status or notes."""
     if job_index < 0 or job_index >= len(JOBS):
         return jsonify({"error": "Invalid job index"}), 404
-
     data = request.get_json()
     if "status" in data:
         JOBS[job_index]["status"] = data["status"]
     if "notes" in data:
         JOBS[job_index]["notes"] = data["notes"]
-
     save_jobs(JOBS, DATA_FILE)
     return jsonify({"ok": True, "job": JOBS[job_index]})
 
 
 @app.route("/api/reload")
 def api_reload():
-    """Reload jobs from the latest kanban JSON file."""
     global JOBS, DATA_FILE
     JOBS, DATA_FILE = load_jobs()
     return jsonify({"ok": True, "data_file": DATA_FILE, "count": len(JOBS)})
 
 
 def compute_stats():
-    """Compute summary stats for the dashboard."""
-    tiers = {}
-    tracks = {}
-    sources = {}
-    columns = {}
+    tiers, tracks, sources, columns = {}, {}, {}, {}
     for j in JOBS:
         t = j.get("relevance", "Unknown")
         tiers[t] = tiers.get(t, 0) + 1
@@ -163,7 +141,7 @@ def compute_stats():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# HTML / CSS / JS (single-page app)
+# HTML / CSS / JS
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _HTML = r"""<!DOCTYPE html>
@@ -173,148 +151,163 @@ _HTML = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>🔍 Ian's Embedded Job Board</title>
 <style>
-/* ── Reset & Base ─────────────────────────────────────────────────────── */
-*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-body {
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-  background: #0f172a; color: #e2e8f0; min-height: 100vh;
+/* ── Reset ─────────────────────────────────────────────────────────────── */
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+               'Helvetica Neue', Arial, sans-serif;
+  background:#0f172a; color:#e2e8f0; min-height:100vh;
+  font-size:16px; line-height:1.5;
 }
 
-/* ── Header ───────────────────────────────────────────────────────────── */
-.header {
-  background: #1e293b; border-bottom: 2px solid #334155;
-  padding: 12px 24px; display: flex; align-items: center; justify-content: space-between;
-  position: sticky; top: 0; z-index: 100;
+/* ── Header ────────────────────────────────────────────────────────────── */
+.header{
+  background:#1e293b; border-bottom:2px solid #334155;
+  padding:14px 28px; display:flex; align-items:center; justify-content:space-between;
+  position:sticky; top:0; z-index:100; gap:16px; flex-wrap:wrap;
 }
-.header h1 { font-size: 1.25rem; font-weight: 700; display: flex; align-items: center; gap: 8px; }
-.header .meta { font-size: 0.8rem; color: #94a3b8; }
-.header .meta code { color: #fbbf24; font-size: 0.75rem; }
-.header .actions { display: flex; gap: 8px; }
-.header button {
-  background: #334155; color: #e2e8f0; border: 1px solid #475569;
-  padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 0.8rem;
-  transition: background 0.15s;
+.header h1{font-size:1.3rem; font-weight:700;}
+.header .meta{font-size:0.85rem; color:#94a3b8;}
+.header .meta code{color:#fbbf24; font-size:0.8rem;}
+.header button{
+  background:#334155; color:#e2e8f0; border:1px solid #475569;
+  padding:7px 18px; border-radius:8px; cursor:pointer; font-size:0.85rem;
+  transition:background .15s; white-space:nowrap;
 }
-.header button:hover { background: #475569; }
+.header button:hover{background:#475569;}
 
-/* ── Stats Bar ─────────────────────────────────────────────────────────── */
-.stats-bar {
-  display: flex; gap: 16px; padding: 10px 24px;
-  background: #1a2332; border-bottom: 1px solid #334155;
-  overflow-x: auto; flex-wrap: wrap; font-size: 0.8rem;
+/* ── Filters bar ────────────────────────────────────────────────────────── */
+.toolbar{
+  display:flex; gap:12px; padding:12px 28px;
+  background:#1a2332; border-bottom:1px solid #334155;
+  flex-wrap:wrap; align-items:center;
 }
-.stat { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
-.stat .dot { width: 10px; height: 10px; border-radius: 50%; }
-.stat strong { color: #f1f5f9; }
+.toolbar label{font-size:0.8rem; color:#94a3b8; white-space:nowrap;}
+.toolbar select, .toolbar input{
+  background:#0f172a; color:#e2e8f0; border:1px solid #475569;
+  padding:7px 12px; border-radius:8px; font-size:0.85rem;
+}
+.toolbar input{flex:1; min-width:200px; max-width:340px;}
+.toolbar select{cursor:pointer;}
+.toolbar .count{font-size:0.8rem; color:#64748b; margin-left:auto;}
 
-/* ── Filters ───────────────────────────────────────────────────────────── */
-.filters {
-  display: flex; gap: 10px; padding: 10px 24px;
-  background: #1a2332; border-bottom: 1px solid #334155;
-  flex-wrap: wrap; align-items: center;
+/* ── Status tabs ────────────────────────────────────────────────────────── */
+.status-tabs{
+  display:flex; gap:6px; padding:12px 28px;
+  background:#1a2332; border-bottom:1px solid #334155;
+  flex-wrap:wrap;
 }
-.filters select, .filters input {
-  background: #0f172a; color: #e2e8f0; border: 1px solid #475569;
-  padding: 6px 10px; border-radius: 6px; font-size: 0.8rem;
+.status-tab{
+  padding:8px 18px; border-radius:20px; border:1px solid #475569;
+  background:#0f172a; color:#94a3b8; cursor:pointer; font-size:0.85rem;
+  transition:all .15s; white-space:nowrap; font-weight:500;
 }
-.filters input { flex: 1; min-width: 180px; max-width: 300px; }
-.filters select { cursor: pointer; }
-.filters label { font-size: 0.75rem; color: #94a3b8; }
-
-/* ── Kanban Board ──────────────────────────────────────────────────────── */
-.board {
-  display: flex; gap: 12px; padding: 16px 24px;
-  overflow-x: auto; min-height: calc(100vh - 170px);
-}
-.column {
-  flex: 1; min-width: 280px; max-width: 380px;
-  background: #1e293b; border-radius: 10px;
-  display: flex; flex-direction: column;
-}
-.column-header {
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 12px 14px; border-bottom: 2px solid var(--col);
-  font-weight: 600; font-size: 0.85rem;
-  position: sticky; top: 0; background: #1e293b; border-radius: 10px 10px 0 0;
-}
-.column-count {
-  background: #334155; color: #94a3b8; font-size: 0.7rem;
-  padding: 2px 8px; border-radius: 10px; font-weight: 500;
-}
-.column-body {
-  flex: 1; padding: 8px; overflow-y: auto; min-height: 200px;
-  display: flex; flex-direction: column; gap: 8px;
+.status-tab:hover{background:#1e293b; color:#e2e8f0;}
+.status-tab.active{background:#6366f1; border-color:#6366f1; color:#fff;}
+.status-tab .badge{
+  display:inline-block; background:#00000030; color:inherit;
+  padding:1px 9px; border-radius:10px; font-size:0.75rem; margin-left:4px;
 }
 
-/* ── Job Card ──────────────────────────────────────────────────────────── */
-.card {
-  background: #0f172a; border: 1px solid #334155; border-radius: 8px;
-  padding: 12px; cursor: pointer; transition: all 0.15s;
-  position: relative;
+/* ── Stats bar ──────────────────────────────────────────────────────────── */
+.stats-bar{
+  display:flex; gap:18px; padding:10px 28px;
+  background:#151d2a; border-bottom:1px solid #1e293b;
+  flex-wrap:wrap; font-size:0.8rem; color:#94a3b8;
 }
-.card:hover { border-color: #6366f1; box-shadow: 0 0 0 1px #6366f140; }
-.card .relevance-badge {
-  display: inline-block; font-size: 0.65rem; font-weight: 700;
-  padding: 2px 7px; border-radius: 4px; margin-bottom: 6px;
-}
-.card .title {
-  font-size: 0.85rem; font-weight: 600; color: #f1f5f9;
-  margin-bottom: 4px; line-height: 1.3;
-}
-.card .company {
-  font-size: 0.78rem; color: #94a3b8; margin-bottom: 2px;
-}
-.card .meta-row {
-  display: flex; gap: 8px; flex-wrap: wrap; margin-top: 6px;
-  font-size: 0.68rem; color: #64748b;
-}
-.card .meta-row span {
-  background: #1e293b; padding: 1px 6px; border-radius: 4px;
-  white-space: nowrap;
-}
-.card .tags {
-  display: flex; gap: 4px; flex-wrap: wrap; margin-top: 6px;
-}
-.card .tag {
-  font-size: 0.6rem; padding: 1px 5px; border-radius: 3px;
-  background: #1e3a5f; color: #93c5fd; white-space: nowrap;
-}
-.card .tag.track-ic { background: #064e3b; color: #6ee7b7; }
-.card .tag.track-lead { background: #4a1d96; color: #c4b5fd; }
-.card .tag.track-hybrid { background: #1e3a5f; color: #93c5fd; }
-.card .tag.source-linkedin { background: #1e3a5f; color: #93c5fd; }
-.card .tag.source-indeed { background: #3b1f1f; color: #fca5a5; }
-.card .tag.source-google { background: #1e2a1e; color: #86efac; }
-.card .tag.clearance-blocked { background: #4a1d1d; color: #fca5a5; }
-.card .tag.clearance-ok { background: #064e3b; color: #6ee7b7; }
+.stats-bar strong{color:#e2e8f0;}
 
-.card .move-btns {
-  display: flex; gap: 4px; margin-top: 8px; flex-wrap: wrap;
+/* ── Card list ──────────────────────────────────────────────────────────── */
+.card-list{
+  padding:16px 28px; display:flex; flex-direction:column; gap:14px;
 }
-.card .move-btns button {
-  font-size: 0.6rem; padding: 3px 8px; border-radius: 4px;
-  border: 1px solid #475569; background: #1e293b; color: #94a3b8;
-  cursor: pointer; transition: all 0.15s;
+.card{
+  background:#1e293b; border:1px solid #334155; border-radius:12px;
+  padding:18px 22px; transition:border-color .15s;
+  display:flex; flex-direction:column; gap:10px;
 }
-.card .move-btns button:hover { background: #334155; color: #e2e8f0; }
-.card .move-btns button.active { background: #6366f1; border-color: #6366f1; color: #fff; }
+.card:hover{border-color:#6366f1;}
+.card.highlight{border-left:4px solid var(--tier-color,#6366f1);}
 
-.card .url-link {
-  font-size: 0.65rem; color: #6366f1; text-decoration: none;
-  display: inline-block; margin-top: 6px;
+/* Row 1: tier badge + title + company */
+.card .row1{display:flex; align-items:baseline; gap:12px; flex-wrap:wrap;}
+.card .tier-badge{
+  font-size:0.75rem; font-weight:700; padding:3px 10px; border-radius:5px;
+  white-space:nowrap; flex-shrink:0;
 }
-.card .url-link:hover { text-decoration: underline; }
-
-/* ── Empty state ───────────────────────────────────────────────────────── */
-.empty-state {
-  text-align: center; padding: 40px 20px; color: #475569;
+.card .job-title{
+  font-size:1.1rem; font-weight:600; color:#f1f5f9;
 }
-.empty-state .emoji { font-size: 3rem; margin-bottom: 8px; }
+.card .company-name{
+  font-size:0.9rem; color:#94a3b8; white-space:nowrap;
+}
 
-/* ── Responsive ────────────────────────────────────────────────────────── */
-@media (max-width: 900px) {
-  .board { flex-direction: column; }
-  .column { max-width: 100%; }
+/* Row 2: meta info */
+.card .row2{
+  display:flex; gap:16px; flex-wrap:wrap; font-size:0.85rem; color:#94a3b8;
+}
+.card .row2 span{display:flex; align-items:center; gap:4px;}
+
+/* Row 3: tags */
+.card .row3{
+  display:flex; gap:6px; flex-wrap:wrap; align-items:center;
+}
+.card .tag{
+  font-size:0.72rem; padding:3px 9px; border-radius:4px; white-space:nowrap;
+  font-weight:500;
+}
+.tag-tier{background:#1e3a5f; color:#93c5fd;}
+.tag-score{background:#3b1f1f; color:#fca5a5;}
+.tag-purity{background:#1e2a1e; color:#86efac;}
+.tag-track-ic{background:#064e3b; color:#6ee7b7;}
+.tag-track-lead{background:#4a1d96; color:#c4b5fd;}
+.tag-track-hybrid{background:#1e3a5f; color:#93c5fd;}
+.tag-source{background:#1e293b; color:#94a3b8; border:1px solid #334155;}
+.tag-clearance-ok{background:#064e3b; color:#6ee7b7;}
+.tag-clearance-blocked{background:#4a1d1d; color:#fca5a5;}
+.tag-kw{background:#1e293b; color:#cbd5e1; border:1px solid #334155;}
+
+/* Row 4: actions */
+.card .row4{
+  display:flex; gap:8px; flex-wrap:wrap; align-items:center;
+  justify-content:space-between;
+}
+.card .row4 .left{display:flex; gap:8px; align-items:center;}
+.card .url-btn{
+  display:inline-flex; align-items:center; gap:4px;
+  color:#818cf8; text-decoration:none; font-size:0.85rem; font-weight:500;
+  padding:6px 12px; border-radius:6px; border:1px solid #818cf840;
+  transition:background .15s;
+}
+.card .url-btn:hover{background:#818cf815;}
+
+.card .status-btns{display:flex; gap:5px; flex-wrap:wrap;}
+.card .status-btn{
+  font-size:0.75rem; padding:6px 14px; border-radius:6px;
+  border:1px solid #475569; background:#0f172a; color:#94a3b8;
+  cursor:pointer; transition:all .15s; font-weight:500;
+}
+.card .status-btn:hover{background:#334155; color:#e2e8f0; border-color:#6366f1;}
+.card .status-btn.current{
+  background:var(--btn-color,#6366f1); border-color:var(--btn-color,#6366f1);
+  color:#fff; cursor:default;
+}
+.card .current-status{
+  font-size:0.75rem; padding:6px 14px; border-radius:6px;
+  font-weight:600; white-space:nowrap;
+}
+
+/* ── Empty state ────────────────────────────────────────────────────────── */
+.empty-state{
+  text-align:center; padding:60px 20px; color:#475569;
+}
+.empty-state .emoji{font-size:3rem; margin-bottom:12px;}
+
+/* ── Responsive ─────────────────────────────────────────────────────────── */
+@media(max-width:700px){
+  .header,.toolbar,.status-tabs,.stats-bar,.card-list{padding-left:14px;padding-right:14px;}
+  .card{padding:14px 16px;}
+  .card .job-title{font-size:1rem;}
 }
 </style>
 </head>
@@ -323,276 +316,209 @@ body {
 <div class="header">
   <div>
     <h1>🔍 Ian's Embedded Job Board</h1>
-    <div class="meta">Data: <code id="data-file">—</code> · <span id="job-count">—</span></div>
+    <div class="meta">📁 <code id="data-file">—</code> &nbsp;·&nbsp; <span id="job-count">—</span></div>
   </div>
-  <div class="actions">
-    <button onclick="reloadData()" title="Reload from latest JSON">🔄 Reload</button>
-  </div>
+  <button onclick="reloadData()">🔄 Reload</button>
 </div>
+
+<div class="toolbar">
+  <label>Filter:</label>
+  <select id="filter-tier" onchange="renderAll()"><option value="">All Tiers</option></select>
+  <select id="filter-track" onchange="renderAll()"><option value="">All Tracks</option></select>
+  <select id="filter-source" onchange="renderAll()"><option value="">All Sources</option></select>
+  <input type="text" id="filter-search" placeholder="🔍 Search title, company, keywords..." oninput="renderAll()">
+  <span class="count" id="filter-count"></span>
+</div>
+
+<div class="status-tabs" id="status-tabs"></div>
 
 <div class="stats-bar" id="stats-bar"></div>
 
-<div class="filters">
-  <label>Filter:</label>
-  <select id="filter-tier" onchange="renderBoard()">
-    <option value="">All Tiers</option>
-  </select>
-  <select id="filter-track" onchange="renderBoard()">
-    <option value="">All Tracks</option>
-  </select>
-  <select id="filter-source" onchange="renderBoard()">
-    <option value="">All Sources</option>
-  </select>
-  <input type="text" id="filter-search" placeholder="🔍 Search title, company, keywords..."
-         oninput="renderBoard()">
-  <span style="font-size:0.7rem;color:#64748b;" id="filter-count"></span>
-</div>
-
-<div class="board" id="board"></div>
+<div class="card-list" id="card-list"></div>
 
 <script>
 // ═══════════════════════════════════════════════════════════════════════════
 // State
 // ═══════════════════════════════════════════════════════════════════════════
-let JOBS = [];
-let DATA_FILE = '';
-let COLUMNS = [];
-let TIER_COLORS = {};
-let TIER_ORDER = [];
+let JOBS=[], DATA_FILE='', STATUSES=[], TIER_COLORS={}, TIER_ORDER=[];
+let activeStatus='All';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Init
 // ═══════════════════════════════════════════════════════════════════════════
-async function loadData() {
-  const res = await fetch('/api/jobs');
-  const data = await res.json();
-  JOBS = data.jobs;
-  DATA_FILE = data.data_file;
-  COLUMNS = data.columns;
-  TIER_COLORS = data.tier_colors;
-  TIER_ORDER = data.tier_order;
-
-  document.getElementById('data-file').textContent = DATA_FILE;
-  document.getElementById('job-count').textContent = `${JOBS.length} jobs`;
+async function loadData(){
+  const r=await fetch('/api/jobs'), d=await r.json();
+  JOBS=d.jobs; DATA_FILE=d.data_file; STATUSES=d.statuses;
+  TIER_COLORS=d.tier_colors; TIER_ORDER=d.tier_order;
+  document.getElementById('data-file').textContent=DATA_FILE;
+  document.getElementById('job-count').textContent=JOBS.length+' jobs';
   populateFilters();
-  renderStats(data.stats);
-  renderBoard();
+  renderAll();
 }
 
-function populateFilters() {
-  // Build tier filter options
-  const tierSel = document.getElementById('filter-tier');
-  tierSel.innerHTML = '<option value="">All Tiers</option>';
-  const tiers = [...new Set(JOBS.map(j => j.relevance))];
-  tiers.sort((a,b) => TIER_ORDER.indexOf(a) - TIER_ORDER.indexOf(b));
-  tiers.forEach(t => { const o = document.createElement('option'); o.value=t; o.textContent=t; tierSel.appendChild(o); });
-
-  // Track filter
-  const trackSel = document.getElementById('filter-track');
-  trackSel.innerHTML = '<option value="">All Tracks</option>';
-  const tracks = [...new Set(JOBS.map(j => j.career_track))].sort();
-  tracks.forEach(t => { const o = document.createElement('option'); o.value=t; o.textContent=t; trackSel.appendChild(o); });
-
-  // Source filter
-  const srcSel = document.getElementById('filter-source');
-  srcSel.innerHTML = '<option value="">All Sources</option>';
-  const sources = [...new Set(JOBS.map(j => j.source))].sort();
-  sources.forEach(s => { const o = document.createElement('option'); o.value=s; o.textContent=s; srcSel.appendChild(o); });
+function populateFilters(){
+  const byId=id=>document.getElementById(id);
+  [{sel:'filter-tier',vals:TIER_ORDER},
+   {sel:'filter-track',vals:[...new Set(JOBS.map(j=>j.career_track))].sort()},
+   {sel:'filter-source',vals:[...new Set(JOBS.map(j=>j.source))].sort()}
+  ].forEach(({sel,vals})=>{
+    const el=byId(sel), cur=el.value;
+    el.innerHTML='<option value="">'+({['filter-tier']:'All Tiers',['filter-track']:'All Tracks',['filter-source']:'All Sources'}[sel])+'</option>';
+    vals.filter(Boolean).forEach(v=>{const o=document.createElement('option');o.value=v;o.textContent=v;el.appendChild(o);});
+    el.value=cur;
+  });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Stats
+// Filtering
 // ═══════════════════════════════════════════════════════════════════════════
-function renderStats(stats) {
-  const bar = document.getElementById('stats-bar');
-  let html = `<div class="stat"><strong>Total:</strong> ${stats.total}</div>`;
-  for (const [col, count] of Object.entries(stats.by_column || {})) {
-    html += `<div class="stat"><strong>${col}:</strong> ${count}</div>`;
-  }
-  bar.innerHTML = html;
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Board Rendering
-// ═══════════════════════════════════════════════════════════════════════════
-function getFilteredJobs() {
-  const tier = document.getElementById('filter-tier').value;
-  const track = document.getElementById('filter-track').value;
-  const source = document.getElementById('filter-source').value;
-  const search = document.getElementById('filter-search').value.toLowerCase();
-
-  return JOBS.filter(j => {
-    if (tier && j.relevance !== tier) return false;
-    if (track && j.career_track !== track) return false;
-    if (source && j.source !== source) return false;
-    if (search) {
-      const haystack = `${j.title} ${j.company} ${j.matched_on} ${j.track_detail} ${j.notes}`.toLowerCase();
-      if (!haystack.includes(search)) return false;
+function getFiltered(){
+  const tier=document.getElementById('filter-tier').value,
+        track=document.getElementById('filter-track').value,
+        source=document.getElementById('filter-source').value,
+        search=document.getElementById('filter-search').value.toLowerCase();
+  return JOBS.filter(j=>{
+    if(tier && j.relevance!==tier) return false;
+    if(track && j.career_track!==track) return false;
+    if(source && j.source!==source) return false;
+    if(activeStatus!=='All' && (j.status||'New')!==activeStatus) return false;
+    if(search){
+      const h=`${j.title} ${j.company} ${j.matched_on} ${j.track_detail} ${j.notes}`.toLowerCase();
+      if(!h.includes(search)) return false;
     }
     return true;
   });
 }
 
-function renderBoard() {
-  const board = document.getElementById('board');
-  const filtered = getFilteredJobs();
-  document.getElementById('filter-count').textContent = `Showing ${filtered.length} of ${JOBS.length}`;
-
-  let html = '';
-  for (const col of COLUMNS) {
-    const colJobs = filtered.filter(j => (j.status || 'New') === col.id);
-    html += `<div class="column" style="--col:${col.color}">`;
-    html += `<div class="column-header" style="border-color:${col.color}">`;
-    html += `<span>${col.emoji} ${col.label}</span>`;
-    html += `<span class="column-count">${colJobs.length}</span>`;
-    html += `</div>`;
-    html += `<div class="column-body" data-status="${col.id}"`;
-    html += ` ondragover="handleDragOver(event)" ondrop="handleDrop(event, '${col.id}')">`;
-    if (colJobs.length === 0) {
-      html += `<div class="empty-state"><div class="emoji">${col.emoji}</div>No jobs</div>`;
-    }
-    for (const [idx, job] of colJobs.entries()) {
-      const globalIdx = JOBS.indexOf(job);
-      html += renderCard(job, globalIdx);
-    }
-    html += `</div></div>`;
-  }
-  board.innerHTML = html;
+// ═══════════════════════════════════════════════════════════════════════════
+// Render
+// ═══════════════════════════════════════════════════════════════════════════
+function renderAll(){
+  renderStatusTabs();
+  renderStats();
+  renderCards();
 }
 
-function renderCard(job, idx) {
-  const tierColor = TIER_COLORS[job.relevance] || '#6b7280';
-  const purityPct = job.purity != null ? Math.round(job.purity * 100) + '%' : '';
+function renderStatusTabs(){
+  const bar=document.getElementById('status-tabs');
+  let counts={};
+  JOBS.forEach(j=>{const s=j.status||'New'; counts[s]=(counts[s]||0)+1;});
+  const total=JOBS.length;
+  let html=`<div class="status-tab${activeStatus==='All'?' active':''}" onclick="setStatusFilter('All')">📋 All<span class="badge">${total}</span></div>`;
+  STATUSES.forEach(st=>{
+    const c=counts[st.id]||0;
+    html+=`<div class="status-tab${activeStatus===st.id?' active':''}" onclick="setStatusFilter('${st.id}')">${st.emoji} ${st.label}<span class="badge">${c}</span></div>`;
+  });
+  bar.innerHTML=html;
+}
 
-  // Build tags
-  let tagsHtml = '';
-  if (job.embedded_tier) {
-    tagsHtml += `<span class="tag">🏷 ${job.embedded_tier}</span>`;
-  }
-  if (job.score) {
-    tagsHtml += `<span class="tag">⭐ ${job.score}</span>`;
-  }
-  if (purityPct) {
-    tagsHtml += `<span class="tag">🧪 ${purityPct}</span>`;
-  }
-  // Career track tag
-  const trackClass = job.career_track && job.career_track.includes('Lead') ? 'track-lead'
-    : job.career_track && job.career_track.includes('Hybrid') ? 'track-hybrid' : 'track-ic';
-  if (job.career_track) {
-    tagsHtml += `<span class="tag ${trackClass}">${job.career_track}</span>`;
-  }
-  // Source tag
-  const srcClass = 'source-' + (job.source || 'unknown');
-  tagsHtml += `<span class="tag ${srcClass}">📎 ${job.source}</span>`;
-  // Clearance tag
-  if (job.clearance_status) {
-    const blocked = job.clearance_status.includes('BLOCKED');
-    tagsHtml += `<span class="tag ${blocked ? 'clearance-blocked' : 'clearance-ok'}">${job.clearance_status}</span>`;
-  }
+function setStatusFilter(s){
+  activeStatus=s; renderAll();
+}
 
-  // Matched keywords
-  if (job.matched_on) {
-    const kws = job.matched_on.split(', ').slice(0, 4);
-    tagsHtml += kws.map(k => `<span class="tag">#${k}</span>`).join('');
-  }
+function renderStats(){
+  const bar=document.getElementById('stats-bar');
+  const filtered=getFiltered();
+  let cols={}; filtered.forEach(j=>{const s=j.status||'New'; cols[s]=(cols[s]||0)+1;});
+  bar.innerHTML=`Showing <strong>${filtered.length}</strong> of <strong>${JOBS.length}</strong> jobs`+
+    STATUSES.map(st=>` &nbsp;·&nbsp; ${st.emoji} <strong>${cols[st.id]||0}</strong> ${st.label}`).join('');
+}
 
-  // Move buttons (all columns except current)
-  let moveBtns = '';
-  for (const col of COLUMNS) {
-    if (col.id === (job.status || 'New')) continue;
-    moveBtns += `<button onclick="moveJob(${idx}, '${col.id}')" title="Move to ${col.label}">${col.emoji} ${col.label}</button>`;
+function renderCards(){
+  const list=document.getElementById('card-list');
+  const filtered=getFiltered();
+  document.getElementById('filter-count').textContent=`${filtered.length} of ${JOBS.length}`;
+
+  if(!filtered.length){
+    list.innerHTML=`<div class="empty-state"><div class="emoji">📭</div><p>No jobs match the current filters</p></div>`;
+    return;
   }
 
-  return `
-    <div class="card" draggable="true" data-job-idx="${idx}"
-         ondragstart="handleDragStart(event, ${idx})" ondragend="handleDragEnd(event)">
-      <div class="relevance-badge" style="background:${tierColor}20;color:${tierColor};border:1px solid ${tierColor}40;">
-        ${job.relevance || 'Unknown'}
+  let html='';
+  filtered.forEach(j=>{
+    const idx=JOBS.indexOf(j);
+    const tierColor=TIER_COLORS[j.relevance]||'#6b7280';
+    const status=j.status||'New';
+    const purityPct=j.purity!=null?Math.round(j.purity*100)+'%':'';
+    const trackClass=j.career_track&&j.career_track.includes('Lead')?'tag-track-lead'
+                   :j.career_track&&j.career_track.includes('Hybrid')?'tag-track-hybrid':'tag-track-ic';
+    const blocked=j.clearance_status&&j.clearance_status.includes('BLOCKED');
+
+    // Status buttons (show all except current)
+    let statusBtns='';
+    STATUSES.forEach(st=>{
+      if(st.id===status){
+        statusBtns+=`<span class="current-status" style="background:var(--btn-color,#6366f1);color:#fff;">${st.emoji} ${st.label}</span>`;
+      }else{
+        statusBtns+=`<button class="status-btn" style="--btn-color:${st.id==='New'?'#6366f1':st.id==='Applied'?'#f59e0b':st.id==='Interview'?'#8b5cf6':st.id==='Offer'?'#10b981':'#6b7280'}" onclick="moveJob(${idx},'${st.id}')">${st.emoji} ${st.label}</button>`;
+      }
+    });
+
+    // Keyword tags (first 5)
+    let kwTags='';
+    if(j.matched_on){
+      j.matched_on.split(', ').slice(0,5).forEach(k=>{kwTags+=`<span class="tag tag-kw">#${escHtml(k)}</span>`;});
+    }
+
+    html+=`
+    <div class="card highlight" style="--tier-color:${tierColor}">
+      <div class="row1">
+        <span class="tier-badge" style="background:${tierColor}20;color:${tierColor};border:1px solid ${tierColor}40">${escHtml(j.relevance||'?')}</span>
+        <span class="job-title">${escHtml(j.title)}</span>
+        <span class="company-name">🏢 ${escHtml(j.company)}</span>
       </div>
-      <div class="title">${escHtml(job.title)}</div>
-      <div class="company">🏢 ${escHtml(job.company)}</div>
-      <div class="meta-row">
-        <span>📍 ${escHtml(job.location)}</span>
-        <span>📅 ${job.date_posted || '?'}</span>
+      <div class="row2">
+        <span>📍 ${escHtml(j.location)}</span>
+        <span>📅 ${j.date_posted||'?'}</span>
+        <span>📎 ${escHtml(j.source||'?')}</span>
+        ${j.clearance_status?`<span class="${blocked?'tag-clearance-blocked':'tag-clearance-ok'}" style="font-size:0.75rem;padding:2px 8px;border-radius:4px;">${escHtml(j.clearance_status)}</span>`:''}
       </div>
-      <div class="tags">${tagsHtml}</div>
-      <a class="url-link" href="${escHtml(job.url)}" target="_blank" rel="noopener"
-         onclick="event.stopPropagation()">🔗 View Job →</a>
-      <div class="move-btns">${moveBtns}</div>
+      <div class="row3">
+        ${j.embedded_tier?`<span class="tag tag-tier">🏷 ${escHtml(j.embedded_tier)}</span>`:''}
+        ${j.score?`<span class="tag tag-score">⭐ ${j.score}</span>`:''}
+        ${purityPct?`<span class="tag tag-purity">🧪 ${purityPct}</span>`:''}
+        ${j.career_track?`<span class="tag ${trackClass}">${escHtml(j.career_track)}</span>`:''}
+        ${j.track_detail?`<span class="tag tag-tier">${escHtml(j.track_detail)}</span>`:''}
+        ${kwTags}
+        ${j.matched_on&&j.matched_on.split(', ').length>5?`<span class="tag tag-kw">+${j.matched_on.split(', ').length-5} more</span>`:''}
+      </div>
+      <div class="row4">
+        <div class="left">
+          <a class="url-btn" href="${escHtml(j.url)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">🔗 View on ${escHtml(j.source||'site')} →</a>
+          ${j.noise_warning?`<span style="font-size:0.7rem;color:#f87171;">⚠️ Noise: ${escHtml(j.noise_warning)}</span>`:''}
+        </div>
+        <div class="status-btns">${statusBtns}</div>
+      </div>
     </div>`;
+  });
+  list.innerHTML=html;
 }
 
-function escHtml(s) {
-  if (!s) return '';
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Drag & Drop
-// ═══════════════════════════════════════════════════════════════════════════
-let dragIdx = null;
-
-function handleDragStart(e, idx) {
-  dragIdx = idx;
-  e.dataTransfer.effectAllowed = 'move';
-  e.target.style.opacity = '0.5';
-}
-
-function handleDragEnd(e) {
-  e.target.style.opacity = '1';
-  dragIdx = null;
-}
-
-function handleDragOver(e) {
-  e.preventDefault();
-  e.dataTransfer.dropEffect = 'move';
-}
-
-function handleDrop(e, status) {
-  e.preventDefault();
-  if (dragIdx != null) {
-    moveJob(dragIdx, status);
-    dragIdx = null;
-  }
-}
+function escHtml(s){if(!s)return'';return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Actions
 // ═══════════════════════════════════════════════════════════════════════════
-async function moveJob(idx, newStatus) {
-  const oldStatus = JOBS[idx].status || 'New';
-  if (oldStatus === newStatus) return;
-
-  try {
-    const res = await fetch(`/api/jobs/${idx}`, {
-      method: 'PATCH',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({status: newStatus}),
-    });
-    if (res.ok) {
-      JOBS[idx].status = newStatus;
-      renderBoard();
+async function moveJob(idx,newStatus){
+  try{
+    const r=await fetch('/api/jobs/'+idx,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:newStatus})});
+    if(r.ok){
+      const d=await r.json();
+      JOBS[idx].status=d.job.status;
+      renderAll();
     }
-  } catch (err) {
-    console.error('Failed to update job:', err);
-  }
+  }catch(e){console.error(e);}
 }
 
-async function reloadData() {
-  try {
+async function reloadData(){
+  try{
     await fetch('/api/reload');
     await loadData();
-  } catch (err) {
-    console.error('Reload failed:', err);
-  }
+  }catch(e){console.error(e);}
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Keyboard shortcuts
-// ═══════════════════════════════════════════════════════════════════════════
-document.addEventListener('keydown', e => {
-  if (e.key === 'r' && e.ctrlKey) { e.preventDefault(); reloadData(); }
-});
+// Keyboard
+document.addEventListener('keydown',e=>{if(e.key==='r'&&e.ctrlKey){e.preventDefault();reloadData();}});
 
 // Boot
 loadData();
@@ -604,8 +530,8 @@ loadData();
 if __name__ == "__main__":
     print("=" * 60)
     print("🔍 Ian's Embedded Job Board")
-    print(f"   Data: {DATA_FILE or '(no kanban JSON found — run linkedin_job_search.py first)'}")
-    print(f"   Open Chrome → http://localhost:{PORT}")
+    print(f"   Data: {DATA_FILE or '(no kanban JSON — run linkedin_job_search.py first)'}")
+    print(f"   Open Chrome → http://192.168.44.128:{PORT}")
     print(f"   Press Ctrl+C to stop")
     print("=" * 60)
     app.run(host="0.0.0.0", port=PORT, debug=False)
