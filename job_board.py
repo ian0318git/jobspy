@@ -25,7 +25,7 @@ from datetime import datetime
 from flask import Flask, jsonify, request, send_from_directory
 
 # ── Config ───────────────────────────────────────────────────────────────────
-PORT = 3000
+PORT = 5000
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 os.chdir(SCRIPT_DIR)
 
