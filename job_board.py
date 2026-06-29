@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Kanban Job Board — Chrome web UI for Ian's embedded job search results.
+Kanban Job Board — Chrome web UI for embedded job search results.
 
 Usage:
     source .venv/bin/activate
@@ -429,7 +429,7 @@ _HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>🔍 Ian's Embedded Job Board</title>
+<title>🔍 Embedded Job Board</title>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 body{
@@ -596,7 +596,7 @@ body{
 
 <div class="header">
   <div>
-    <h1>🔍 Ian's Embedded Job Board</h1>
+    <h1>🔍 Embedded Job Board</h1>
     <div class="meta">
       📂 <select id="file-selector" onchange="switchFile(this.value)"><option>Loading...</option></select>
       <span id="job-count" style="font-size:0.75rem;color:#64748b;">—</span>
@@ -975,7 +975,7 @@ init();
 # ── Main ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print("=" * 60)
-    print("🔍 Ian's Embedded Job Board")
+    print("🔍 Embedded Job Board")
     print(f"   Data : {DATA_FILE or '(no kanban JSON)'}")
     print(f"   URL  : http://192.168.44.128:{PORT}")
     print(f"   Sched: {'ON' if SCHEDULE_CONFIG.get('enabled') else 'OFF'} "

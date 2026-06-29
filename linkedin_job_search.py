@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Melbourne Embedded Systems Job Scraper — tailored to Ian Chang's resume.
+Melbourne Embedded Systems Job Scraper.
 
 Three intelligent engines:
   1. Semantic Depth Brain — distinguishes hardcore embedded (bare-metal, kernel,
@@ -251,7 +251,7 @@ TOOLING_TERMS = {
 # ENGINE 2 — IC / Lead Dual Track
 # ──────────────────────────────────────────────────────────────────────────────
 # Classifies each role based on title patterns.
-# Ian has 25+ years — both tracks are valid:
+# Senior engineers with 25+ years — both tracks are valid:
 #   IC Track: Staff, Principal, Distinguished, Fellow, Senior IC
 #   Lead Track: Manager, Director, Head, Team Lead
 #   Hybrid: Tech Lead (hands-on + mentoring), "Lead Engineer"
@@ -591,7 +591,7 @@ def main():
     all_jobs = []
 
     print("=" * 72)
-    print("🔍 Ian Chang — Embedded Systems Job Search")
+    print("🔍 Embedded Systems Job Search")
     print(f"   🧠 Semantic Depth Brain: ACTIVE")
     print(f"   🛤️  IC / Lead Dual Track: ACTIVE")
     print(f"   🚫 Security Clearance Red Line: ACTIVE")

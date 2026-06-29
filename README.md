@@ -1,4 +1,4 @@
-# 🔍 Ian's Melbourne Embedded Job Search
+# 🔍 Melbourne Embedded Job Search
 
 Tailored job scraper + Kanban board for embedded systems roles in Melbourne.
 

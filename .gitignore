@@ -13,3 +13,5 @@ dist
 kanban_jobs_*.json
 melbourne_embedded_jobs_*.csv
 search_results/
+blocked_clearance_jobs_*.json
+*.log
