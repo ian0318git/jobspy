@@ -1,7 +1,11 @@
 # 🔍 Ian's Melbourne Embedded Job Search
 
 Tailored job scraper + Kanban board for embedded systems roles in Melbourne.
-Built on top of [JobSpy](https://github.com/cullenwatson/JobSpy).
+
+> **Forked from [JobSpy](https://github.com/cullenwatson/JobSpy)** by Cullen Watson —
+> a multi-board job scraping library. This project adds semantic depth scoring,
+> career track classification, security clearance filtering, and a Kanban web UI
+> on top of the original `scrape_jobs()` engine.
 
 ## What this does
 
