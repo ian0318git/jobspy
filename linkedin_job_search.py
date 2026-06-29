@@ -8,8 +8,8 @@ Three intelligent engines:
   2. IC / Lead Dual Track — classifies every job as Individual Contributor,
      Leadership, or Hybrid; embraces both tracks for maximum opportunity.
   3. Security Clearance Red Line — auto-detects and blocks roles requiring
-     NV1/NV2/Baseline clearance or Australian citizenship (Bridging Visa A
-     does NOT qualify), preventing wasted applications.
+     NV1/NV2/Baseline clearance or Australian citizenship (may not apply
+     to all visa categories), preventing wasted applications.
 
 Output: CSV + relevance-scored Kanban JSON with track & clearance metadata.
 """
@@ -281,9 +281,8 @@ LEAD_TRACK_PATTERNS = [
 # ═══════════════════════════════════════════════════════════════════════════════
 # ENGINE 3 — Australian Security Clearance Red Line
 # ──────────────────────────────────────────────────────────────────────────────
-# Bridging Visa A (BVA) grants FULL WORK RIGHTS but is NOT citizenship or PR.
-# Security clearances (NV1/NV2/Baseline) require citizenship (at minimum).
-# These roles are UNOBTAINABLE — must be flagged and blocked.
+# Security clearances (NV1/NV2/Baseline) require citizenship at minimum;
+# some Baseline roles may accept PR. These roles should be flagged for review.
 #
 # References:
 #   - AGSVA: Baseline = citizen or PR (some cases). NV1/NV2 = citizen only.
@@ -292,7 +291,7 @@ LEAD_TRACK_PATTERNS = [
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # Patterns that indicate a job REQUIRES security clearance
-# These are hard-red: BVA cannot satisfy any of these.
+# These are hard-red for non-citizen/non-PR applicants.
 SECURITY_CLEARANCE_PATTERNS = [
     # ── Explicit clearance levels ──
     (r'\bNV\s*1\b', "NV1"),
@@ -328,7 +327,7 @@ SECURITY_CLEARANCE_PATTERNS = [
 ]
 
 # Patterns that indicate CITIZENSHIP is required (broader than clearance)
-# BVA is NOT citizenship — these are also red-line.
+# Non-citizens cannot satisfy these requirements.
 CITIZENSHIP_REQUIRED_PATTERNS = [
     (r'\bmust\s+be\s+an?\s+Australian\s+(?:Citizen|citizen)\b', "Citizenship Required"),
     (r'\bAustralian\s+(?:Citizenship|citizenship)\s+(?:required|essential|mandatory|must|is\s+required)\b',
@@ -340,14 +339,14 @@ CITIZENSHIP_REQUIRED_PATTERNS = [
     (r'\bAustralian\s+Citizens?\s+Only\b', "Citizenship Required"),
     (r'\bcitizenship\s+(?:required|essential|mandatory|must|is\s+required)\b',
      "Citizenship Required"),
-    # Australian Permanent Resident (BVA is NOT PR either)
+    # Australian Permanent Resident required
     (r'\b(?:Australian\s+)?Permanent\s+Resident\s+(?:required|essential|mandatory|must|only)\b',
      "PR or Citizenship Required"),
     (r'\bmust\s+be\s+(?:an?\s+)?(?:Australian\s+)?Permanent\s+Resident\b',
      "PR or Citizenship Required"),
     (r'\b(?:Citizens?|citizens?|PR|Permanent\s+Resident)\s+(?:and|or)\s+(?:Citizens?|citizens?|PR|Permanent\s+Resident)\b',
      "Citizenship/PR Required"),
-    # AGSVA baseline also effectively blocks BVA
+    # AGSVA baseline requires at minimum PR (often citizenship)
     (r'\b(?:must|requires?|need)\s+(?:to\s+)?(?:be\s+(?:able\s+to\s+)?)?(?:eligible\s+(?:for|to\s+apply\s+for)|obtain|hold)\s+(?:a\s+)?(?:AGSVA|Australian\s+Government)\s*(?:Security)?\s*(?:Vetting|Clearance)',
      "AGSVA Required"),
 ]
@@ -709,7 +708,7 @@ def main():
     if len(blocked) > 0:
         print(f"\n{'=' * 72}")
         print(f"🚫 SECURITY CLEARANCE RED LINE — {len(blocked)} jobs BLOCKED")
-        print(f"   These require citizenship/PR/clearance (Bridging Visa A ≠ eligible)")
+        print(f"   These require citizenship/PR/clearance — verify your eligibility")
         print(f"{'=' * 72}")
         for _, row in blocked.iterrows():
             print(f"   [{row['clearance_level']:>12s}] {row['title'][:55]} @ {row['company'][:25]}")
@@ -796,7 +795,7 @@ def main():
     # Clearance summary
     print(f"   ── Security Clearance ──")
     print(f"      🚫 Blocked (NV1/NV2/Baseline/Citizenship): {len(blocked)}")
-    print(f"      ✅ Eligible (BVA-compatible):               {len(eligible)}")
+    print(f"      ✅ Eligible (no clearance barrier):          {len(eligible)}")
 
     # ── Kanban JSON ──────────────────────────────────────────────────────────
     kanban_file = os.path.join(OUTPUT_DIR, f"kanban_jobs_{timestamp}.json")
@@ -821,7 +820,7 @@ def main():
             "career_track": str(row.get("career_track", "")),
             "track_detail": str(row.get("track_detail", "")),
             # Clearance
-            "clearance_status": "✅ BVA Eligible" if not row.get("clearance_blocked") else f"🚫 BLOCKED: {row.get('clearance_level', '')}",
+            "clearance_status": "✅ No Clearance Required" if not row.get("clearance_blocked") else f"🚫 BLOCKED: {row.get('clearance_level', '')}",
             # Kanban
             "status": "New",
             "notes": (

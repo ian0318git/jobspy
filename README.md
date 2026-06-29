@@ -97,7 +97,7 @@ Classifies every job as:
 
 ### 🚫 Security Clearance Red Line
 
-Auto-detects and blocks jobs requiring NV1/NV2/Baseline clearance or Australian citizenship/PR — unobtainable on a Bridging Visa A.
+Auto-detects and blocks jobs requiring NV1/NV2/Baseline clearance or Australian citizenship/PR — verify your eligibility before applying.
 
 Blocked jobs go to a separate JSON file for reference (some may become relevant if visa status changes).
 
