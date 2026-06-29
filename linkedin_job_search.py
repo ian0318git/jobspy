@@ -16,6 +16,7 @@ Output: CSV + relevance-scored Kanban JSON with track & clearance metadata.
 
 import csv
 import json
+import os
 import re
 from datetime import datetime
 from jobspy import scrape_jobs
