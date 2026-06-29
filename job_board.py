@@ -217,7 +217,15 @@ def get_search_status():
 # ═══════════════════════════════════════════════════════════════════════════════
 # Scheduler
 # ═══════════════════════════════════════════════════════════════════════════════
-SCHEDULE_DEFAULT = {"enabled": False, "interval_hours": 6, "last_run": None, "next_run": None}
+SCHEDULE_DEFAULT = {
+    "enabled": False,
+    "mode": "times",        # "times" or "interval"
+    "interval_hours": 6,
+    "times": ["06:00", "22:00"],  # specific times (HH:MM, 24h)
+    "last_run": None,
+    "next_run": None,
+    "last_run_date": None,  # track day to avoid double-fire
+}
 
 
 def load_schedule():
@@ -243,18 +251,34 @@ SCHEDULE_STOP = threading.Event()
 
 
 def scheduler_loop():
+    """Background thread: check every 30s if a scheduled search is due."""
     while not SCHEDULE_STOP.is_set():
         cfg = load_schedule()
         if cfg.get("enabled"):
-            interval = cfg.get("interval_hours", 6)
-            last = cfg.get("last_run")
             now = datetime.now()
             due = False
-            if last:
-                if now >= datetime.fromisoformat(last) + timedelta(hours=interval):
-                    due = True
+            mode = cfg.get("mode", "interval")
+
+            if mode == "times":
+                times = cfg.get("times", ["06:00", "22:00"])
+                today_str = now.strftime("%Y-%m-%d")
+                last_date = cfg.get("last_run_date", "")
+                if today_str != last_date:
+                    for t in times:
+                        target = datetime.strptime(f"{today_str} {t}", "%Y-%m-%d %H:%M")
+                        diff = abs((now - target).total_seconds())
+                        if diff < 90:
+                            due = True
+                            break
             else:
-                due = True
+                interval = cfg.get("interval_hours", 6)
+                last = cfg.get("last_run")
+                if last:
+                    if now >= datetime.fromisoformat(last) + timedelta(hours=interval):
+                        due = True
+                else:
+                    due = True
+
             if due:
                 print(f"[scheduler] Triggering search at {now.strftime('%Y-%m-%d %H:%M')}")
                 ok, _ = start_search()
@@ -267,10 +291,18 @@ def scheduler_loop():
                     global JOBS, DATA_FILE, CURRENT_FILE
                     JOBS, DATA_FILE = load_jobs()
                     CURRENT_FILE = DATA_FILE
-                    cfg["last_run"] = datetime.now().isoformat()
-                    cfg["next_run"] = (datetime.now() + timedelta(hours=interval)).isoformat()
+                    now2 = datetime.now()
+                    cfg["last_run"] = now2.isoformat()
+                    cfg["last_run_date"] = now2.strftime("%Y-%m-%d")
+                    if mode == "times":
+                        times = cfg.get("times", ["06:00", "22:00"])
+                        future = [t for t in times if t > now2.strftime("%H:%M")]
+                        next_t = future[0] if future else times[0]
+                        cfg["next_run"] = f"{now2.strftime('%Y-%m-%d')} {next_t}"
+                    else:
+                        cfg["next_run"] = (now2 + timedelta(hours=cfg.get("interval_hours", 6))).isoformat()
                     save_schedule(cfg)
-        SCHEDULE_STOP.wait(60)
+        SCHEDULE_STOP.wait(30)
 
 
 _scheduler_thread = threading.Thread(target=scheduler_loop, daemon=True)
@@ -353,12 +385,23 @@ def api_schedule():
         data = request.get_json()
         if "enabled" in data:
             SCHEDULE_CONFIG["enabled"] = bool(data["enabled"])
+        if "mode" in data:
+            SCHEDULE_CONFIG["mode"] = data["mode"]
         if "interval_hours" in data:
             SCHEDULE_CONFIG["interval_hours"] = int(data["interval_hours"])
+        if "times" in data:
+            SCHEDULE_CONFIG["times"] = data["times"]
         if SCHEDULE_CONFIG["enabled"]:
-            last = SCHEDULE_CONFIG.get("last_run")
-            base = datetime.fromisoformat(last) if last else datetime.now()
-            SCHEDULE_CONFIG["next_run"] = (base + timedelta(hours=SCHEDULE_CONFIG["interval_hours"])).isoformat()
+            if SCHEDULE_CONFIG.get("mode") == "times":
+                times = SCHEDULE_CONFIG.get("times", ["06:00", "22:00"])
+                now_str = datetime.now().strftime("%H:%M")
+                future = [t for t in sorted(times) if t > now_str]
+                next_t = future[0] if future else sorted(times)[0]
+                SCHEDULE_CONFIG["next_run"] = f"{datetime.now().strftime('%Y-%m-%d')} {next_t}"
+            else:
+                last = SCHEDULE_CONFIG.get("last_run")
+                base = datetime.fromisoformat(last) if last else datetime.now()
+                SCHEDULE_CONFIG["next_run"] = (base + timedelta(hours=SCHEDULE_CONFIG["interval_hours"])).isoformat()
         else:
             SCHEDULE_CONFIG["next_run"] = None
         save_schedule(SCHEDULE_CONFIG)
@@ -585,11 +628,25 @@ body{
       <input type="checkbox" id="sched-enabled" onchange="updateSchedule()"><span class="slider"></span>
     </label>
     <label for="sched-enabled" style="cursor:pointer;">Enable scheduled auto-search</label>
-    <label style="margin-left:12px;">Every</label>
-    <select id="sched-interval" onchange="updateSchedule()">
-      <option value="3">3 hours</option><option value="6" selected>6 hours</option>
-      <option value="12">12 hours</option><option value="24">24 hours</option>
+  </div>
+  <div class="schedule-row" style="margin-top:8px;">
+    <label>Mode:</label>
+    <select id="sched-mode" onchange="onSchedModeChange()">
+      <option value="times" selected>Specific times</option>
+      <option value="interval">Every N hours</option>
     </select>
+    <span id="sched-times-group">
+      <label style="margin-left:8px;">At:</label>
+      <input type="time" id="sched-time1" value="06:00" onchange="updateSchedule()" style="background:#0f172a;color:#e2e8f0;border:1px solid #475569;padding:6px 10px;border-radius:8px;font-size:0.85rem;">
+      <input type="time" id="sched-time2" value="22:00" onchange="updateSchedule()" style="background:#0f172a;color:#e2e8f0;border:1px solid #475569;padding:6px 10px;border-radius:8px;font-size:0.85rem;">
+    </span>
+    <span id="sched-interval-group" style="display:none;">
+      <label style="margin-left:8px;">Every</label>
+      <select id="sched-interval" onchange="updateSchedule()">
+        <option value="3">3 hours</option><option value="6" selected>6 hours</option>
+        <option value="12">12 hours</option><option value="24">24 hours</option>
+      </select>
+    </span>
     <span style="font-size:0.8rem;color:#64748b;" id="sched-next-run"></span>
   </div>
 </div>
@@ -856,20 +913,36 @@ async function pollSearchStatus(){
 // ═══════════════════════════════════════════════════════════════════════════
 function toggleSchedPanel(){document.getElementById('sched-panel').classList.toggle('open');}
 
+function onSchedModeChange(){
+  const mode=document.getElementById('sched-mode').value;
+  document.getElementById('sched-times-group').style.display=mode==='times'?'':'none';
+  document.getElementById('sched-interval-group').style.display=mode==='interval'?'':'none';
+  updateSchedule();
+}
+
 async function loadSchedule(){
   try{
     const r=await fetch('/api/schedule'), s=await r.json();
     document.getElementById('sched-enabled').checked=s.enabled;
-    document.getElementById('sched-interval').value=s.interval_hours;
+    document.getElementById('sched-mode').value=s.mode||'times';
+    document.getElementById('sched-interval').value=s.interval_hours||6;
+    const times=s.times||['06:00','22:00'];
+    document.getElementById('sched-time1').value=times[0]||'06:00';
+    document.getElementById('sched-time2').value=times[1]||'22:00';
+    onSchedModeChange();
     updateSchedDisplay(s);
   }catch(e){console.error(e);}
 }
 
 async function updateSchedule(){
+  const mode=document.getElementById('sched-mode').value;
   const enabled=document.getElementById('sched-enabled').checked;
-  const ih=parseInt(document.getElementById('sched-interval').value);
+  const interval_hours=parseInt(document.getElementById('sched-interval').value);
+  const t1=document.getElementById('sched-time1').value;
+  const t2=document.getElementById('sched-time2').value;
+  const times=[t1,t2].filter(Boolean).sort();
   try{
-    const r=await fetch('/api/schedule',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled,interval_hours:ih})});
+    const r=await fetch('/api/schedule',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled,mode,interval_hours,times})});
     const s=await r.json(); updateSchedDisplay(s.schedule||s);
   }catch(e){console.error(e);}
 }
@@ -879,7 +952,10 @@ function updateSchedDisplay(s){
   const nr=document.getElementById('sched-next-run');
   if(s.enabled){
     badge.style.display='inline';
-    let t=`Auto: every ${s.interval_hours}h`;
+    const mode=s.mode||'times';
+    let t=mode==='times'
+      ?`Auto: at ${(s.times||['06:00','22:00']).join(' & ')} daily`
+      :`Auto: every ${s.interval_hours}h`;
     if(s.next_run){const d=new Date(s.next_run);t+=` · Next: ${d.toLocaleString('en-AU',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})}`;}
     if(s.last_run){const d=new Date(s.last_run);t+=` · Last: ${d.toLocaleString('en-AU',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})}`;}
     info.textContent=t;
