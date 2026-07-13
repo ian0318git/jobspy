@@ -15,6 +15,7 @@ Features:
   - 📂 Historical file browser — switch between past search results
   - 💾 Cross-file status persistence — Applied/Interview status survives
     across search runs (saved to .job_statuses.json by job URL)
+  - 💻 4 job boards: LinkedIn, Indeed, Google, and Seek (via custom scraper)
   - Relevance-tier color coding, embedded depth badges
   - Filter by tier, career track, source + keyword search
   - 🔍 Re-search button — triggers linkedin_job_search.py live
@@ -224,7 +225,8 @@ SCHEDULE_DEFAULT = {
     "times": ["06:00", "22:00"],  # specific times (HH:MM, 24h)
     "last_run": None,
     "next_run": None,
-    "last_run_date": None,  # track day to avoid double-fire
+    "last_run_date": None,
+    "_fired_today": {},     # {"2026-07-05": ["06:00", "22:00"]}
 }
 
 
@@ -262,14 +264,18 @@ def scheduler_loop():
             if mode == "times":
                 times = cfg.get("times", ["06:00", "22:00"])
                 today_str = now.strftime("%Y-%m-%d")
-                last_date = cfg.get("last_run_date", "")
-                if today_str != last_date:
-                    for t in times:
-                        target = datetime.strptime(f"{today_str} {t}", "%Y-%m-%d %H:%M")
-                        diff = abs((now - target).total_seconds())
-                        if diff < 90:
-                            due = True
-                            break
+                # Track which (date_time) combos have already fired
+                fired_map = cfg.get("_fired_today", {})
+                already_fired = fired_map.get(today_str, [])
+                for t in times:
+                    if t in already_fired:
+                        continue
+                    target = datetime.strptime(f"{today_str} {t}", "%Y-%m-%d %H:%M")
+                    # Fire if current time has passed the scheduled time
+                    # (within last 2h to avoid catch-up from hours ago)
+                    if now >= target and (now - target).total_seconds() < 7200:
+                        due = True
+                        break
             else:
                 interval = cfg.get("interval_hours", 6)
                 last = cfg.get("last_run")
@@ -295,10 +301,27 @@ def scheduler_loop():
                     cfg["last_run"] = now2.isoformat()
                     cfg["last_run_date"] = now2.strftime("%Y-%m-%d")
                     if mode == "times":
-                        times = cfg.get("times", ["06:00", "22:00"])
+                        fired_map = cfg.get("_fired_today", {})
+                        today_str = now2.strftime("%Y-%m-%d")
+                        if today_str not in fired_map:
+                            fired_map[today_str] = []
+                        # Record the time that just fired
+                        fired_time = now2.strftime("%H:%M")
+                        for t in times:
+                            target = datetime.strptime(f"{today_str} {t}", "%Y-%m-%d %H:%M")
+                            if abs((now2 - target).total_seconds()) < 3600:
+                                if t not in fired_map[today_str]:
+                                    fired_map[today_str].append(t)
+                                break
+                        cfg["_fired_today"] = fired_map
+                        # Determine next run time
                         future = [t for t in times if t > now2.strftime("%H:%M")]
                         next_t = future[0] if future else times[0]
                         cfg["next_run"] = f"{now2.strftime('%Y-%m-%d')} {next_t}"
+                        # Clean up entries older than 3 days
+                        old_dates = [d for d in fired_map if d < (now2 - timedelta(days=3)).strftime("%Y-%m-%d")]
+                        for d in old_dates:
+                            del fired_map[d]
                     else:
                         cfg["next_run"] = (now2 + timedelta(hours=cfg.get("interval_hours", 6))).isoformat()
                     save_schedule(cfg)
@@ -387,10 +410,12 @@ def api_schedule():
             SCHEDULE_CONFIG["enabled"] = bool(data["enabled"])
         if "mode" in data:
             SCHEDULE_CONFIG["mode"] = data["mode"]
+            SCHEDULE_CONFIG.pop("_fired_today", None)  # reset tracking on mode change
         if "interval_hours" in data:
             SCHEDULE_CONFIG["interval_hours"] = int(data["interval_hours"])
         if "times" in data:
             SCHEDULE_CONFIG["times"] = data["times"]
+            SCHEDULE_CONFIG.pop("_fired_today", None)  # reset tracking on time change
         if SCHEDULE_CONFIG["enabled"]:
             if SCHEDULE_CONFIG.get("mode") == "times":
                 times = SCHEDULE_CONFIG.get("times", ["06:00", "22:00"])

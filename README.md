@@ -13,7 +13,7 @@ Two scripts:
 
 | Script | Purpose |
 |--------|---------|
-| `linkedin_job_search.py` | Scrapes LinkedIn/Indeed/Google for embedded jobs, scores them with 3 AI engines, outputs CSV + Kanban JSON |
+| `linkedin_job_search.py` | Scrapes 4 job boards (LinkedIn, Indeed, Google, **Seek**) for embedded jobs, scores them with 3 AI engines, outputs CSV + Kanban JSON |
 | `job_board.py` | Flask web UI — Kanban board with status tracking, filtering, historical file browser, and auto-scheduler |
 
 ---
@@ -43,9 +43,9 @@ python linkedin_job_search.py
 Output goes to `search_results/`:
 ```
 search_results/
-├── melbourne_embedded_jobs_20260629_1435.csv   ← Full results
-├── kanban_jobs_20260629_1435.json             ← Top 40 for Kanban board
-└── blocked_clearance_jobs_20260629_1435.json  ← Jobs blocked by clearance
+├── melbourne_embedded_jobs_20260714_0002.csv   ← Full results
+├── kanban_jobs_20260714_0002.json             ← Top 32 for Kanban board
+└── blocked_clearance_jobs_20260714_0002.json  ← Jobs blocked by clearance
 ```
 
 Each run creates timestamped files — historical results are never overwritten.
@@ -115,6 +115,8 @@ All config lives at the top of `linkedin_job_search.py`:
 | `HOURS_OLD` | `168` (7 days) | Max job age |
 | `OUTPUT_DIR` | `"search_results"` | Output directory |
 
+**Job boards used:** LinkedIn, Indeed, Google for Jobs, and **Seek** (via built-in custom scraper).
+
 Schedule config is managed via the Web UI or by editing `.job_board_schedule.json`:
 
 ```json
@@ -147,6 +149,7 @@ Schedule config is managed via the Web UI or by editing `.job_board_schedule.jso
 **No results for a search term?**
 - JobSpy rate limits aggressively. Wait a few minutes between runs.
 - LinkedIn blocks after ~10 pages without proxies. Indeed is more lenient.
+- **Seek** results are scraped from HTML — Seek may block repeated requests; using proxies helps.
 
 **Too many irrelevant results?**
 - Add noise patterns to `IT_NOISE_PATTERNS` in `linkedin_job_search.py`.

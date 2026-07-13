@@ -162,6 +162,7 @@ SEMANTIC_DEPTH_LAYERS = [
         "soc architecture", "system-on-chip", "system on chip",
         "microcontroller", "mcu ", "soc ",
         "hardware bring", "hardware debug", "hardware design",
+        "hardware-software", "electronics",
         "manufacturing test", "factory test", "production test",
         "diagnostics firmware", "power-on self-test", "power on self test",
         "secure enclave", "hsm ", "hardware security module",
@@ -176,7 +177,7 @@ SEMANTIC_DEPTH_LAYERS = [
 
     # ── Layer D: EMBEDDED-SPECTRUM (weight 3) ──
     (3, "embedded", [
-        "firmware", "f/w", "embedded c", "embedded c++",
+        "firmware", "f/w", "embedded software", "embedded c", "embedded c++",
         "embedded systems", "embedded linux",
         "arm ", "cortex-", "nxp ", "marvell", "stm32",
         "ti ", "texas instruments", "microchip", "renesas",
@@ -358,6 +359,103 @@ RED_LINE_REGEX = [
 ]
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# ENGINE 4 — Hardware Design Exclusion (PCB / Circuit Design)
+# ──────────────────────────────────────────────────────────────────────────────
+# Filters out roles focused on PCB layout, circuit design, EDA tools, and
+# electronics hardware design — these are distinct from embedded software /
+# firmware engineering and are not a fit for this search.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+HARDWARE_DESIGN_EXCLUDE_PATTERNS = [
+    # ── PCB Design / Layout ──
+    r'\bPCB\b', r'\bPCBA\b',
+    r'\bprinted\s+circuit\s+board\b',
+    r'\bPCB\s+layout\b',
+    r'\bPCB\s+design\b',
+    r'\bmultilayer\s+PCB\b',
+    r'\bflex\s+PCB\b', r'\brigid-flex\b',
+    r'\bsolder\w*\b', r'\bsoldering\b',
+    r'\bdesoldering\b',
+    r'\brework\s+station\b',
+    r'\bSMT\s+(?:assembly|process|pick|mount)\b',
+    r'\bsurface\s+mount\b',
+    r'\bthrough-hole\b',
+    # ── EDA Tools / CAD ──
+    r'\bAltium\b', r'\bAltium\s+Designer\b',
+    r'\bEagle\b', r'\bKiCad\b',
+    r'\bOrCAD\b', r'\bPADS\b',
+    r'\bCadence\s+(?:Allegro|OrCAD|Virtuoso)\b',
+    r'\bMentor\s+Graphics\b',
+    r'\bP\s*CAD\b', r'\bProtel\b',
+    r'\bDesignSpark\b', r'\bEasyEDA\b',
+    r'\bSPICE\b', r'\bPspice\b', r'\bLTSpice\b',
+    r'\bMultisim\b',
+    # ── Circuit Design / Analysis ──
+    r'\bcircuit\s+design\b',
+    r'\bcircuit\s+analysis\b',
+    r'\bcircuit\s+simulation\b',
+    r'\bschematic\s+capture\b',
+    r'\bschematic\s+design\b',
+    r'\bcircuit\s+board\b',
+    r'\belectronic\s+design\b',
+    r'\belectronics\s+design\b',
+    r'\belectrical\s+design\b',
+    # removed: standalone r'\bhardware\s+design\b' — too many false positives for FW roles
+    r'\banalog\s+design\b',
+    r'\bdigital\s+design\b',
+    r'\bRF\s+design\b',
+    r'\bpower\s+electronics\s+design\b',
+    r'\bmixed-signal\s+design\b',
+    r'\bhigh-speed\s+digital\s+design\b',
+    r'\bsignal\s+integrity\s+analysis\b',
+    r'\bpower\s+integrity\b',
+    r'\bthermal\s+analysis\b',
+    r'\bEMC\s+design\b', r'\bEMI\s+mitigation\b',
+    r'\belectromagnetic\s+(?:compatibility|interference)\b',
+    # ── Test & Measurement (hardware focused) ──
+    r'\boscilloscope\s+measurement\b',
+    r'\bnodal\s+analysis\b',
+    r'\bfrequency\s+response\b',
+    r'\bimpedance\s+matching\b',
+    # ── Job title patterns ──
+    r'\bhardware\s+design\s+engineer\b',
+    r'\bPCB\s+(?:designer|layout\s+engineer)\b',
+    r'\belectronics\s+design\s+engineer\b',
+    r'\belectrical\s+design\s+engineer\b',
+    r'\bcircuit\s+design\s+engineer\b',
+    r'\blayout\s+engineer\b',
+    r'\bCAD\s+engineer\b',
+    r'\bhardware\s+test\s+engineer\b',
+    r'\bpower\s+electronics\s+engineer\b',
+    r'\belectronic\s+engineer\b(?!.*\b(?:firmware|embedded|software|linux)\b)',
+    # ── PCB-specific manufacturing ──
+    r'\bSMT\s+engineer\b',
+]
+
+# Compile once for efficiency
+HW_DESIGN_REGEX = [
+    re.compile(pat, re.IGNORECASE) for pat in HARDWARE_DESIGN_EXCLUDE_PATTERNS
+]
+
+
+def check_hardware_design_exclusion(title, description=""):
+    """Check if a job posting is primarily about PCB / circuit design (hardware
+    engineering) rather than embedded software / firmware.
+
+    Returns (is_excluded, matched_pattern, matched_text).
+    """
+    text = f"{title} {description}"
+
+    for regex in HW_DESIGN_REGEX:
+        match = regex.search(text)
+        if match:
+            matched = match.group(0).strip()
+            return True, regex.pattern[:50], matched
+
+    return False, None, None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Scoring Functions
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -429,6 +527,18 @@ def compute_semantic_depth(title, description, company):
                      "data scientist", "ai engineer"]
     if any(s in text for s in ai_ml_signals) and hardware_count == 0:
         noise_count += 5  # heavy penalty for pure AI/ML roles
+
+    # ── Embedded context: when hardware depth signals are present ────────────
+    # cloud/devops/infra terms are part of the normal embedded toolchain
+    # (CI/CD for firmware, IoT cloud backends) — not IT noise.
+    EMBEDDED_ADJACENT_NOISE = {
+        "azure", "aws ", "devops", "ci/cd pipeline", "jenkins pipeline",
+        "github actions", "docker swarm", "kubernetes", "k8s",
+        "terraform", "helm chart", "infrastructure as code",
+    }
+    if hardware_count > 0:
+        noise_signals = [n for n in noise_signals if n not in EMBEDDED_ADJACENT_NOISE]
+        noise_count = len(noise_signals)
 
     # ── Compute purity ──────────────────────────────────────────────────────
     noise_penalty = noise_count * 8
@@ -594,6 +704,7 @@ def main():
     print(f"   🧠 Semantic Depth Brain: ACTIVE")
     print(f"   🛤️  IC / Lead Dual Track: ACTIVE")
     print(f"   🚫 Security Clearance Red Line: ACTIVE")
+    print(f"   🔧 PCB/Circuit Design Filter: ACTIVE")
     print(f"   📍 Location: {LOCATION}")
     print(f"   🔎 Search terms: {len(SEARCH_TERMS)}")
     print(f"   ⏱️  Max age: {HOURS_OLD}h ({HOURS_OLD // 24} days)")
@@ -604,7 +715,7 @@ def main():
         print(f"\n🔎 Searching: '{term}' ...")
         try:
             jobs = scrape_jobs(
-                site_name=["linkedin", "indeed", "google"],
+                site_name=["linkedin", "indeed", "google", "seek"],
                 search_term=term,
                 google_search_term=f"{term} jobs Melbourne Victoria",
                 location=LOCATION,
@@ -668,6 +779,10 @@ def main():
         is_blocked, clearance_level, clearance_label, clearance_detail = \
             check_security_clearance(title, desc)
 
+        # Engine 4: Hardware Design Exclusion (PCB / Circuit Design)
+        is_hw_design, hw_design_pat, hw_design_matched = \
+            check_hardware_design_exclusion(title, desc)
+
         depth_keywords = ", ".join([kw for _, kw in depth_sigs[:6]])
         noise_keywords = ", ".join(noise_sigs[:5])
 
@@ -696,6 +811,9 @@ def main():
             "clearance_level": clearance_level,
             "clearance_label": clearance_label,
             "clearance_detail": clearance_detail,
+            # Hardware design exclusion
+            "hw_design_excluded": is_hw_design,
+            "hw_design_detail": f"PCB/Circuit Design: '{hw_design_matched}'" if is_hw_design else "",
         })
 
     df = pd.DataFrame(results)
@@ -716,7 +834,22 @@ def main():
 
     print(f"\n   ✅ Eligible jobs (no clearance barrier): {len(eligible)}")
 
-    # ── Relevance filter (on eligible jobs only) ─────────────────────────────
+    # ── Hardware Design Exclusion: filter out PCB / circuit design roles ──────
+    eligible_before_hw = len(eligible)
+    hw_design_jobs = eligible[eligible["hw_design_excluded"] == True].copy()
+    eligible = eligible[eligible["hw_design_excluded"] == False].copy()
+
+    if len(hw_design_jobs) > 0:
+        print(f"\n{'=' * 72}")
+        print(f"🔧 HARDWARE DESIGN EXCLUSION — {len(hw_design_jobs)} PCB/circuit design jobs REMOVED")
+        print(f"{'=' * 72}")
+        for _, row in hw_design_jobs.iterrows():
+            print(f"   [{row['relevance_score']:2d}] {row['title'][:55]} @ {row['company'][:25]}")
+            print(f"                      ↳ {row['hw_design_detail'][:80]}")
+
+    print(f"   💻 Software-oriented jobs remaining: {len(eligible)}")
+
+    # ── Relevance filter (on eligible + non-hw-design jobs only) ──────────────
     MIN_SCORE = 5
     filtered = eligible[eligible["relevance_score"] >= MIN_SCORE].copy()
     dropped = eligible[eligible["relevance_score"] < MIN_SCORE]
@@ -795,7 +928,12 @@ def main():
     # Clearance summary
     print(f"   ── Security Clearance ──")
     print(f"      🚫 Blocked (NV1/NV2/Baseline/Citizenship): {len(blocked)}")
-    print(f"      ✅ Eligible (no clearance barrier):          {len(eligible)}")
+    print(f"      ✅ Eligible (no clearance barrier):          {eligible_before_hw}")
+
+    # Hardware design exclusion summary
+    print(f"   ── Hardware Design Exclusion ──")
+    print(f"      🔧 PCB/Circuit Design roles removed: {len(hw_design_jobs)}")
+    print(f"      💻 Software/Firmware roles kept:     {len(eligible)}")
 
     # ── Kanban JSON ──────────────────────────────────────────────────────────
     kanban_file = os.path.join(OUTPUT_DIR, f"kanban_jobs_{timestamp}.json")
