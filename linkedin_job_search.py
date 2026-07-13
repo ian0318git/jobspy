@@ -443,14 +443,50 @@ def check_hardware_design_exclusion(title, description=""):
     engineering) rather than embedded software / firmware.
 
     Returns (is_excluded, matched_pattern, matched_text).
-    """
-    text = f"{title} {description}"
 
-    for regex in HW_DESIGN_REGEX:
-        match = regex.search(text)
-        if match:
-            matched = match.group(0).strip()
-            return True, regex.pattern[:50], matched
+    Smart exclusion:
+    - If the title itself contains design terms (PCB, Altium, circuit design),
+      the role IS excluded (it's a hardware design role).
+    - If only the description matches, we check context:
+      * For firmware/embedded software titles, bare 'PCB' in the description
+        (e.g. "nice to have: PCB exposure") does NOT trigger exclusion.
+      * Design-specific matches (PCB layout, Altium, etc.) in the description
+        still trigger exclusion even for firmware titles.
+    """
+    def check_text(text, skip_bare_pcb=False):
+        """Search text against HW_DESIGN_REGEX, optionally skipping bare PCB."""
+        for regex in HW_DESIGN_REGEX:
+            match = regex.search(text)
+            if not match:
+                continue
+            pattern_str = regex.pattern
+            # Skip bare \bPCB\b for firmware roles (nice-to-have context)
+            if skip_bare_pcb and pattern_str in (
+                r'\\bPCB\\b',
+            ):
+                continue
+            return True, regex.pattern[:50], match.group(0).strip()
+        return False, None, None
+
+    # 1) Check title first — any design term in title → immediate exclusion
+    is_excluded, pattern, matched = check_text(title)
+    if is_excluded:
+        return True, pattern, matched
+
+    # 2) Check if this is a firmware/embedded software role
+    is_firmware_role = bool(re.search(
+        r'\b(?:embedded\s+(?:software|firmware|systems|engineer|linux)|'
+        r'firmware\s+(?:engineer|developer|lead)|'
+        r'embedded\s+c(?:\+\+|)|'
+        r'rtos|'
+        r'bare.?metal)\b',
+        title, re.IGNORECASE
+    ))
+
+    # 3) Check description — be lenient with bare PCB for firmware roles
+    is_excluded, pattern, matched = check_text(description, skip_bare_pcb=is_firmware_role)
+    if is_excluded:
+        return True, pattern, matched
 
     return False, None, None
 
