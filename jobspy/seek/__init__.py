@@ -47,6 +47,8 @@ class SeekScraper(Scraper):
         # Warm up session with homepage to set cookies
         self.session.get(f"{self.base_url}/")
 
+        import time as time_module
+
         job_list: list[JobPost] = []
         page = 1
         results_wanted = scraper_input.results_wanted or 15
@@ -65,7 +67,12 @@ class SeekScraper(Scraper):
                 try:
                     job_post = self._extract_job_info(job_el)
                     if job_post:
+                        # Fetch full description from job detail page
+                        full_desc = self._fetch_full_description(job_post.job_url)
+                        if full_desc:
+                            job_post.description = full_desc
                         job_list.append(job_post)
+                        time_module.sleep(0.3)  # polite delay
                         if len(job_list) >= results_wanted:
                             break
                 except Exception as e:
@@ -159,6 +166,23 @@ class SeekScraper(Scraper):
             date_posted=date_posted,
             description=description_short,
         )
+
+    def _fetch_full_description(self, job_url: str) -> str | None:
+        """Fetch full job description from the job detail page."""
+        try:
+            response = self.session.get(job_url)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, "html.parser")
+            details = soup.find(attrs={"data-automation": "jobAdDetails"})
+            if details:
+                # Remove any script/style elements before extracting text
+                for tag in details.find_all(["script", "style"]):
+                    tag.decompose()
+                return details.get_text(strip=True)
+            return None
+        except Exception as e:
+            log.debug(f"Seek: Failed to fetch job detail for {job_url}: {e}")
+            return None
 
     def _parse_salary(self, salary_raw: str | None) -> Compensation | None:
         """Parse a Seek salary string like '$170,000 – $190,000 + Super'."""
