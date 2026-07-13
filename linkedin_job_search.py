@@ -462,7 +462,7 @@ def check_hardware_design_exclusion(title, description=""):
             pattern_str = regex.pattern
             # Skip bare \bPCB\b for firmware roles (nice-to-have context)
             if skip_bare_pcb and pattern_str in (
-                r'\\bPCB\\b',
+                r'\bPCB\b',
             ):
                 continue
             return True, regex.pattern[:50], match.group(0).strip()
