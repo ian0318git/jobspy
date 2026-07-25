@@ -77,6 +77,15 @@ SEARCH_TERMS = [
     # ── Broad catch (may bring noise, filtered later) ──
     "C++ engineer low latency",
     "system software engineer C",
+    # ── Robotics / Autonomous Systems ──
+    "robotics engineer",
+    "robotics software engineer",
+    "autonomous systems engineer",
+    "autonomous vehicle engineer",
+    # ── IoT / Edge Computing ──
+    "IoT engineer",
+    "internet of things engineer",
+    "edge computing engineer",
 ]
 
 LOCATION = "Melbourne, Victoria, Australia"
@@ -822,6 +831,20 @@ def main():
         depth_keywords = ", ".join([kw for _, kw in depth_sigs[:6]])
         noise_keywords = ", ".join(noise_sigs[:5])
 
+        # Format salary string
+        min_sal = row.get("min_amount")
+        max_sal = row.get("max_amount")
+        currency = str(row.get("currency", "") or "")
+        interval = str(row.get("interval", "") or "")
+        sal_str = ""
+        if pd.notna(min_sal) and pd.notna(max_sal) and min_sal and max_sal:
+            if min_sal >= 1000:
+                sal_str = f"{currency}${min_sal/1000:.0f}k–${max_sal/1000:.0f}k"
+            else:
+                sal_str = f"{currency}${min_sal:.0f}–${max_sal:.0f}"
+            if interval and interval != "yearly":
+                sal_str += f"/{interval}"
+
         results.append({
             "title": title,
             "company": company,
@@ -850,6 +873,13 @@ def main():
             # Hardware design exclusion
             "hw_design_excluded": is_hw_design,
             "hw_design_detail": f"PCB/Circuit Design: '{hw_design_matched}'" if is_hw_design else "",
+            # Salary
+            "interval": row.get("interval", None),
+            "min_amount": row.get("min_amount", None),
+            "max_amount": row.get("max_amount", None),
+            "currency": row.get("currency", None),
+            "salary_source": row.get("salary_source", None),
+            "salary_str": sal_str,
         })
 
     df = pd.DataFrame(results)
@@ -910,7 +940,7 @@ def main():
     # ── Save CSV ────────────────────────────────────────────────────────────
     csv_cols = [
         "relevance_tier", "embedded_tier", "career_track",
-        "title", "company", "location", "date_posted",
+        "title", "company", "location", "date_posted", "salary_str",
         "relevance_score", "semantic_purity", "depth_raw", "noise_count",
         "depth_keywords", "noise_keywords",
         "track_detail", "clearance_detail", "job_url", "site"
@@ -922,7 +952,7 @@ def main():
     # ── Terminal Summary ────────────────────────────────────────────────────
     display_cols = [
         "relevance_tier", "embedded_tier", "career_track",
-        "title", "company", "date_posted",
+        "title", "company", "salary_str", "date_posted",
         "relevance_score", "semantic_purity", "depth_keywords"
     ]
     display_cols = [c for c in display_cols if c in filtered.columns]
@@ -983,6 +1013,8 @@ def main():
             "date_posted": str(row.get("date_posted", "")),
             "url": str(row.get("job_url", "")),
             "source": str(row.get("site", "")),
+            # Salary
+            "salary": str(row.get("salary_str", "")),
             # Semantic depth
             "relevance": str(row.get("relevance_tier", "")),
             "embedded_tier": str(row.get("embedded_tier", "")),
@@ -1002,6 +1034,7 @@ def main():
                 f"Score={int(row.get('relevance_score', 0))} | "
                 f"Purity={float(row.get('semantic_purity', 0)):.0%} | "
                 f"{row.get('track_detail', '')}"
+                f"{' | 💰 ' + str(row.get('salary_str', '')) if row.get('salary_str') else ''}"
             ),
         }
         kanban_entries.append(entry)
