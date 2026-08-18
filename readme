@@ -1,0 +1,20 @@
+使用標準的 venv 虛擬環境
+如果你想用 Python 內建的方式，也是標準做法：
+
+1. 安裝 venv 工具（如果系統還沒有）
+
+Bash
+sudo apt update && sudo apt install python3-full -y
+2. 建立並啟用虛擬環境
+
+Bash
+python3 -m venv .venv
+source .venv/bin/activate
+執行完 source 後，你的命令列前端應該會出現 (.venv) 的字樣。
+
+3. 在虛擬環境中安裝並執行
+
+Bash
+pip install pandas python-jobspy
+python linkedin_job_search.py
+之後如果要離開這個虛擬環境，輸入 deactivate 即可。

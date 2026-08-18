@@ -254,77 +254,88 @@ SCHEDULE_STOP = threading.Event()
 
 def scheduler_loop():
     """Background thread: check every 30s if a scheduled search is due."""
+    print("[scheduler] Scheduler thread started", flush=True)
     while not SCHEDULE_STOP.is_set():
-        cfg = load_schedule()
-        if cfg.get("enabled"):
-            now = datetime.now()
-            due = False
-            mode = cfg.get("mode", "interval")
+        try:
+            cfg = load_schedule()
+            if cfg.get("enabled"):
+                now = datetime.now()
+                due = False
+                mode = cfg.get("mode", "interval")
 
-            if mode == "times":
-                times = cfg.get("times", ["06:00", "22:00"])
-                today_str = now.strftime("%Y-%m-%d")
-                # Track which (date_time) combos have already fired
-                fired_map = cfg.get("_fired_today", {})
-                already_fired = fired_map.get(today_str, [])
-                for t in times:
-                    if t in already_fired:
-                        continue
-                    target = datetime.strptime(f"{today_str} {t}", "%Y-%m-%d %H:%M")
-                    # Fire if current time has passed the scheduled time
-                    # (within last 2h to avoid catch-up from hours ago)
-                    if now >= target and (now - target).total_seconds() < 7200:
-                        due = True
-                        break
-            else:
-                interval = cfg.get("interval_hours", 6)
-                last = cfg.get("last_run")
-                if last:
-                    if now >= datetime.fromisoformat(last) + timedelta(hours=interval):
-                        due = True
-                else:
-                    due = True
-
-            if due:
-                print(f"[scheduler] Triggering search at {now.strftime('%Y-%m-%d %H:%M')}")
-                ok, _ = start_search()
-                if ok:
-                    while True:
-                        st = get_search_status()
-                        if not st["running"]:
+                if mode == "times":
+                    times = cfg.get("times", ["06:00", "22:00"])
+                    today_str = now.strftime("%Y-%m-%d")
+                    # Track which (date_time) combos have already fired
+                    fired_map = cfg.get("_fired_today", {})
+                    already_fired = fired_map.get(today_str, [])
+                    for t in times:
+                        if t in already_fired:
+                            continue
+                        target = datetime.strptime(f"{today_str} {t}", "%Y-%m-%d %H:%M")
+                        # Fire if current time has passed the scheduled time
+                        # (within last 6h so a late-waking machine still catches
+                        # the morning scan, while avoiding stale catch-up)
+                        if now >= target and (now - target).total_seconds() < 21600:
+                            due = True
                             break
-                        time.sleep(5)
-                    global JOBS, DATA_FILE, CURRENT_FILE
-                    JOBS, DATA_FILE = load_jobs()
-                    CURRENT_FILE = DATA_FILE
-                    now2 = datetime.now()
-                    cfg["last_run"] = now2.isoformat()
-                    cfg["last_run_date"] = now2.strftime("%Y-%m-%d")
-                    if mode == "times":
-                        fired_map = cfg.get("_fired_today", {})
-                        today_str = now2.strftime("%Y-%m-%d")
-                        if today_str not in fired_map:
-                            fired_map[today_str] = []
-                        # Record the time that just fired
-                        fired_time = now2.strftime("%H:%M")
-                        for t in times:
-                            target = datetime.strptime(f"{today_str} {t}", "%Y-%m-%d %H:%M")
-                            if abs((now2 - target).total_seconds()) < 3600:
-                                if t not in fired_map[today_str]:
-                                    fired_map[today_str].append(t)
-                                break
-                        cfg["_fired_today"] = fired_map
-                        # Determine next run time
-                        future = [t for t in times if t > now2.strftime("%H:%M")]
-                        next_t = future[0] if future else times[0]
-                        cfg["next_run"] = f"{now2.strftime('%Y-%m-%d')} {next_t}"
-                        # Clean up entries older than 3 days
-                        old_dates = [d for d in fired_map if d < (now2 - timedelta(days=3)).strftime("%Y-%m-%d")]
-                        for d in old_dates:
-                            del fired_map[d]
+                else:
+                    interval = cfg.get("interval_hours", 6)
+                    last = cfg.get("last_run")
+                    if last:
+                        if now >= datetime.fromisoformat(last) + timedelta(hours=interval):
+                            due = True
                     else:
-                        cfg["next_run"] = (now2 + timedelta(hours=cfg.get("interval_hours", 6))).isoformat()
-                    save_schedule(cfg)
+                        due = True
+
+                if due:
+                    print(f"[scheduler] Triggering search at {now.strftime('%Y-%m-%d %H:%M')}", flush=True)
+                    ok, _ = start_search()
+                    if ok:
+                        while True:
+                            st = get_search_status()
+                            if not st["running"]:
+                                break
+                            time.sleep(5)
+                        global JOBS, DATA_FILE, CURRENT_FILE
+                        JOBS, DATA_FILE = load_jobs()
+                        CURRENT_FILE = DATA_FILE
+                        now2 = datetime.now()
+                        cfg["last_run"] = now2.isoformat()
+                        cfg["last_run_date"] = now2.strftime("%Y-%m-%d")
+                        if mode == "times":
+                            fired_map = cfg.get("_fired_today", {})
+                            today_str = now2.strftime("%Y-%m-%d")
+                            if today_str not in fired_map:
+                                fired_map[today_str] = []
+                            # Record the time that just fired
+                            fired_time = now2.strftime("%H:%M")
+                            for t in times:
+                                target = datetime.strptime(f"{today_str} {t}", "%Y-%m-%d %H:%M")
+                                if abs((now2 - target).total_seconds()) < 21600:
+                                    if t not in fired_map[today_str]:
+                                        fired_map[today_str].append(t)
+                                    break
+                            cfg["_fired_today"] = fired_map
+                            # Determine next run time
+                            future = [t for t in times if t > now2.strftime("%H:%M")]
+                            if future:
+                                next_t = future[0]
+                                next_date = now2.strftime("%Y-%m-%d")
+                            else:
+                                # All times passed -> next run is tomorrow's first slot
+                                next_t = times[0]
+                                next_date = (now2 + timedelta(days=1)).strftime("%Y-%m-%d")
+                            cfg["next_run"] = f"{next_date} {next_t}"
+                            # Clean up entries older than 3 days
+                            old_dates = [d for d in fired_map if d < (now2 - timedelta(days=3)).strftime("%Y-%m-%d")]
+                            for d in old_dates:
+                                del fired_map[d]
+                        else:
+                            cfg["next_run"] = (now2 + timedelta(hours=cfg.get("interval_hours", 6))).isoformat()
+                        save_schedule(cfg)
+        except Exception as e:
+            print(f"[scheduler] Error: {e}", flush=True)
         SCHEDULE_STOP.wait(30)
 
 
@@ -419,10 +430,17 @@ def api_schedule():
         if SCHEDULE_CONFIG["enabled"]:
             if SCHEDULE_CONFIG.get("mode") == "times":
                 times = SCHEDULE_CONFIG.get("times", ["06:00", "22:00"])
-                now_str = datetime.now().strftime("%H:%M")
+                now = datetime.now()
+                now_str = now.strftime("%H:%M")
                 future = [t for t in sorted(times) if t > now_str]
-                next_t = future[0] if future else sorted(times)[0]
-                SCHEDULE_CONFIG["next_run"] = f"{datetime.now().strftime('%Y-%m-%d')} {next_t}"
+                if future:
+                    next_t = future[0]
+                    next_date = now.strftime("%Y-%m-%d")
+                else:
+                    # All times passed -> next run is tomorrow's first slot
+                    next_t = sorted(times)[0]
+                    next_date = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+                SCHEDULE_CONFIG["next_run"] = f"{next_date} {next_t}"
             else:
                 last = SCHEDULE_CONFIG.get("last_run")
                 base = datetime.fromisoformat(last) if last else datetime.now()
