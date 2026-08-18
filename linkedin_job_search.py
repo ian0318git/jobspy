@@ -316,18 +316,24 @@ SECURITY_CLEARANCE_PATTERNS = [
     (r'\b(?:must\s+hold|requires?|requiring)\s+(?:an?\s+)?(?:Australian|Defence)\s*(?:Government|Security)?\s*(?:Security)?\s*Clearance\b',
      "Government Clearance"),
     # ── Generic clearance mentions ──
-    (r'\bSecurity\s+Clearance\s*(?::|required|must|essential|mandatory|needed)\b',
+    # (?<!no )(?<!not ) guards: "No security clearance required" must not match
+    (r'(?<!no )(?<!not )Security\s+Clearance\s*(?::|required|must|essential|mandatory|needed)\b',
      "Security Clearance Required"),
-    (r'\b(?:must|requires?|need(?:ed)?|essential)\s+.*?\bclearance\b',
+    # Tempered dot: don't cross "no"/"not" — "requires no security clearance" must not match
+    (r'\b(?:must|requires?|need(?:ed)?|essential)\s+(?:(?!\bno\b|\bnot\b).)*?\bclearances?\b',
      "Clearance Required"),
-    (r'\beligible\s+to\s+obtain\s+(?:and\s+maintain\s+)?(?:a\s+)?(?:security\s+)?clearance\b',
+    (r'\beligible\s+to\s+obtain\s+(?:and\s+maintain\s+)?(?:a\s+)?(?:security\s+)?clearances?\b',
      "Must Obtain Clearance"),
-    (r'\bability\s+to\s+obtain\s+(?:and\s+maintain\s+)?(?:a\s+)?(?:security\s+)?clearance\b',
+    (r'\bability\s+to\s+obtain\s+(?:and\s+maintain\s+)?(?:a\s+)?(?:security\s+)?clearances?\b',
      "Must Obtain Clearance"),
-    (r'\bclearance\s*(?::|is|are)\s*(?:required|essential|mandatory|needed|must|a\s+must)\b',
+    (r'\b(?:must\s+)?(?:be|are)\s+able\s+to\s+obtain\s+(?:and\s+maintain\s+)?(?:a\s+)?(?:security\s+)?clearances?\b',
+     "Must Obtain Clearance"),
+    (r'\bclearances?\s*(?::|is|are)\s*(?:required|essential|mandatory|needed|must|a\s+must)\b',
      "Clearance Required"),
     # ── Defence / Government security ──
     (r'\bAGSVA\b', "AGSVA"),
+    (r'\bITAR\b', "ITAR Export Control"),
+    (r'\bInternational\s+Traffic\s+in\s+Arms\s+Regulations\b', "ITAR Export Control"),
     (r'\bDefence\s+(?:Security|Clearance|Vetting)\b', "Defence Clearance"),
     (r'\b(?:Australian|Commonwealth)\s+(?:Government|Public\s+Service)\s+(?:Security|Clearance)\b',
      "Government Clearance"),
@@ -356,6 +362,9 @@ CITIZENSHIP_REQUIRED_PATTERNS = [
      "PR or Citizenship Required"),
     (r'\b(?:Citizens?|citizens?|PR|Permanent\s+Resident)\s+(?:and|or)\s+(?:Citizens?|citizens?|PR|Permanent\s+Resident)\b',
      "Citizenship/PR Required"),
+    # "full, permanent work rights" excludes visa holders -> equivalent to PR/citizenship
+    (r'\b(?:must\s+have|requires?|essential|mandatory|need\s+to\s+have)\s+(?:full\s*,\s*)?permanent\s+work\s+rights\b',
+     "PR or Citizenship Required"),
     # AGSVA baseline requires at minimum PR (often citizenship)
     (r'\b(?:must|requires?|need)\s+(?:to\s+)?(?:be\s+(?:able\s+to\s+)?)?(?:eligible\s+(?:for|to\s+apply\s+for)|obtain|hold)\s+(?:a\s+)?(?:AGSVA|Australian\s+Government)\s*(?:Security)?\s*(?:Vetting|Clearance)',
      "AGSVA Required"),
@@ -721,12 +730,17 @@ def check_security_clearance(title, description=""):
                 return True, "AGSVA", label, f"AGSVA clearance: '{matched_text}'"
             elif "SCEC" in matched_text.upper():
                 return True, "SCEC", label, f"SCEC access: '{matched_text}'"
+            elif "ITAR" in matched_text.upper():
+                return True, "ITAR Export Control", label, f"ITAR export control: '{matched_text}'"
+            elif "WORK RIGHTS" in matched_text.upper():
+                return True, "PR Required", label, f"Permanent work rights required: '{matched_text}'"
             else:
                 return True, "Unknown", label, f"Clearance required: '{matched_text}'"
 
     # Check for negative patterns — explicit "no clearance needed" or "citizenship not required"
     negative_patterns = [
         r'(?:no|not)\s+(?:requiring|require|need|needing)\s+(?:a\s+)?(?:security\s+)?clearance',
+        r'\bno\s+(?:security\s+)?clearances?\s+(?:is\s+)?(?:required|needed|necessary)\b',
         r'clearance\s+(?:is\s+)?not\s+(?:required|needed|necessary)',
         r'(?:all|any)\s+(?:visas?|work\s+rights?|work\s+permits?)\s+(?:welcome|accepted|considered)',
     ]
