@@ -2,6 +2,26 @@
 
 重要決策紀錄 — 依專案工作流程要求更新。
 
+## 2026-08-19 — dashboard 改以 systemd user service 常駐
+
+**問題：** 2026-08-13 決策後 dashboard（job_board.py）為唯一排程來源，
+但僅靠 `./run.sh`（nohup）啟動，重開機或程序死掉後不會自動恢復
+（本次檢查時已無執行，job_board.log 停在當日 07:40）。
+
+**決策：** 改用 systemd user service 常駐（`~/.config/systemd/user/jobboard.service`）。
+- `Restart=always`（崩潰 5 秒後自動重啟）
+- `WantedBy=default.target` + `Linger=yes` → 開機即啟動、無需登入
+- 日誌沿用 `job_board.log`（append）
+- 排程配置（06:00 / 22:00 + 6h 補觸發）不變
+
+**管理指令：**
+- 查看：`systemctl --user status jobboard`
+- 重啟：`systemctl --user restart jobboard`
+- 停止：`systemctl --user stop jobboard`
+- 日誌：`tail -f job_board.log`
+
+**後續：** `run.sh` / `stop.sh` 保留但僅供手動除錯用；啟用服務後勿再使用。
+
 ## 2026-08-13 — 排程改為 dashboard 唯一來源
 
 **問題：** 搜尋排程有 3 個實際來源，造成重複觸發：
