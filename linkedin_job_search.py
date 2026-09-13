@@ -92,6 +92,17 @@ LOCATION = "Melbourne, Victoria, Australia"
 RESULTS_PER_TERM = 20
 HOURS_OLD = 168  # 7 days
 
+# jobspy's scrape_jobs() defaults to verbose=0, which sets its loggers to ERROR —
+# every WARNING and INFO is discarded. A whole source can then fail silently: a
+# run where Jora is Cloudflare-blocked (403) looks identical to a run that simply
+# found fewer jobs, because the "Jora: HTTP 403 (not retryable)" warning never
+# reaches the log. Since this now runs unattended on a VPS where the log is the
+# only diagnostic channel, that silence is worse than the noise.
+#   0 = ERROR (jobspy default) — silent failures
+#   1 = WARNING                  — surfaces source failures, no per-term chatter
+#   2 = INFO                     — verbose; also logs per-term item counts
+SCRAPE_VERBOSE = 1
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Output
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -783,6 +794,7 @@ def main():
                 hours_old=HOURS_OLD,
                 country_indeed="Australia",
                 linkedin_fetch_description=True,
+                verbose=SCRAPE_VERBOSE,
             )
             print(f"   → Found {len(jobs)} raw results")
             all_jobs.append(jobs)
