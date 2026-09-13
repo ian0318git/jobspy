@@ -34,13 +34,21 @@ LinkedIn 完全相同，Indeed/Seek 在正常跳動範圍內。**唯一的差異
 而那是已知且已被接受的 Cloudflare 403。原計畫把「機房 IP 對 LinkedIn/Indeed 的
 持續封鎖」列為頭號未驗證風險 —— 實測結果推翻了它。
 
-**既有缺陷（本次發現，未修）：** `scrape_jobs()` 的 `verbose` 預設值是 **0**
+**既有缺陷（本次發現並已修正，`c903c5b`）：** `scrape_jobs()` 的 `verbose` 預設值是 **0**
 （`jobspy/__init__.py:52`），而應用端從不覆寫它。`verbose=0` → `set_logger_level(0)`
 → **ERROR 等級**，因此**所有 WARNING / INFO 都被丟棄**。後果：Jora 的 403 警告
 （`jobspy/jora/__init__.py:277`）永遠不會出現在日誌中，使用者只會看到「0 筆」而無任何解釋。
 這正是先前 P0「靜默失敗」的同一個坑，違反本專案「不允許靜默失敗」原則。
-（附帶：`jobspy/util.py:140` 的 docstring 寫 `default=2`，與實際預設值 0 不符。）
-最小修法是呼叫時加 `verbose=1`，但屬既有行為變更，**留待使用者決定**。
+（附帶：`jobspy/util.py:140` 的 docstring 寫 `default=2`，與實際預設值 0 不符 —— 未修，
+屬上游文件問題。）
+
+**修正：** 呼叫端明確傳 `verbose=SCRAPE_VERBOSE`（新常數，預設 `1` = WARNING），
+並在註解中記錄 0/1/2 三級語意，避免日後被當成雜訊「清理」掉。
+選 1 而非 2：WARNING 已能暴露來源失效，又不會產生每詞的 INFO 洗版。
+
+**實測驗證（在 Jora 被擋的 VPS 上跑單詞）：** 修正後日誌確實出現
+`WARNING - JobSpy:Jora - Jora: HTTP 403 (not retryable) for https://au.jora.com/...`，
+**每詞恰好一行**，且無其他 jobspy 輸出。修正前同一情境是完全靜默的。
 
 **驗證（無自動化測試，全為手動程序）：**
 - 服務 `active` + `enabled`，`Linger=yes`，**實際重開機後自動起**（boot id 已變、
