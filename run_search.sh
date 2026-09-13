@@ -18,7 +18,7 @@ source .venv/bin/activate
 echo "============================================"
 echo "🔍 開始搜尋工作..."
 echo "   搜尋條件: Melbourne Embedded Jobs"
-echo "   搜尋平台: LinkedIn + Indeed + Google + Seek"
+echo "   搜尋平台: LinkedIn + Indeed + Seek + Jora"
 echo "============================================"
 
 python linkedin_job_search.py

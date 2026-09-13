@@ -13,7 +13,7 @@ Two scripts:
 
 | Script | Purpose |
 |--------|---------|
-| `linkedin_job_search.py` | Scrapes 4 job boards (LinkedIn, Indeed, Google, **Seek**) for embedded jobs, scores them with 3 AI engines, outputs CSV + Kanban JSON |
+| `linkedin_job_search.py` | Scrapes 4 job boards (LinkedIn, Indeed, **Seek**, **Jora**) for embedded jobs, scores them with 3 AI engines, outputs CSV + Kanban JSON |
 | `job_board.py` | Flask web UI — Kanban board with status tracking, filtering, historical file browser, and auto-scheduler |
 
 ---
@@ -115,7 +115,10 @@ All config lives at the top of `linkedin_job_search.py`:
 | `HOURS_OLD` | `168` (7 days) | Max job age |
 | `OUTPUT_DIR` | `"search_results"` | Output directory |
 
-**Job boards used:** LinkedIn, Indeed, Google for Jobs, and **Seek** (via built-in custom scraper).
+**Job boards used:** LinkedIn, Indeed, **Seek** and **Jora** (the latter two via built-in custom scrapers).
+
+> **Note:** Google for Jobs was removed — it now serves a JS-required shell with no server-rendered
+> results, so it returned 0 jobs. PyPI's latest jobspy (1.1.82) has no upstream fix.
 
 Schedule config is managed via the Web UI or by editing `.job_board_schedule.json`:
 
@@ -150,6 +153,9 @@ Schedule config is managed via the Web UI or by editing `.job_board_schedule.jso
 - JobSpy rate limits aggressively. Wait a few minutes between runs.
 - LinkedIn blocks after ~10 pages without proxies. Indeed is more lenient.
 - **Seek** results are scraped from HTML — Seek may block repeated requests; using proxies helps.
+- **Jora** is behind Cloudflare and requires a residential IP. It works from this machine but returns
+  HTTP 403 ("Just a moment...") from the Oracle VPS, whose datacenter IP scores as suspicious.
+  It also ignores server-side date filters, so `HOURS_OLD` is applied client-side in the scraper.
 
 **Too many irrelevant results?**
 - Add noise patterns to `IT_NOISE_PATTERNS` in `linkedin_job_search.py`.

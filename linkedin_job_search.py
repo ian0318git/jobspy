@@ -774,7 +774,7 @@ def main():
         print(f"\n🔎 Searching: '{term}' ...")
         try:
             jobs = scrape_jobs(
-                site_name=["linkedin", "indeed", "google", "seek"],
+                site_name=["linkedin", "indeed", "seek", "jora"],
                 search_term=term,
                 google_search_term=f"{term} jobs Melbourne Victoria",
                 location=LOCATION,
