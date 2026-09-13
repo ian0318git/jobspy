@@ -878,7 +878,7 @@ function renderCards(){
       <div class="row4">
         <div class="left">
           <a class="url-btn" href="${escHtml(j.url)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">🔗 View on ${escHtml(j.source||'site')} →</a>
-          ${j.noise_warning?`<span style="font-size:0.7rem;color:#f87171;">⚠️ Noise: ${escHtml(j.noise_warning)}</span>`:''}
+          ${j.noise_warning && (j.relevance==='🤔 Weak Signal'||j.relevance==='❌ IT Noise / Irrelevant')?`<span style="font-size:0.7rem;color:#f87171;">⚠️ Noise: ${escHtml(j.noise_warning)}</span>`:''}
         </div>
         <div class="status-btns">${statusBtns}</div>
       </div>

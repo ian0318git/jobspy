@@ -589,6 +589,7 @@ def compute_semantic_depth(title, description, company):
         "azure", "aws ", "devops", "ci/cd pipeline", "jenkins pipeline",
         "github actions", "docker swarm", "kubernetes", "k8s",
         "terraform", "helm chart", "infrastructure as code",
+        "cloud-native", "cloud native",
     }
     if hardware_count > 0:
         noise_signals = [n for n in noise_signals if n not in EMBEDDED_ADJACENT_NOISE]
@@ -1035,7 +1036,14 @@ def main():
             "score": int(row.get("relevance_score", 0)),
             "purity": float(row.get("semantic_purity", 0)),
             "matched_on": str(row.get("depth_keywords", "")),
-            "noise_warning": str(row.get("noise_keywords", "")) if row.get("noise_count", 0) > 0 else "",
+            # Only surface noise keywords on weak/non-matches — strong
+            # matches with incidental cloud/DevOps mentions stay clean.
+            "noise_warning": (
+                str(row.get("noise_keywords", ""))
+                if row.get("noise_count", 0) > 0
+                and row.get("relevance_tier") in ("🤔 Weak Signal", "❌ IT Noise / Irrelevant")
+                else ""
+            ),
             # Career track
             "career_track": str(row.get("career_track", "")),
             "track_detail": str(row.get("track_detail", "")),
