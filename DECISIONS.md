@@ -2,6 +2,66 @@
 
 重要決策紀錄 — 依專案工作流程要求更新。
 
+## 2026-09-13 — 完整遷移到 Oracle VPS，以 SSH tunnel 存取 dashboard
+
+**問題：** dashboard 只綁本機 LAN（`http://192.168.44.128:5000`），離開家裡網段就無法開啟。
+
+**兩個決策（使用者選定）：**
+1. **全部搬 VPS** —— 爬蟲與 dashboard 都在 VPS 執行，本機退役。**接受 Jora 歸零**。
+2. **SSH tunnel 存取** —— 不公開任何埠、不改 iptables / OCI security list、不加認證程式碼。
+   VPS 的 unit 明確設 `JOB_BOARD_HOST=127.0.0.1`（僅縱深防禦）。
+
+**遷移中發現的 P0（若不處理會靜默全滅）：** `pip install python-jobspy` 從 PyPI 裝到的是
+上游 1.1.82，**沒有 `JORA` 成員**。而 `get_site_type()` 用 list comprehension 建 `site_types`
+（`jobspy/__init__.py:82-86`），**一個未知名稱就讓四個來源全部中止**，且在任何 HTTP 請求
+之前就爆掉；例外被 `linkedin_job_search.py:787` 的 broad `except` 吞掉 → 印
+`❌ No results found` → **exit code 仍是 0** → dashboard 顯示 `✅ Search completed!`。
+修正：改用 **editable install**（`pip install -e ~/jobspy`），與本機的 `python_jobspy.pth` 一致。
+已實測：`import jobspy` 解析到 `/home/ubuntu/jobspy/jobspy/__init__.py`、
+site-packages **沒有** shadow `jobspy/` 目錄、`Site` 有 10 個成員（上游 9 個，無 jora）。
+
+**關鍵量測 —— 機房 IP 沒有被節流（本次最重要的結論）：**
+同一組 6 個搜尋詞，本機 vs VPS 逐來源比對：
+
+| 來源 | 本機 | VPS |
+|------|------|-----|
+| linkedin | 11 | **11** |
+| indeed | 5 | 6 |
+| seek | 2 | 1 |
+| jora | 11 | **0** |
+
+LinkedIn 完全相同，Indeed/Seek 在正常跳動範圍內。**唯一的差異就是 Jora**，
+而那是已知且已被接受的 Cloudflare 403。原計畫把「機房 IP 對 LinkedIn/Indeed 的
+持續封鎖」列為頭號未驗證風險 —— 實測結果推翻了它。
+
+**既有缺陷（本次發現，未修）：** `scrape_jobs()` 的 `verbose` 預設值是 **0**
+（`jobspy/__init__.py:52`），而應用端從不覆寫它。`verbose=0` → `set_logger_level(0)`
+→ **ERROR 等級**，因此**所有 WARNING / INFO 都被丟棄**。後果：Jora 的 403 警告
+（`jobspy/jora/__init__.py:277`）永遠不會出現在日誌中，使用者只會看到「0 筆」而無任何解釋。
+這正是先前 P0「靜默失敗」的同一個坑，違反本專案「不允許靜默失敗」原則。
+（附帶：`jobspy/util.py:140` 的 docstring 寫 `default=2`，與實際預設值 0 不符。）
+最小修法是呼叫時加 `verbose=1`，但屬既有行為變更，**留待使用者決定**。
+
+**驗證（無自動化測試，全為手動程序）：**
+- 服務 `active` + `enabled`，`Linger=yes`，**實際重開機後自動起**（boot id 已變、
+  uptime 0 分鐘、未經登入即啟動）
+- 只聽 `127.0.0.1:5000`，對外**連不上**（iptables 只放行 22，已實測拒絕）
+- tunnel 進來的頁面與 VPS loopback 直取**位元組完全相同**（29,220 bytes）
+- 歷史 209 次執行、`.job_statuses.json` 32 筆（7 Rejected / 24 Applied / 1 Interview）
+  全部跨重開機倖存；status overlay 逐筆比對 0 筆不符
+- 排程 `enabled: true`、`next_run 2026-09-13 22:00`、`times [06:00, 22:00]`
+
+**存取方式：**
+```bash
+ssh -N -L 5000:127.0.0.1:5000 ubuntu@129.150.42.124
+```
+然後瀏覽器開 `http://localhost:5000`。tunnel 斷了重跑即可。
+
+**本機處置：** 服務 `stop` + `disable`（**只停用、不刪除**），程式與資料原封不動，
+必要時 `systemctl --user enable --now jobboard` 一行復原。本機埠 5000 已釋出給 tunnel 用。
+
+**生效：** job_board.py 每次搜尋 spawn 新 subprocess，無需重啟。
+
 ## 2026-09-13 — 移除失效的 Google 來源、新增 Jora（au.jora.com）
 
 **問題：** Google 來源每次回傳 0 筆，卻仍在 48 個搜尋詞的迴圈中被呼叫 48 次。

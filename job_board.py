@@ -7,7 +7,9 @@ Usage:
     pip install flask
     python job_board.py
 
-    Then open Chrome → http://192.168.44.128:5000
+    Then open Chrome → http://127.0.0.1:5000
+    (On a remote host, reach it through an SSH tunnel:
+     ssh -N -L 5000:127.0.0.1:5000 user@host — then browse 127.0.0.1:5000)
 
 Features:
   - Full-width job cards with compact status controls
@@ -34,7 +36,11 @@ from datetime import datetime, timedelta
 from flask import Flask, jsonify, request
 
 # ── Config ───────────────────────────────────────────────────────────────────
-PORT = 5000
+# Bind address is env-overridable so a remote deployment can restrict itself to
+# loopback (JOB_BOARD_HOST=127.0.0.1) without editing code. The default is kept
+# at 0.0.0.0 so existing LAN usage is unchanged.
+HOST = os.environ.get("JOB_BOARD_HOST", "0.0.0.0")
+PORT = int(os.environ.get("JOB_BOARD_PORT", "5000"))
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 os.chdir(SCRIPT_DIR)
 
@@ -1020,11 +1026,11 @@ if __name__ == "__main__":
     print("=" * 60)
     print("🔍 Embedded Job Board")
     print(f"   Data : {DATA_FILE or '(no kanban JSON)'}")
-    print(f"   URL  : http://192.168.44.128:{PORT}")
+    print(f"   Bind : {HOST}:{PORT}")
     print(f"   Sched: {'ON' if SCHEDULE_CONFIG.get('enabled') else 'OFF'} "
           f"(every {SCHEDULE_CONFIG.get('interval_hours', 6)}h)")
     print("=" * 60)
     try:
-        app.run(host="0.0.0.0", port=PORT, debug=False)
+        app.run(host=HOST, port=PORT, debug=False)
     finally:
         SCHEDULE_STOP.set()
