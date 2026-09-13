@@ -41,6 +41,12 @@ from flask import Flask, jsonify, request
 # at 0.0.0.0 so existing LAN usage is unchanged.
 HOST = os.environ.get("JOB_BOARD_HOST", "0.0.0.0")
 PORT = int(os.environ.get("JOB_BOARD_PORT", "5000"))
+# Optional label appended to the dashboard title, so two instances (say a local
+# one and a VPS one) can be told apart when both are open in browser tabs —
+# otherwise the tab strip shows identical titles for different data.
+# Empty by default, so existing single-machine usage is unchanged.
+LABEL = os.environ.get("JOB_BOARD_LABEL", "").strip()
+BOARD_TITLE = f"Embedded Job Board ({LABEL})" if LABEL else "Embedded Job Board"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 os.chdir(SCRIPT_DIR)
 
@@ -355,7 +361,9 @@ _scheduler_thread.start()
 
 @app.route("/")
 def index():
-    return _HTML
+    # _HTML is a raw string (the page is mostly CSS/JS braces, so an f-string
+    # would be a minefield), hence the sentinel substitution here.
+    return _HTML.replace("__BOARD_TITLE__", BOARD_TITLE)
 
 
 @app.route("/api/files")
@@ -478,7 +486,7 @@ _HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>🔍 Embedded Job Board</title>
+<title>🔍 __BOARD_TITLE__</title>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 body{
@@ -645,7 +653,7 @@ body{
 
 <div class="header">
   <div>
-    <h1>🔍 Embedded Job Board</h1>
+    <h1>🔍 __BOARD_TITLE__</h1>
     <div class="meta">
       📂 <select id="file-selector" onchange="switchFile(this.value)"><option>Loading...</option></select>
       <span id="job-count" style="font-size:0.75rem;color:#64748b;">—</span>
@@ -1024,7 +1032,7 @@ init();
 # ── Main ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print("=" * 60)
-    print("🔍 Embedded Job Board")
+    print(f"🔍 {BOARD_TITLE}")
     print(f"   Data : {DATA_FILE or '(no kanban JSON)'}")
     print(f"   Bind : {HOST}:{PORT}")
     print(f"   Sched: {'ON' if SCHEDULE_CONFIG.get('enabled') else 'OFF'} "
