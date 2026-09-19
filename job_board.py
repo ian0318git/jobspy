@@ -662,8 +662,6 @@ def _external_idle_seconds():
         return time.monotonic() - _EXTERNAL["last_read_at"]
 
 
-# 日誌輸出的序列化鎖，搭配「整行一次 write()」。兩個都必要。
-#
 # 為什麼不能直接用 print()：`print()` 是**兩次** write() —— 先寫內容、再寫換行。
 # stdout 在 systemd 的 `StandardOutput=append:` 下是 O_APPEND 的檔案，兩個執行緒
 # 交錯時換行就會被吞掉、兩行黏成一行。2026-09-19 在 job_board.log 實際觀察到：
@@ -673,15 +671,19 @@ def _external_idle_seconds():
 # （23:05 那次啟動正常、23:39 那次黏住 —— 是間歇性的 race，不是每次都會中。）
 # 這正好抵銷 _log() 加時戳的目的：加時戳就是為了對齊，黏行反而更難追。
 #
-# 單次 write() 在 O_APPEND 下具原子性，所以「整行一次寫」就夠；鎖則是為了讓
-# 緩衝與沖刷也落在同一段臨界區內（TextIOWrapper 會緩衝，write() 之後還要 flush()
-# 才真的落到 fd；中間被插隊的話仍然會亂）。
+# 【真正有效的是「整行一次 write()」】—— O_APPEND 下的單次 write() 具原子性，
+# 所以一行只要一次 write()，黏行在結構上就不可能發生。這是被變異測試逼出來的
+# 結論，不是推理：M12（保留鎖、改用 print 的兩次 write）會被逮捕，而
+# M13（拿掉鎖、保留單次 write）**逃脫** —— 也就是說下面這把鎖【不是】load-bearing，
+# 目前沒有任何測試能證明少了它會出問題。留著是 defence in depth（而且成本在這種
+# 日誌量下可忽略），但**不要以為它是那個修正**。詳見 DECISIONS.md 第四輪條目。
 _LOG_LOCK = threading.Lock()
 
 
 def _out(line: str = "") -> None:
-    """整行一次寫出並立刻沖刷，且與其他 _log()/_out() 互斥。
+    """整行一次 write() 寫出並立刻沖刷，且與其他 _log()/_out() 互斥。
 
+    整行一次 write() 是機制本身（見上方說明）；鎖只是額外的序列化。
     【不要】在這個模組裡用 print() 輸出會與背景執行緒競爭的訊息
     （watchdog / jobscan 監看 / 掃描生命週期）—— 一律走這裡。
     """

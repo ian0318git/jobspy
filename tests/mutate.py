@@ -40,6 +40,18 @@ TEST = "tests/test_scan_lock.py"
 # 每個變異的逾時。正常一輪約 6 秒；被逮捕的變異通常更快，但留足餘裕。
 TIMEOUT = 400
 
+# 已知會逃脫、且【已經理解為什麼】的變異。
+#
+# 空集合才是理想狀態 —— 但把「已理解的逃脫」跟「沒被發現的覆蓋缺口」混在一起
+# 回報，等於讓這個工具失去訊號。所以：列在這裡的逃脫不影響退出碼，但一定會
+# 印出來，而且必須在 DECISIONS.md 有對應的說明。
+#
+# M13（拿掉 _LOG_LOCK）：黏行的成因是 print() 把一行拆成兩次 write()，
+#   而 O_APPEND 下的單次 write() 具原子性 —— 所以「整行一次 write」就足以讓黏行
+#   結構上不可能，鎖不是 load-bearing。留著它是 defence in depth，不是那個修正。
+#   **這代表目前沒有任何測試能證明少了鎖會出問題**，這是已知且接受的狀態。
+EXPECTED_ESCAPES = {"M13"}
+
 
 def git(*args, check=True):
     return subprocess.run(["git", *args], cwd=REPO, capture_output=True,
@@ -183,10 +195,21 @@ escaped = [r for r in results if "逃脫" in str(r[2]) or r[1] == "ANCHOR-FAIL"]
 for label, stat, verdict in results:
     print(f"  {label:44s} {stat:>18s}  {verdict}")
 print("=" * 80)
-if escaped:
-    print(f"\n⚠️  {len(escaped)} 個變異沒有被逮捕：")
-    for label, _, v in escaped:
+
+known = [r for r in escaped if r[0].split()[0] in EXPECTED_ESCAPES]
+new = [r for r in escaped if r[0].split()[0] not in EXPECTED_ESCAPES]
+
+if known:
+    print(f"\nℹ️  {len(known)} 個【已知且已理解】的逃脫（見 EXPECTED_ESCAPES 與 DECISIONS.md）：")
+    for label, _, v in known:
+        print(f"   - {label}  {v}")
+
+if new:
+    print(f"\n⚠️  {len(new)} 個變異沒有被逮捕（＝那項修正沒有回歸保護）：")
+    for label, _, v in new:
         print(f"   - {label}  {v}")
     sys.exit(1)
-print(f"\n✅ 全部 {len(MUTATIONS)} 個變異都被逮捕")
+
+print(f"\n✅ {len(MUTATIONS) - len(known)}/{len(MUTATIONS)} 個變異被逮捕"
+      + (f"，{len(known)} 個為已知逃脫" if known else "，無逃脫"))
 sys.exit(0)
