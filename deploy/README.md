@@ -118,14 +118,14 @@ tail -f logs/cron_search.log
 
 ## 測試覆蓋（誠實聲明）
 
-**這個專案的自動化測試只有一支**：`tests/test_scan_lock.py`（55 項檢查）。
+**這個專案的自動化測試只有一支**：`tests/test_scan_lock.py`（56 項檢查）。
 其餘全部是手動驗證 —— 上面各節的「驗證」指令就是手動程序。
 
 ```bash
 cd /home/ian/github-project/jobspy
 .venv/bin/python tests/test_scan_lock.py     # 通過時印「✅ 全數通過」且 exit 0
 
-# 要引用「幾項」時用這個量，不要憑印象寫 —— 這個數字已經腐化過三次（28→39→53→55）：
+# 要引用「幾項」時用這個量，不要憑印象寫 —— 這個數字已經腐化過四次（28→39→53→55→56）：
 .venv/bin/python tests/test_scan_lock.py | grep -c '\[PASS\]'
 ```
 
@@ -139,7 +139,13 @@ cd /home/ian/github-project/jobspy
 | F | 17 | 孤兒鎖盲區、誤殺無關行程、幻影掃描、假成功、`cmdline` 身分驗證（第三輪退回） |
 | F7 | 7 | 殺戮路徑的**正向**覆蓋：必須開火、且目標真的死掉（第四輪退回） |
 | G | 4 | `errors="replace"` 與 TOCTOU 重檢的回歸保護（第四輪退回） |
-| H | 2 | 日誌每行必須**一次** `write()` 寫出（見下） |
+| H | 3 | 日誌每行必須**一次** `write()` 寫出（第五輪退回，見下） |
+| I | 1 | `job_board.py` 不得有 live 的 `print()`（第五輪退回） |
+
+> **H 區的 `PYTHONUNBUFFERED` 前提**：黏行的成因（`print` 拆成兩次 `write()`）
+> 只有 stdout **不緩衝**時才會顯現 —— 第五輪審查用有緩衝的檔案實測，`print`
+> 竟然 0 黏行。unit 裡的 `Environment=PYTHONUNBUFFERED=1` 是這個缺陷的前提之一。
+> **拿掉它、或把日誌改成 `StandardOutput=journal`，測試不會提醒你。**
 
 **測試本身有護欄**（因為它 import `job_board` 會連帶啟動背景 watchdog）：
 
@@ -165,7 +171,7 @@ cd /home/ian/github-project/jobspy
 
 ```bash
 cd /home/ian/github-project/jobspy
-.venv/bin/python tests/mutate.py      # 需要乾淨的工作區；會改寫並還原 job_board.py
+.venv/bin/python tests/mutate.py     # 需乾淨的工作區；在 /tmp 隔離副本裡跑
 ```
 
 目前 **13 個變異、12 個被逮、1 個已知逃脫**（M13，理由見 `../DECISIONS.md`
@@ -173,23 +179,39 @@ cd /home/ian/github-project/jobspy
 覆蓋缺口」分開回報，只有後者會讓退出碼變 1）。**若你新增修正卻找不到會失敗的
 變異，代表那個修正沒有被測試覆蓋。**
 
-三個踩過的坑，寫在這裡免得重蹈：
+> ⚠️ **這個工具不會碰生產目錄。** 第五輪審查抓到：舊版直接改寫 repo 裡的
+> `job_board.py`，13 個變異每個會在磁碟上存在 5–25 秒，而 `jobboard.service` 是
+> `Restart=always` + `MemoryMax=512M` —— 若這段窗口內被 OOM 殺掉而重啟，
+> **新行程載入的就是那個變異**（清單裡有 M5／M6／M8，其中 M8 是停滯偵測整個
+> no-op）。現在改用 `git archive HEAD` 解到 `/tmp` 的隔離副本，生產檔案從頭到尾
+> 不被寫入，結束時以 sha256 驗證。
+
+四個踩過的坑，寫在這裡免得重蹈：
 
 - **假變異**：改到註解的變異**不可能改變行為**，所以永遠不會 FAIL、永遠「逃脫」。
   看到「逃脫」先懷疑變異本身。
 - **殘留檢查不能用 grep**：「把 `kill_stalled_external` 整個 no-op」的變異是一個
-  裸的 `return None`，任何樣式比對都抓不到。還原一律用
-  `git checkout -- job_board.py`，並以 `git diff --stat` 驗證。
+  裸的 `return None`，任何樣式比對都抓不到。現在靠的是「根本不在生產目錄裡跑」，
+  比事後檢查殘留更根本。
 - **⚠️ 有修正 ≠ 有回歸保護，連寫測試的人自己都會中**：H 區第一版用 8 執行緒對
   `StringIO` 猛寫、斷言沒有黏行 —— 結果把 `_out()` 退回修正前的 `print()`（M11）
   之後**全數通過**。`StringIO` 太快，GIL 在兩次 `write()` 之間幾乎不切換，
-  race 逼不出來。**改成斷言成因**（用假的 stdout 數 `write()` 呼叫次數，
-  必須恰好 1 次），這是決定性的、不會間歇性失敗。
-  原本那個併發測試**保留但已重新標示**為一般性煙霧測試 —— **它不是這個缺陷的
-  守衛**。繼續宣稱它有保護作用，就是同一種錯用小包裝再犯一次。
+  race 逼不出來。修法是**斷言成因而非賭 race**（逐次檢查 `write()` 呼叫），
+  決定性、不會間歇性失敗。
+- **⚠️ 同一個錯，我在下一輪又犯了一次**：補上的 I 區（AST 掃描）第一版把
+  「落在 `_out` span 內」整段豁免，於是 M11 的那個 `print` 也被放行 ——
+  **這一項根本沒開火，而測試仍然是綠的**。發現方式是對照失敗項數：
+  照理三項該響卻只有兩項。
+  **變異測試不只驗證修正，也驗證了驗證本身。** 光看「測試通過」永遠不夠 ——
+  唯一能區分的動作是把修正改回去，看它會不會響。
 
 ### ⚠️ 未涵蓋（不要以為有測試就安全）
 
+- **`linkedin_job_search.py` 有同一個兩次 syscall 的結構**（56 個 `print`，
+  `jobscan.service` 同樣 `PYTHONUNBUFFERED=1`）。今天沒有症狀（`_worker` 不 print，
+  `cron_search.log` 用雙時戳啟發式檢查 0 筆），但若爬蟲改多執行緒輸出、或
+  `run_scan.sh` 的 echo 與爬蟲的 print 交錯，同一個缺陷會在另一份日誌復發。
+  **I 區的 AST 掃描只涵蓋 `job_board.py`。**
 - **`run_scan.sh` 的 bash 端：零自動化測試。** 鎖重試、`SKIPPED` 路徑、`LOCK_WAIT`
   驗證、`finish()`／`trap` 的退出碼語意，全部只有手動驗證過。改這支腳本時請照
   上面「手動操作」一節實測。

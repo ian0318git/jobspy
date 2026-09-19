@@ -2,6 +2,120 @@
 
 重要決策紀錄 — 依專案工作流程要求更新。
 
+## 2026-09-20 — 變異工具在生產主機上、以及三個「有修正沒守衛」的補強（第五輪審查）
+
+第五輪 Senior Reviewer 對 `46a8fff` 判定 **`[REVIEW_PASSED]`**，附 1 個 MAJOR 與
+5 個 MINOR。它沒有只讀文件：自己重跑了測試與變異工具、逐格比對變異表、
+用生產等價設定重現了黏行的因果。
+
+### MAJOR — `tests/mutate.py` 在 `Restart=always` 的生產主機上有載入變異的窗口
+
+**這是我自己造的，而且與第四輪 MAJOR 是同一個形狀 —— 只是換個入口。**
+
+原本 `mutate.py` 直接改寫 repo 裡的 `job_board.py`，跑完再用 `git checkout` 還原。
+13 個變異每個會在磁碟上存在 5–25 秒（整輪約 2 分鐘）。而 `jobboard.service` 是
+`Restart=always` + `MemoryMax=512M`（unit 註解本身就預期會被 OOM 殺掉）。若這段
+窗口內看板被殺掉而重啟，**新行程載入的就是那個變異** —— 而變異清單裡正好有：
+
+| 變異 | 內容 | 後果 |
+|---|---|---|
+| M5 | `_pid_is_our_scan` 恆真 | watchdog 會殺掉任何符合形狀的行程 |
+| M6 | 拿掉 `ActiveState` 前置檢查 | 對非 active 的 unit 也送 kill |
+| M8 | `kill_stalled_external` 整個 no-op | 停滯偵測完全失效 |
+
+（M6 那個尤其重：`systemctl --user kill --signal=SIGKILL <unit>` 對 **inactive**
+的 unit 回傳 0 但什麼都沒殺 —— 是第四輪就量過的假成功。）
+
+**修法：不在生產目錄裡跑。** 改成 `git archive HEAD | tar -x` 解到 `/tmp` 的隔離
+副本，在那裡產生並執行變異。生產的 `job_board.py` **從頭到尾不會被寫入**，結束時
+以 sha256 驗證（`生產檔案驗證：sha256 不變 ✓`）。還原機制也不再需要 `git checkout`
+—— 每個變異都是從記憶體裡的 `ORIG` 重新產生，磁碟上沒有中間狀態可殘留。
+
+> 為什麼選隔離而不是「偵測到 jobboard 在跑就拒絕執行」：後者需要操作者記得繞過，
+> 而看板幾乎永遠在跑，於是那個 guard 只會變成「每次都加 `--force`」。**讓危險的
+> 做法在結構上不可能，比要求人記得避開可靠。**
+
+### MINOR-1 — `_out()` 的註解漏了必要前提，而且原子性的措辭不精確
+
+審查用**有緩衝**的檔案實測：`print` 在 3200+2400 行、8 執行緒下 **0 黏行** ——
+一度以為診斷是錯的。真正讓它現形的是 unit 裡的 `Environment=PYTHONUNBUFFERED=1`
+（`deploy/jobboard.service`、`jobscan.service` 都有）：**不緩衝才會把 print 的兩次
+write 變成兩次真正的 write(2) syscall**，交錯才是必然。同條件對照：
+
+| `PYTHONUNBUFFERED=1`、O_APPEND 檔案、8 執行緒 | `print` | 單次 write |
+|---|---|---|
+| 短行 (~120B) | **139 / 2400 黏** | 0 / 4800 黏 |
+| 12 KB 行 | **314 / 2043 黏** | 0 / 4800 黏 |
+
+**我的註解沒寫這個前提，這是真的缺漏** —— 有人拿掉 `PYTHONUNBUFFERED` 或把日誌
+改成 `StandardOutput=journal`，註解描述的因果就不再成立，而沒有測試會提醒。
+
+同時更正原子性的措辭：**不是** O_APPEND 本身給了原子性（它只保證 offset 設到
+檔尾）。不交錯來自 Linux 核心對同一 inode 的 write(2) 以 `i_rwsem` 序列化；
+**POSIX 對一般檔案並沒有保證這件事**（`PIPE_BUF` 的保證只適用 pipe/FIFO，且只到
+4096 bytes）。並把「鎖不是 load-bearing」的結論**限縮在今天的部署前提**：日誌
+目標是本地檔案、行長遠小於 PIPE_BUF（實測 `job_board.log` 最長行 203 bytes、
+`cron_search.log` 353 bytes）。改成 pipe/journal 且行長超過 4096 時鎖就會變成
+load-bearing —— 但審查**未能實測重現**那個情境（四種實作在真實 pipe 下都 0 黏行），
+所以那是理論風險、不是已知事實。
+
+### MINOR-2／MINOR-3 — 補上兩個守衛，其中一個是我自己寫壞的
+
+**MINOR-2**：H 區只觀測 `_log()` 這條路徑。具體失敗情境：有人在 scheduler 或
+watchdog 執行緒加一行 `print("[timer] ...", flush=True)` → 56 項全過 → 黏行回來
+（審查實測該寫法在生產設定下黏 139/2400 行）。新增 **I 區 AST 掃描**：`job_board.py`
+出現任何 live `print(` 或 `_out()` 外的直接 `sys.stdout.write` 就 FAIL。
+
+> 用 AST 而不是 grep：`grep` 分不出「程式碼」與「註解／docstring」—— `_out()` 上方
+> 就有一大段說明 print 為什麼不能用的註解，grep 會把它們全部算成違規（偽陽性），
+> **然後就會有人把這個測試關掉**。
+
+**MINOR-3**：H2 原本是測不出東西的煙霧測試（M11 在它底下照樣通過）。改用會讓出
+GIL 的假 stdout（`write()` 內 `time.sleep(0)`），並把斷言從「串接後 split」改成
+**逐次檢查 `write()` 呼叫**。後者才是決定性的：`_out()` 對每行只呼叫一次，
+所以每一次呼叫都必須是「一整行、含結尾換行」；`print` 會產生「內容（無換行）」與
+「裸的 `\n`」兩個呼叫，兩個都不符合。
+
+### ⚠️ 我自己在這一輪又犯了一次同樣的錯，而且是被變異測試抓到的
+
+I 區第一版把「落在 `_out` span 內」當成**整段豁免**，結果 M11（把 `_out` 的內容
+換成 `print(line, flush=True)`）的那個 `print` 也在 span 內，被一起放行了 ——
+**這一項根本沒開火。**
+
+發現方式不是重讀程式碼，是對照 **M11 的失敗項數**：照理 H1、H2、I 三項都該響，
+卻只有 2 個 `[FAIL]`。修好之後 M11/M12 都變成 3 個 `[FAIL]`。
+
+> **教訓：變異測試不只驗證修正，也驗證了驗證本身。** 「測試通過」在這一輪之內
+> 已經是第三次不代表「有保護」—— 前兩次是 M11 逃脫、H2 測不出東西。
+> 唯一能區分的動作永遠是同一個：**把修正改回去，看它會不會響。**
+
+### MINOR-4 — `mutate.py` 本身的四個洞
+
+| 洞 | 修法 |
+|---|---|
+| 乾淨度檢查只涵蓋 `job_board.py`，但判定同時取決於測試檔 | 兩個檔案都檢查 |
+| `SYNTAX-ERR` 走「不計」且不影響退出碼 → 套用失敗的變異讓整輪看起來是綠的 | 計入 `BAD`，退出碼變 1 |
+| 逾時被算成「被逮」→ 變異造成死鎖時結論反轉 | 改判 `INCONCLUSIVE`，退出碼變 1 |
+| `EXPECTED_ESCAPES` 用標籤前綴比對，任何以 `M13` 開頭的新標籤都會被自動豁免 | id 與標籤分開，綁明確 id；並新增「**豁免過期**」警告（列在 `EXPECTED_ESCAPES` 卻被逮到 = 有人補了測試，該把它刪掉） |
+
+最後一項是為了讓這份清單不會腐化成裝飾品 —— 一個只增不減的豁免清單，
+跟一份只增不減的「已知問題」文件一樣，遲早會蓋掉真正的訊號。
+
+### 已知限制（本輪未修，誠實列出）
+
+- **`linkedin_job_search.py` 有同一個兩次 syscall 的結構**（56 個 `print`，
+  `jobscan.service` 同樣 `PYTHONUNBUFFERED=1`）。今天沒有症狀（`_worker` 不 print，
+  `cron_search.log` 用雙時戳啟發式檢查 0 筆），但若爬蟲改多執行緒輸出、或
+  `run_scan.sh` 的 echo 與爬蟲的 print 交錯，同一個缺陷會在另一份日誌復發。
+  **I 區的 AST 掃描只涵蓋 `job_board.py`，沒有涵蓋爬蟲。**
+- **看板重啟後 `/api/search/status` 的 `last_finished` / `run_id` / `exit_code` /
+  `start_time` 回 `None`**，但 `logs/search_state.json` 裡有。診斷用的 in-memory
+  `_EXTERNAL["finished"]` / `_LAST_SCAN_SOURCE` 沒有從磁碟回填。
+  `data_age_seconds` 是從檔案 mtime 算的，**不受影響**；前端的 `exit_code` 徽章
+  在 `null` 時只是不顯示，不會顯示錯誤結論。用 `git log -S` 追出是 `081d6b5`
+  帶進來的**既有**行為，非本次遷移引進。審查同意「不影響排程與資料，不該在
+  這個遷移裡再疊加新變數」，故保留待後續處理。
+
 ## 2026-09-19 — 測試會殺掉生產掃描、殺戮路徑沒有正向測試（第四輪審查）
 
 第四輪 Senior Reviewer 對 `56cef73`（第三輪 MAJOR 的修正）判定 `[REVIEW_REJECTED]`。
@@ -175,19 +289,31 @@ H 區第一版用 8 執行緒 × 40 行對 `StringIO` 猛寫，斷言沒有黏�
 
 | 變異 | 內容 | 結果 |
 |---|---|---|
-| M1 | 孤兒回收判準改回 `proc is not None` | 54P / 1F ✅ |
-| M2 | 拿掉 `_read_search_output` 的 try/finally | 54P / 1F ✅ |
-| M3 | 拿掉 `Popen(errors="replace")` | 54P / 1F ✅ |
-| M4 | 拿掉 `kill_stalled_external` 的 phase 閘門 | 53P / 2F ✅ |
-| M5 | 拿掉 cmdline 身分檢查 | 54P / 1F ✅ |
-| M6 | 拿掉 systemd 分支的 ActiveState 前置檢查 | 53P / 2F ✅ |
-| M7 | 拿掉 `_external_begin` 身分閘門 | 53P / 2F ✅ |
-| M8 | `kill_stalled_external` 整個 no-op | 50P / 5F ✅ |
-| M9 | 拿掉 TOCTOU 重檢 | 54P / 1F ✅ |
-| M10 | `_pid_is_our_scan` 退回子字串比對 | 54P / 1F ✅ |
-| M11 | `_out` 退回 `print()`（修正前行為、無鎖） | 54P / 1F ✅ |
-| M12 | 保留鎖但用 `print()`（兩次 write） | 54P / 1F ✅ |
-| M13 | 拿掉鎖、保留單次 write | 55P / 0F ⚠️ **已知逃脫** |
+| M1 | 孤兒回收判準改回 `proc is not None` | 55P / 1F ✅ |
+| M2 | 拿掉 `_read_search_output` 的 try/finally | 55P / 1F ✅ |
+| M3 | 拿掉 `Popen(errors="replace")` | 55P / 1F ✅ |
+| M4 | 拿掉 `kill_stalled_external` 的 phase 閘門 | 54P / 2F ✅ |
+| M5 | 拿掉 cmdline 身分檢查 | 55P / 1F ✅ |
+| M6 | 拿掉 systemd 分支的 ActiveState 前置檢查 | 54P / 2F ✅ |
+| M7 | 拿掉 `_external_begin` 身分閘門 | 54P / 2F ✅ |
+| M8 | `kill_stalled_external` 整個 no-op | 51P / 5F ✅ |
+| M9 | 拿掉 TOCTOU 重檢 | 55P / 1F ✅ |
+| M10 | `_pid_is_our_scan` 退回子字串比對 | 55P / 1F ✅ |
+| M11 | `_out` 退回 `print()`（修正前行為、無鎖） | 53P / 3F ✅ |
+| M12 | 保留鎖但用 `print()`（兩次 write） | 53P / 3F ✅ |
+| M13 | 拿掉鎖、保留單次 write | 56P / 0F ⚠️ **已知逃脫** |
+
+> ⚠️ **這張表的 PASS/FAIL 數會隨測試項數變動**（測試從 55 加到 56 之後，
+> M1 就從 54P/1F 變成 55P/1F）。**權威來源是 `tests/mutate.py` 的實跑輸出**，
+> 這張表只是某一次的快照；會變的數字不是重點，**判定欄（被逮／逃脫）才是**。
+> 要重跑：
+>
+> ```bash
+> .venv/bin/python tests/mutate.py     # 需乾淨的工作區；在 /tmp 隔離副本裡跑
+> ```
+>
+> 這是第四次記錄到「文件裡的數量聲明會腐化」（28→39→53→55→56）。
+> 每次改動測試就順手重跑一次，比記得回來改文件可靠。
 
 > M10 只被**一項**逮到，就是 F3 反轉後的那條「冒名者必須被拒」。這是第四輪把 F3
 > 從「斷言冒名者必須被認可」改成「必須被拒絕」的直接價值 —— **把弱點寫成規格的
