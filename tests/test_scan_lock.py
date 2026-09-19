@@ -471,8 +471,12 @@ with mock.patch.object(jb, "read_jobscan_state",
         with mock.patch.object(jb, "_we_hold_scan_lock", return_value=False):
             killed = _REAL_KILL_EXTERNAL()
 check("state 自稱 finished 時，即使沉默超時也不得動手", killed is None, f"回傳={killed!r}")
+# ⚠️ 不可以寫 `bystander.poll() is None`。SIGKILL 送出到子行程真的死掉之間有窗口，
+# `poll()` 若在窗口內呼叫會回 None —— 於是「該被殺」的變異體【假通過】。
+# 第六輪審查實測：M5 之下這一項 20 次裡有 2 次假通過，讓 `tests/mutate.py` 的
+# 數字漂移（56P/2F ↔ 57P/1F）。改成有界等待：等它真的死，再斷言它沒死。
 check("旁觀者必須還活著（WTERMSIG=9 的事故不得重演）",
-      bystander.poll() is None, f"poll={bystander.poll()}")
+      not wait_dead(bystander, 0.5), f"poll={bystander.poll()}")
 
 # F4c：phase 閘門必須獨立於 cmdline 檢查而存在 —— 這一項是 mutant 實驗揪出來的。
 # 真正的危險情境不是「pid 被回收」（那由 cmdline 檢查擋），而是
@@ -533,7 +537,8 @@ with mock.patch.object(jb, "read_jobscan_state",
             with mock.patch.object(jb.subprocess, "run", side_effect=_fake_run2):
                 killed2 = _REAL_KILL_EXTERNAL()
 check("phase=running 但 cmdline 不符時仍須拒絕", killed2 is None, f"回傳={killed2!r}")
-check("旁觀者仍未被殺", bystander.poll() is None)
+# 同 F4b：`poll()` 緊接在 SIGKILL 之後是 race，會讓 M5 的數字漂移。有界等待。
+check("旁觀者仍未被殺", not wait_dead(bystander, 0.5))
 check("PID 路徑不得呼叫 systemctl（那是 systemd 分支的事）",
       syscalls2 == [], f"實際呼叫={syscalls2}")
 bystander.kill()
@@ -933,6 +938,18 @@ _J_TMP = tempfile.mkdtemp(prefix="jobspy-sched-")
 # 用 `os._exit(0)` 跳過 finalization → 決定性 exit 0。這【不會】削弱這一區：
 # 排程檔是 import 期間同步寫完的，斷言讀的是磁碟上的內容；若 `save_schedule()`
 # 根本沒被呼叫，讀回來的就是 seed 本身，兩項都會 FAIL（已用 M14/M15 驗證）。
+#
+# ⚠️ 兩道跳線，缺一不可（第六輪審查的 MAJOR M2）：
+#   * `subprocess.run` 擋 argv 含 "kill" 的呼叫（第四輪 MAJOR 的教訓）。
+#   * `subprocess.Popen` 擋【啟動真爬蟲】。這一條原本沒有，而排程器啟動爬蟲走的
+#     正是 `subprocess.Popen([sys.executable, "-u", linkedin_job_search.py])`，
+#     **完全繞過 subprocess.run 那道跳線**。也就是說原版的隔離不是護欄，而是
+#     「種子的 interval_hours 剛好很大」這個常數 —— 只要種子一逾期（本輪就真的
+#     發生過兩次，`job_board.log` 兩筆 `[scheduler] Triggering search`），
+#     子行程會在【生產目錄】跑起真的爬蟲。審查員用原封不動的跳線實測重現了。
+#     現在它是一條斷言，不是一個但書。
+#   * 兩道都要在 `import job_board`【之前】裝好 —— 插在其後會有 race，因為
+#     job_board 是在模組層就把背景執行緒啟動起來的。
 _J_TRIPWIRE = (
     "import subprocess, sys, os\n"
     "_real = subprocess.run\n"
@@ -942,6 +959,14 @@ _J_TRIPWIRE = (
     "        raise AssertionError('tripwire: %r' % (cmd,))\n"
     "    return _real(*a, **k)\n"
     "subprocess.run = _guard\n"
+    "_real_popen = subprocess.Popen\n"
+    "def _guard_popen(*a, **k):\n"
+    "    cmd = a[0] if a else k.get('args')\n"
+    "    if isinstance(cmd, (list, tuple)) and any(\n"
+    "            'linkedin_job_search.py' in str(x) for x in cmd):\n"
+    "        raise AssertionError('tripwire: 試圖啟動真爬蟲 %r' % (cmd,))\n"
+    "    return _real_popen(*a, **k)\n"
+    "subprocess.Popen = _guard_popen\n"
     "import job_board\n"
     "sys.stdout.flush()\n"
     "os._exit(0)\n"   # ← 見上方：跳過 finalization，避開 daemon 執行緒的 SIGABRT
@@ -1008,6 +1033,148 @@ check(
     f"next_run={_rev.get('next_run')} {_rev.get('__error__', '')}",
 )
 shutil.rmtree(_J_TMP, ignore_errors=True)
+
+print("=== K. 第六輪退回：api_schedule 的輸入驗證（幽靈排程）===")
+# 第六輪審查的 m2：`times: []` 會產生一則【幽靈排程】。_compute_next_run() 的
+# `cfg.get("times") or [...]` 對空清單會退回預設時段，於是面板顯示「06:00 會
+# 掃描」；但排程器那條用 `cfg.get("times", [...])`（只有 key 不存在才退回），
+# for 迴圈空轉 → due 永遠 False → **永遠不掃描**。
+#
+# 這是重構【製造】出來的：舊碼在同樣輸入下 IndexError → HTTP 500（醜，但大聲）。
+# 「把吵的失敗變成靜默失敗」是這個專案獵捕的缺陷類別，所以補上入口驗證。
+#
+# 核心不變式：**next_run 必須永遠由【已儲存的】cfg 推導出來**。幽靈排程的定義
+# 就是這條不變式被破壞 —— 畫面顯示的時段不在 cfg["times"] 裡。
+#
+# 這裡【不寫檔】：SCHEDULE_CONFIG 與 save_schedule 都被 mock 掉。直接在測試行程
+# 裡 POST 而不 mock 的話會覆寫生產的 .job_board_schedule.json（本輪就發生過一次，
+# 那次還順帶啟動了兩次真爬蟲）。
+class _FakeReq:
+    def __init__(self, payload) -> None:
+        self.method = "POST"
+        self._payload = payload
+
+    def get_json(self, silent: bool = False):
+        # 產品碼呼叫的是 `request.get_json(silent=True)`；只收 self 的假物件會 TypeError。
+        return self._payload
+
+
+def _post_schedule(payload, internal: bool = False, enabled: bool = True):
+    """回傳 (cfg, resp)。cfg 是 api_schedule 就地改過的那份 dict。
+
+    `internal=True` 會把 `jb.INTERNAL_SCHEDULER` 一起 mock 成 True（等於「回復舊制」
+    那個組態）。這讓「enabled 被什麼東西改動」變成可觀察的行為，而不是只能比對
+    警告文字 —— 字串比對會讓變異表測到措辭而不是測到行為。
+
+    ⚠️ `jsonify` 是【位置】引數（`job_board.py` 的 `return jsonify(resp)`），不是關鍵字
+    引數 —— 只收 `**k` 的 mock 會 TypeError。這裡兩種都收。
+
+    ⚠️ 例外必須在這裡變成 dict，不能讓 traceback 冒出去。理由與 `_startup_schedule`
+    的排程檔讀取相同：冒出去的 traceback 會讓**後面所有區段都不執行**，而
+    `tests/mutate.py` 只數 `[FAIL]` —— 於是 0 個 FAIL，變異體**假通過**。
+    這正是第六輪審查抓到的缺陷類別（把大聲的失敗變成靜默的失敗），只是換了個位置。
+    """
+    cfg = {"enabled": enabled, "mode": "times", "interval_hours": 6,
+           "times": ["06:00", "22:00"], "next_run": None, "_fired_today": {}}
+    try:
+        with mock.patch.object(jb, "SCHEDULE_CONFIG", cfg), \
+                mock.patch.object(jb, "INTERNAL_SCHEDULER", internal), \
+                mock.patch.object(jb, "save_schedule"), \
+                mock.patch.object(jb, "request", _FakeReq(payload)), \
+                mock.patch.object(jb, "jsonify",
+                                  side_effect=lambda *a, **k: a[0] if a else k):
+            out = jb.api_schedule()
+    except Exception as e:  # noqa: BLE001 — 任何例外都是一項 FAIL，不是一次崩潰
+        return cfg, {"__error__": f"api_schedule 丟出例外：{e!r}"}
+    if isinstance(out, tuple):  # `return jsonify(...), 400`
+        body, status = out
+        if isinstance(body, dict):
+            body = {**body, "__status__": status}
+        return cfg, body
+    return cfg, out
+
+
+def _next_run_time_in_times(cfg) -> bool:
+    """不變式：next_run 的 HH:MM 必須是 cfg['times'] 裡的其中一個。"""
+    nr = cfg.get("next_run")
+    return bool(nr) and nr.split()[-1] in (cfg.get("times") or [])
+
+
+# 合法／非法時段。字串邊界要逐一釘住：'6:00'（少一位）、'24:00'、'06:60'、
+# 非字串、空清單、空字串。這些都是「面板存得進去、但排程器不會照做」的來源。
+_K_VALID = [["06:00"], ["06:00", "22:00"], ["00:00", "23:59"]]
+_K_INVALID = [[], ["6:00"], ["24:00"], ["06:60"], ["0600"], [""], ["06:00", 7],
+              "06:00", None, 6]
+_k_bad_accepted = [v for v in _K_INVALID if jb._valid_times(v) is not None]
+_k_good_rejected = [v for v in _K_VALID if jb._valid_times(v) is None]
+check(
+    "_valid_times 必須擋掉畸形時段、放行合法時段",
+    not _k_bad_accepted and not _k_good_rejected,
+    f"誤放行={_k_bad_accepted} 誤拒絕={_k_good_rejected}",
+)
+
+# 本輪真實案例：空 times 必須【保留原值】且不得留下幽靈 next_run。
+_k_cfg, _k_resp = _post_schedule({"times": []})
+check(
+    "POST times:[] 必須保留原時段，且 next_run 不得指向不在 times 裡的時段（幽靈排程）",
+    _k_cfg["times"] == ["06:00", "22:00"] and _next_run_time_in_times(_k_cfg),
+    f"times={_k_cfg['times']} next_run={_k_cfg.get('next_run')!r} "
+    f"warning={(_k_resp.get('warning') or '')[:60]!r}",
+)
+
+# 每個非法輸入都要【有警告】—— 「未變更」如果沒有人說出來，就是靜默失敗。
+_k_missing_warn = []
+for _payload in ({"times": []}, {"times": ["25:00"]}, {"mode": "bogus"},
+                 {"interval_hours": 0}, {"interval_hours": "x"}):
+    _c, _r = _post_schedule(_payload)
+    if not _r.get("warning"):
+        _k_missing_warn.append(_payload)
+check("非法輸入必須回報 warning（不得靜默忽略）",
+      not _k_missing_warn, f"沒有 warning 的={_k_missing_warn}")
+
+# 反向：合法的輸入必須真的生效，否則上面的檢查可以靠「什麼都不做」通過。
+_k_cfg2, _k_resp2 = _post_schedule({"times": ["07:30", "19:30"]})
+_k_cfg3, _ = _post_schedule({"mode": "interval", "interval_hours": 4})
+check(
+    "合法輸入仍須生效（否則上面幾項可靠「全部拒絕」空轉通過）",
+    _k_cfg2["times"] == ["07:30", "19:30"] and _next_run_time_in_times(_k_cfg2)
+    and not _k_resp2.get("warning")
+    and _k_cfg3["mode"] == "interval" and _k_cfg3["interval_hours"] == 4,
+    f"times={_k_cfg2['times']} next_run={_k_cfg2.get('next_run')!r} "
+    f"warning={_k_resp2.get('warning')!r} mode={_k_cfg3['mode']} "
+    f"interval_hours={_k_cfg3['interval_hours']}",
+)
+
+# ── 非物件的主體 ──────────────────────────────────────────────────────────────
+# `request.get_json()` 對 `null` 回 None、對壞 JSON 也可能回 None。舊碼的
+# `"enabled" in data` 於是 TypeError → HTTP 500。500 是大聲的，但 400 才是這個
+# 請求真正的意思，而且 500 會把 traceback 印進日誌、看起來像程式壞了。
+_k_status = {}
+for _body in (None, [], "x", 6):
+    _c, _r = _post_schedule(_body)
+    _k_status[repr(_body)] = _r.get("__status__")
+check(
+    "非 JSON 物件的主體必須回 400（不是帶著 traceback 的 500）",
+    all(v == 400 for v in _k_status.values()) and len(_k_status) == 4,
+    f"狀態碼={_k_status}",
+)
+
+# ── `enabled` 必須是真正的 bool ───────────────────────────────────────────────
+# `bool("false")` 是 True。舊碼照單全收，於是「字串 'true'」會被當成「打開排程」。
+# 這裡刻意把 INTERNAL_SCHEDULER 設成 True（＝回復舊制那個組態），否則第三道鎖會
+# 擋下所有 enabled=True，讓這項檢查變成在測鎖、而不是在測型別驗證。
+_k_str_cfg, _k_str_resp = _post_schedule({"enabled": "true"}, internal=True,
+                                         enabled=False)
+_k_bool_cfg, _k_bool_resp = _post_schedule({"enabled": True}, internal=True,
+                                           enabled=False)
+check(
+    "enabled 必須是真正的 bool：字串 'true' 不得把排程打開（bool('false') 是 True）",
+    _k_str_cfg["enabled"] is False and _k_str_resp.get("warning")
+    # 正向控制：真 bool 在同一個組態下【必須】生效，否則本項可靠「一律拒絕」空轉通過
+    and _k_bool_cfg["enabled"] is True and not _k_bool_resp.get("warning"),
+    f"字串→enabled={_k_str_cfg['enabled']} warning={_k_str_resp.get('warning')!r} "
+    f"真bool→enabled={_k_bool_cfg['enabled']} warning={_k_bool_resp.get('warning')!r}",
+)
 
 # ═══ 結果 ════════════════════════════════════════════════════════════════════
 print()

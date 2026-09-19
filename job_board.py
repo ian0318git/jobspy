@@ -1236,6 +1236,31 @@ SCHEDULE_CONFIG = load_schedule()
 SCHEDULE_STOP = threading.Event()
 
 
+def _valid_times(value):
+    """驗證時段清單，回傳原順序的複本；不合法回 None。
+
+    ⚠️ 這個函式存在的原因是第六輪審查的 m2：`times: []` 會產生一則【幽靈排程】。
+    `_compute_next_run()` 用 `cfg.get("times") or ["06:00","22:00"]` —— 空清單是
+    falsy，會退回預設時段，於是面板顯示「06:00 會掃描」；但排程器那條用的是
+    `cfg.get("times", [...])`（只有 key 不存在才退回），因此 for 迴圈空轉、
+    due 永遠是 False → **永遠不掃描**。畫面承諾了一件不會發生的事，而且沒有人
+    會收到錯誤。舊碼在同樣輸入下會 IndexError → HTTP 500（醜，但大聲）——
+    重構把它變成了靜默失敗，這是絕不允許的方向。
+
+    【保持原順序】不回傳排序後的結果：`times` 的順序是使用者在面板上看到的順序，
+    在這裡偷偷排序是使用者可見的行為改變。排序只在計算 next_run 時做
+    （`_compute_next_run` 內），那裡才是語意上需要它的地方。
+    """
+    if not isinstance(value, list) or not value:
+        return None
+    for t in value:
+        if (not isinstance(t, str) or len(t) != 5 or t[2] != ":"
+                or not (t[:2].isdigit() and t[3:].isdigit())
+                or int(t[:2]) > 23 or int(t[3:]) > 59):
+            return None
+    return list(value)
+
+
 def _compute_next_run(cfg):
     """算出 cfg 的下一次執行時間字串；未啟用時回 None。
 
@@ -1544,38 +1569,70 @@ def api_search_status():
 def api_schedule():
     global SCHEDULE_CONFIG
     if request.method == "POST":
-        data = request.get_json()
+        data = request.get_json(silent=True)
+        # 非物件的主體（`null`／`[]`／`"x"`／壞 JSON）在舊碼會讓 `"enabled" in data`
+        # 丟 TypeError → HTTP 500 + traceback。500 是「大聲」的，所以不算靜默失敗，
+        # 但這是 unhandled edge case，而且 400 才是這個請求真正的意思。
+        if not isinstance(data, dict):
+            return jsonify({"ok": False,
+                            "error": f"請求主體必須是 JSON 物件（收到 {type(data).__name__}）"}), 400
         refused = None
+        problems = []
         if "enabled" in data:
-            want = bool(data["enabled"])
-            # 第三道鎖：即使有人繞過前端（curl、devtools），也不能把內建排程器
-            # 重新武裝。兩條觸發路徑同時存在就是 2026-08-13 的並發事故。
-            if want and not INTERNAL_SCHEDULER:
-                refused = ("內建排程器已停用（排程由 systemd timer 負責），"
-                           "enabled 未變更")
-                want = False
-            SCHEDULE_CONFIG["enabled"] = want
+            # `bool("false")` 是 True。寬鬆地 bool() 一個字串等於把「關掉排程」
+            # 變成「打開排程」—— 使用者要求 A、系統做 B，而且沒有任何訊息。
+            # 只接受真正的 bool（面板送的就是 bool）。
+            if not isinstance(data["enabled"], bool):
+                problems.append("enabled 只接受 true／false，未變更"
+                                f"（收到 {data['enabled']!r}）")
+            else:
+                want = data["enabled"]
+                # 第三道鎖：即使有人繞過前端（curl、devtools），也不能把內建排程器
+                # 重新武裝。兩條觸發路徑同時存在就是 2026-08-13 的並發事故。
+                if want and not INTERNAL_SCHEDULER:
+                    refused = ("內建排程器已停用（排程由 systemd timer 負責），"
+                               "enabled 未變更")
+                    want = False
+                SCHEDULE_CONFIG["enabled"] = want
         # 只有在值*真的*變動時才清掉當日追蹤。UI 每次儲存都會把 times/mode 一起
         # 送上來，若照單全收地 pop，任何一次無關的儲存都會清空 _fired_today，
         # 讓排程器誤判當日尚未執行而立刻補跑一次。
-        if "mode" in data and data["mode"] != SCHEDULE_CONFIG.get("mode"):
-            SCHEDULE_CONFIG["mode"] = data["mode"]
-            SCHEDULE_CONFIG.pop("_fired_today", None)  # reset tracking on mode change
+        # 四個欄位都要驗證過才落地。不合法的【保留原值】並回報，不寫進設定 ——
+        # 見 _valid_times() 的說明（`times: []` 的幽靈排程就是這樣來的）。
+        if "mode" in data:
+            if data["mode"] not in ("times", "interval"):
+                problems.append(f"mode 只接受 times／interval，未變更（收到 {data['mode']!r}）")
+            elif data["mode"] != SCHEDULE_CONFIG.get("mode"):
+                SCHEDULE_CONFIG["mode"] = data["mode"]
+                SCHEDULE_CONFIG.pop("_fired_today", None)  # reset tracking on mode change
         if "interval_hours" in data:
-            SCHEDULE_CONFIG["interval_hours"] = int(data["interval_hours"])
+            try:
+                hours = int(data["interval_hours"])
+            except (TypeError, ValueError):
+                hours = 0
+            if hours <= 0:
+                problems.append("interval_hours 必須是正整數，未變更"
+                                f"（收到 {data['interval_hours']!r}）")
+            else:
+                SCHEDULE_CONFIG["interval_hours"] = hours
         if "times" in data:
-            new_times = list(data["times"])
-            changed = sorted(new_times) != sorted(SCHEDULE_CONFIG.get("times") or [])
-            SCHEDULE_CONFIG["times"] = new_times
-            if changed:
-                SCHEDULE_CONFIG.pop("_fired_today", None)  # reset tracking on time change
+            new_times = _valid_times(data["times"])
+            if new_times is None:
+                problems.append("times 必須是 'HH:MM' 的非空清單，未變更"
+                                f"（收到 {data['times']!r}）")
+            else:
+                changed = sorted(new_times) != sorted(SCHEDULE_CONFIG.get("times") or [])
+                SCHEDULE_CONFIG["times"] = new_times
+                if changed:
+                    SCHEDULE_CONFIG.pop("_fired_today", None)  # reset tracking on time change
         # 原本這裡是 13 行內聯計算，與啟動回復舊制那段是同一套邏輯的複製品
         # （而且已經 drift）。現在共用 _compute_next_run()。
         SCHEDULE_CONFIG["next_run"] = _compute_next_run(SCHEDULE_CONFIG)
         save_schedule(SCHEDULE_CONFIG)
         resp = {"ok": True, "schedule": SCHEDULE_CONFIG}
-        if refused:
-            resp["warning"] = refused
+        warning = "；".join(filter(None, [refused, *problems]))
+        if warning:
+            resp["warning"] = warning
         return jsonify(resp)
     SCHEDULE_CONFIG = load_schedule()
     payload = dict(SCHEDULE_CONFIG)
@@ -2207,7 +2264,13 @@ async function updateSchedule(){
   const times=[t1,t2].filter(Boolean).sort();
   try{
     const r=await fetch('/api/schedule',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled,mode,interval_hours,times})});
-    const s=await r.json(); updateSchedDisplay(s.schedule||s);
+    const s=await r.json();
+    // `warning` 從第六輪就有了，但前端從來沒顯示過 —— 也就是說「請求被拒絕、
+    // 值沒有變更」在畫面上與「存檔成功」長得一模一樣（面板會顯示舊值，而舊值
+    // 正是使用者剛剛想改掉的東西）。後端有話要說，前端就必須說出來。
+    if(s.error){alert('排程未儲存：'+s.error);return;}
+    if(s.warning){alert('排程只有部分變更：\n'+s.warning);}
+    updateSchedDisplay(s.schedule||s);
   }catch(e){console.error(e);}
 }
 

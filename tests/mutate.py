@@ -203,6 +203,36 @@ MUTATIONS = [
     ("M15", "回復舊制時不算 next_run", lambda t: sub_once(
         t, '        SCHEDULE_CONFIG["next_run"] = _next\n',
         "        pass\n", "M15")),
+
+    # ── api_schedule 的輸入驗證（K 區）────────────────────────────────────
+    # 2026-09-20 第六輪審查的 m2：重構把 `times: []` 從「HTTP 500（大聲）」
+    # 變成「HTTP 200 + 一則永遠不會執行的幽靈排程（靜默）」。
+    ("M16", "times 不驗證（照單全收，回復幽靈排程）", lambda t: sub_once(
+        t, "            new_times = _valid_times(data[\"times\"])\n            if new_times is None:\n",
+        "            new_times = list(data[\"times\"])\n            if False:\n", "M16")),
+    # 只把 _valid_times 的邊界判斷拿掉（什麼都放行）—— 問的是「驗證本身」有沒有被測到，
+    # 與 M16 問的「呼叫端有沒有用它」是兩件事。
+    ("M17", "_valid_times 不檢查內容（空清單與畸形時段都放行）", lambda t: sub_once(
+        t, "    if not isinstance(value, list) or not value:\n        return None\n    for t in value:\n",
+        "    if not isinstance(value, list):\n        return None\n    return list(value)\n    for t in value:\n",
+        "M17")),
+    # 非 JSON 物件的主體：`null`／`[]`／`"x"` → 舊碼 `"enabled" in data` 會 TypeError。
+    ("M18", "拿掉主體型別檢查（非物件主體回到 500）", lambda t: sub_once(
+        t, "        if not isinstance(data, dict):\n", "        if False:\n", "M18")),
+    # `bool("false")` 是 True：字串 enabled 會把「關掉排程」變成「打開排程」。
+    ("M19", "enabled 用 bool() 寬鬆轉換（字串 'true' 就打開排程）", lambda t: sub_once(
+        t,
+        "            if not isinstance(data[\"enabled\"], bool):\n"
+        "                problems.append(\"enabled 只接受 true／false，未變更\"\n"
+        "                                f\"（收到 {data['enabled']!r}）\")\n"
+        "            else:\n"
+        "                want = data[\"enabled\"]\n",
+        "            if False:\n"
+        "                problems.append(\"enabled 只接受 true／false，未變更\"\n"
+        "                                f\"（收到 {data['enabled']!r}）\")\n"
+        "            else:\n"
+        "                want = bool(data[\"enabled\"])\n",
+        "M19")),
 ]
 
 results = []
