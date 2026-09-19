@@ -15,3 +15,17 @@ melbourne_embedded_jobs_*.csv
 search_results/
 blocked_clearance_jobs_*.json
 *.log
+
+# ── 執行期狀態（2026-09-19 systemd timer 遷移時新增）─────────────────────────
+# logs/ 全部是執行期產物：systemd 用 append: 持有的逐字稿、flock 鎖檔、
+# search_state.json、每輪截斷的 search_current.log。整目錄忽略，這樣將來新增
+# 任何執行期檔案都不會漏掉規則而誤入版控（原本的 *.log 只涵蓋其中一部分）。
+logs/
+
+# 排程設定：Phase 1 起排程主權在 deploy/jobscan.timer，此檔降級為執行期狀態
+# （每次啟動都會被壓平重寫：enabled=false、managed_by=systemd-timer）。
+# 留著追蹤只會讓 git status 永遠 dirty，失去訊號價值。
+# 遺失的後果已確認可接受：回退到 SCHEDULE_DEFAULT，其 times 同為 06:00/22:00，
+# 唯一差異 interval_hours 在 mode="times" 下不會被讀取。
+# 注意：.job_statuses.json 相反，那是真實求職資料，刻意保留追蹤（等於免費備份）。
+.job_board_schedule.json
