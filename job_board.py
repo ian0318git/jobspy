@@ -686,15 +686,32 @@ def _pid_is_our_scan(pid):
 
     判準用 cmdline 而不是「pid 存不存在」：PID 被回收後同一個號碼會是別的行程，
     只有 cmdline 能區分。「不確定」一律回 False —— 不確定就不動手。
+
+    比對的是 argv 的【結構】，不是整條 cmdline 的子字串。2026-09-19 第四輪審查指出
+    子字串比對太寬鬆：`vim run_scan.sh`、`tail -f run_scan.sh`、甚至
+    `echo linkedin_job_search.py` 全都會被判定成「我們的掃描」。要送的訊號是
+    SIGKILL（不可逆），所以寬鬆的方向剛好是最危險的那一邊。改成看得懂 argv 結構：
+    wrapper 是「argv[0] 就是 run_scan.sh」，爬蟲是「解譯器 + 腳本路徑當參數」
+    —— run_scan.sh 用 `"$PY" -u "$SCRIPT"` 啟動，所以爬蟲的 argv[0] 是 python、
+    腳本路徑在 argv[2]，只看 argv[0] 反而會漏掉真正要保護的對象。
     """
     try:
         with open(f"/proc/{pid}/cmdline", "rb") as f:
-            cmdline = f.read().decode("utf-8", "replace")
+            argv = [a for a in f.read().decode("utf-8", "replace").split("\0") if a]
     except OSError:
         return False
-    if not cmdline:
+    if not argv:
         return False        # zombie：cmdline 為空，不是可殺的目標
-    return any(m in cmdline for m in ("run_scan.sh", "linkedin_job_search.py"))
+    exe = os.path.basename(argv[0])
+    if exe == "run_scan.sh":
+        return True
+    # 手動 `bash run_scan.sh`：argv[1] 必須【就是】那支腳本，不是字串裡含有它。
+    if exe in ("bash", "sh", "dash"):
+        return len(argv) > 1 and os.path.basename(argv[1]) == "run_scan.sh"
+    # 爬蟲：python 解譯器帶著我們的腳本當參數。
+    if exe.startswith("python"):
+        return any(os.path.basename(a) == "linkedin_job_search.py" for a in argv[1:])
+    return False
 
 
 def kill_stalled_external():
