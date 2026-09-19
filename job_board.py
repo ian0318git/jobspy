@@ -311,6 +311,9 @@ OUTPUT_KEEP = 4000
 # 現在才收尾，卻把新一輪的鎖放掉」。
 SEARCH_LOCK_FD = None
 SEARCH_LOCK_OWNER = None
+# 取鎖的時刻（time.monotonic()）。只用來讓 reap_orphan_search_lock() 判斷
+# 「持有鎖卻沒有子程序」這個不該持續的狀態已經持續多久。
+SEARCH_LOCK_HELD_SINCE = None
 
 
 def _lock_held(path):
@@ -338,7 +341,7 @@ def _lock_held(path):
 
 def _acquire_search_lock():
     """為本行程的子程序取得掃描鎖。成功回傳 fd；已被別人持有則回傳 None。"""
-    global SEARCH_LOCK_FD, SEARCH_LOCK_OWNER
+    global SEARCH_LOCK_FD, SEARCH_LOCK_OWNER, SEARCH_LOCK_HELD_SINCE
     try:
         os.makedirs(LOG_DIR, exist_ok=True)
         fd = os.open(JOBSCAN_LOCK, os.O_RDWR | os.O_CREAT, 0o644)
@@ -351,6 +354,7 @@ def _acquire_search_lock():
         os.close(fd)
         return None
     SEARCH_LOCK_FD, SEARCH_LOCK_OWNER = fd, None
+    SEARCH_LOCK_HELD_SINCE = time.monotonic()
     return fd
 
 
@@ -360,7 +364,7 @@ def _release_search_lock(owner=None):
     owner 給定時，只有當鎖仍屬於該子程序才釋放 —— 否則一個拖到很晚才收尾的舊
     reader thread 會把新一輪搜尋的鎖放掉，等於門戶洞開。
     """
-    global SEARCH_LOCK_FD, SEARCH_LOCK_OWNER
+    global SEARCH_LOCK_FD, SEARCH_LOCK_OWNER, SEARCH_LOCK_HELD_SINCE
     # 「檢查 owner」與「清空」必須在同一個臨界區內。少了這道鎖，舊掃描的 reader
     # thread 可能在通過 owner 檢查之後被排程器切換掉，等 start_search() 換上
     # 新一輪的 fd 之後才醒來執行清空 —— 結果是把【新掃描的鎖】關掉，新掃描在
@@ -371,6 +375,7 @@ def _release_search_lock(owner=None):
         if owner is not None and SEARCH_LOCK_OWNER is not owner:
             return
         fd, SEARCH_LOCK_FD, SEARCH_LOCK_OWNER = SEARCH_LOCK_FD, None, None
+        SEARCH_LOCK_HELD_SINCE = None
     if fd is None:
         return
     try:
@@ -396,21 +401,38 @@ def start_search():
         # 全機唯一的鎖：systemd timer 的 run_scan.sh 與手動 run_search.sh 也取同一把。
         if _acquire_search_lock() is None:
             return False, "A scan is already running (systemd timer or manual run)"
+        script = os.path.join(SCRIPT_DIR, "linkedin_job_search.py")
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, "-u", script],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1, cwd=SCRIPT_DIR,
+            )
+        except Exception as e:
+            # 鎖【已經在我們手上了】（上面 :402 的 _acquire_search_lock），Popen 失敗
+            # 若不還回去，這個 fd 會一直開到行程結束，而且沒有任何機制救得回來：
+            #   kill_stalled_search()   → SEARCH_PROCESS is None，直接 return
+            #   kill_stalled_external() → _we_hold_scan_lock() 早退（鎖確實在我們手上）
+            #   下次 start_search()     → 對同一個檔案開第二個 fd 取 flock 仍然衝突，
+            #                             所以永遠回 "A scan is already running"
+            # 使用者看到的是一句「有掃描在跑」的錯誤訊息，而 timer 每一輪都等 20 秒後
+            # SKIPPED、exit 0、日誌一切正常 —— 正是本次遷移要根除的那種靜默資料缺口，
+            # 而且是【無限期】的。實際觸發路徑：爬蟲檔被改名／刪除（run_scan.sh 有
+            # [ -f "$SCRIPT" ] 檢查，這裡沒有），或 VM 在 suspend/resume 後 fork/exec
+            # 失敗（EAGAIN/ENOMEM）—— 這台正是會 suspend 的 VM。
+            _release_search_lock()
+            print(f"[search] 無法啟動爬蟲 {script}: {e}", flush=True)
+            return False, f"無法啟動爬蟲：{e}"
+        # 到這裡才動狀態。上面任何一步失敗時，這些欄位都必須維持原樣，否則 UI 會
+        # 顯示一個根本沒開始的掃描，而 stall 偵測會拿著假的起始時間。
+        SEARCH_PROCESS = proc
         SEARCH_OUTPUT = []
         SEARCH_START_TIME = datetime.now().isoformat()
         SEARCH_LAST_OUTPUT_AT = time.monotonic()
         _LAST_SCAN_SOURCE = "own"
-        script = os.path.join(SCRIPT_DIR, "linkedin_job_search.py")
-        SEARCH_PROCESS = subprocess.Popen(
-            [sys.executable, "-u", script],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1, cwd=SCRIPT_DIR,
-        )
         # 鎖現在屬於這一輪；之後 reader thread / watchdog 才能據此安全釋放。
-        SEARCH_LOCK_OWNER = SEARCH_PROCESS
-        t = threading.Thread(
-            target=_read_search_output, args=(SEARCH_PROCESS,), daemon=True
-        )
+        SEARCH_LOCK_OWNER = proc
+        t = threading.Thread(target=_read_search_output, args=(proc,), daemon=True)
         t.start()
         return True, "Search started"
 
@@ -476,6 +498,40 @@ def kill_stalled_search():
     except subprocess.TimeoutExpired:
         pass
     return pid
+
+
+# 「持有鎖但沒有子程序在跑」持續超過這個秒數，就判定為洩漏。
+# 正常情況下這個狀態只存在於 start_search() 內「取鎖 → Popen」之間的微秒級窗口，
+# 所以 60 秒是極寬鬆的門檻；刻意取寬是因為誤放鎖的代價（兩套爬蟲並發，重演
+# 2026-08-13 事故）比多等一分鐘高。
+ORPHAN_LOCK_GRACE = 60
+
+
+def reap_orphan_search_lock():
+    """回收「持有鎖、卻沒有任何子程序在跑」的孤兒鎖。回傳釋放的 fd；沒事回 None。
+
+    這是最後一道防線。已知的洩漏路徑（Popen 失敗）已在 start_search() 內直接修掉，
+    這裡防的是「還沒想到的那一條」。之所以值得為它加一個自癒機制，是因為這個缺陷
+    類別的代價是【永久且靜默的全機掃描停擺】：timer 每輪等 20 秒後 SKIPPED、exit 0、
+    日誌全部正常，只有 search_results/ 從此不再長大。
+
+    保守之處：只在 SEARCH_PROCESS is None 時動手。若子程序還在（或剛結束、reader
+    thread 仍在收尾），一律不碰 —— 那是有主的鎖，不是孤兒。
+    """
+    with SEARCH_LOCK:
+        if SEARCH_LOCK_FD is None or SEARCH_PROCESS is not None:
+            return None
+        held_since = SEARCH_LOCK_HELD_SINCE
+        if held_since is None or time.monotonic() - held_since < ORPHAN_LOCK_GRACE:
+            return None
+        fd = SEARCH_LOCK_FD
+    print(
+        f"[watchdog] 掃描鎖 fd={fd} 已被持有超過 {ORPHAN_LOCK_GRACE}s，"
+        f"但沒有任何子程序在跑 —— 判定為洩漏，主動釋放以免全機排程永久停擺",
+        flush=True,
+    )
+    _release_search_lock()
+    return fd
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -587,6 +643,19 @@ def kill_stalled_external():
         return None
     state = read_jobscan_state() or {}
     run_id, trigger, pid = state.get("run_id"), state.get("trigger"), state.get("pid")
+
+    # TOCTOU 收尾（MINOR-11）：上面的判定與下面的動手之間隔著讀 state 檔與組字串，
+    # 而動手是不可逆的 SIGKILL。若看板恰好在這個窗口內取得掃描鎖（使用者按了
+    # 重新搜尋），我們就會拿著【前一個外部掃描】留下的 run_id/trigger 去殺一個
+    # 已經結束的目標 —— 最壞情況是那個 PID 已被回收，殺到無關的行程樹。
+    # 送訊號前重新確認「我們仍然沒有持有鎖」。
+    #
+    # 誠實揭露：這把窗口從「無界（含檔案 I/O 與 subprocess 建立）」縮到微秒級，
+    # 但沒有歸零 —— 要歸零得把鎖一路持有到訊號送出為止，而 systemctl 是阻塞呼叫，
+    # 那會製造更嚴重的問題（整個 watchdog 卡住、連自己的掃描都放不掉）。
+    if _we_hold_scan_lock():
+        return None
+
     target = None
     if trigger == "systemd-timer":
         # 交給 systemd：只有它知道完整的 cgroup，能一次收掉 wrapper 與爬蟲。
@@ -801,6 +870,9 @@ def watchdog_loop():
             target = kill_stalled_external()
             if target is not None:
                 print(f"[watchdog] Terminated stalled external scan: {target}", flush=True)
+            orphan = reap_orphan_search_lock()
+            if orphan is not None:
+                print(f"[watchdog] Released orphan scan lock fd={orphan}", flush=True)
         except Exception as e:
             print(f"[watchdog] Error: {e}", flush=True)
         SCHEDULE_STOP.wait(60)

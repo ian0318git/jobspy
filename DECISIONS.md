@@ -2,6 +2,74 @@
 
 重要決策紀錄 — 依專案工作流程要求更新。
 
+## 2026-09-19 — 掃描鎖的三個缺陷與一個已知限制（第二輪審查）
+
+第二輪 Senior Reviewer 對 `d1c60c8` 判定 `[REVIEW_REJECTED]`，確認 CRITICAL-1 /
+MAJOR-1 / MAJOR-2 / MINOR-1 / MINOR-8 五項修正到位，但抓到一個新的 MAJOR-3。
+三個缺陷的共同教訓：**這條路徑的失敗都是靜默的**（不拋例外、`exit 0`、日誌正常），
+代價卻是全機掃描停擺，所以每一項都補了回歸測試。
+
+### MAJOR-3 — `start_search()` 的 Popen 失敗會洩漏全機掃描鎖（無限期）
+
+`start_search()` 先取鎖才 `subprocess.Popen()`，而 Popen 沒有任何 `try/except`。
+失敗時 `SEARCH_LOCK_OWNER` 尚未設定、`SEARCH_PROCESS` 仍是 `None`，fd 永遠不關：
+
+- `kill_stalled_search()` → `SEARCH_PROCESS is None`，直接 return
+- `kill_stalled_external()` → `_we_hold_scan_lock()` 早退（鎖確實在我們手上）
+- 下次 `start_search()` → 對同檔開第二個 fd 取 flock 仍衝突，**永遠**回
+  `"A scan is already running (systemd timer or manual run)"`
+- timer 每輪等 20 秒後 `SKIPPED`、`exit 0`、日誌一切正常 → **無限期**資料缺口
+
+觸發路徑：爬蟲檔被改名／刪除（`run_scan.sh` 有 `[ -f "$SCRIPT" ]` 檢查，看板沒有），
+或 VM 在 suspend/resume 後 fork/exec 失敗（EAGAIN/ENOMEM）—— 這台正是會 suspend 的 VM。
+**修法：** `try/except` 包住 Popen，失敗時 `_release_search_lock()` 並回傳明確錯誤；
+狀態欄位（`SEARCH_PROCESS` / `SEARCH_START_TIME` / …）改到 Popen 成功之後才更新，
+避免 UI 顯示一個根本沒開始的掃描。
+
+**外加自癒（`reap_orphan_search_lock()`）：** watchdog 每輪檢查「持有鎖但
+`SEARCH_PROCESS is None`」是否持續超過 `ORPHAN_LOCK_GRACE`（60 秒）。正常情況下
+這個狀態只存在於「取鎖 → Popen」之間的微秒級窗口，所以 60 秒極寬鬆；刻意取寬是因為
+**誤放鎖的代價（兩套爬蟲並發，重演 2026-08-13）比多等一分鐘高**。保守之處：只在
+`SEARCH_PROCESS is None` 時動手，子程序還在（或 reader thread 仍在收尾）一律不碰。
+
+### MINOR-11 — `kill_stalled_external()` 的 TOCTOU（已縮小，未歸零）
+
+判定（未持鎖 + 逾時）與動手（SIGKILL）之間隔著讀 `search_state.json` 與組字串。
+若看板恰在此窗口取得掃描鎖，就會拿前一個外部掃描的 `run_id`/`trigger` 去殺一個
+已結束的目標，最壞是 PID 已被回收而殺到無關行程樹。
+**修法：** 送訊號前重新確認 `_we_hold_scan_lock()`。
+**誠實揭露：** 窗口從「無界（含檔案 I/O 與 subprocess 建立）」縮到微秒級，但沒有歸零
+—— 要歸零得把鎖一路持有到訊號送出，而 `systemctl` 是阻塞呼叫，那會讓 watchdog
+整體卡住、連自己的掃描都放不掉，比原缺陷更糟。**殘餘風險已知且接受。**
+
+### MINOR-9 — 測試不得佔用生產鎖（已修）
+
+`tests/test_scan_lock.py` 原本對真實的 `logs/jobscan.lock` 取鎖。缺陷版路徑上它會
+卡死並持續持有**全機鎖約 53 秒** —— 若此時 timer 觸發，真實掃描會白等 20 秒後 SKIP，
+也就是**測試本身能製造這次遷移要消滅的失敗**。改指向 `tempfile.mkdtemp()` 的私人鎖檔。
+另外測試行程也會啟動 `job_board` 的背景 watchdog，其 `kill_stalled_external()` 會執行
+`systemctl --user kill --signal=SIGKILL jobscan.service`，因此在測試中把該函式換成
+no-op 護欄（背景執行緒走模組全域），測試要驗證真正的護欄時改呼叫保存下來的原函式。
+
+### MINOR-13 — 已知限制（接受）：持鎖分支不呼叫 `_external_end()`
+
+看板持有掃描鎖時，`_jobscan_watch_tick()` 直接清掉 `_EXTERNAL["active"]` 並 return，
+因此 `maybe_adopt_new_results()` 不會被呼叫、`_EXTERNAL["finished"]` 不會更新
+（`/api/search/status` 的 `last_finished` 可能顯示較舊的一輪）。
+**實質無害**：前端在 running→idle 轉移時會走 `/api/reload` → `find_latest_kanban()`
+載入最新檔，所以看板仍會換到新結果。殘留影響僅止於那個欄位的顯示。
+**刻意不修**：在持鎖分支補呼叫 `_external_end()` 會讓「自己的掃描結束」與
+「外部掃描結束」兩條路徑的語意糾纏在一起，換取的好處只是一個顯示欄位。
+
+### 未涵蓋（誠實聲明）
+
+自動化測試**只有** `tests/test_scan_lock.py`（20 項，含 MAJOR-3 與孤兒鎖自癒），
+其餘仍為手動驗證。該測試以變異實驗自我驗證：把 `SEARCH_LOCK` 換回
+`threading.Lock()` → 5 項 FAIL 並卡死；拿掉 `except` 區塊的 `_release_search_lock()`
+→ 3 項 FAIL（含重現 `"A scan is already running"`）。**未覆蓋**：`run_scan.sh` 的
+重試邏輯（bash 端零測試）、`kill_stalled_external()` 的實際動手路徑（會殺真行程，
+測試刻意不碰）。
+
 ## 2026-09-19 — 排程主權移交 systemd timer（解決休眠導致整天不掃描）
 
 **問題：** 晚上電腦休眠 → 喚醒後補跑視窗不足 → 整個時段被跳過。

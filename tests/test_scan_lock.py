@@ -28,6 +28,33 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import job_board as jb  # noqa: E402
 
+# MINOR-9：測試【不得】佔用生產鎖 logs/jobscan.lock。缺陷版路徑會卡死並持續持有
+# 全機鎖約 53 秒，若剛好撞上 timer 觸發，真實掃描就會白等 20 秒後 SKIP ——
+# 也就是說測試本身能製造這次遷移要消滅的那種失敗。改指向暫存目錄的私人鎖檔。
+import tempfile  # noqa: E402
+
+jb.JOBSCAN_LOCK = os.path.join(tempfile.mkdtemp(prefix="jobscan-test-"), "jobscan.lock")
+print(f"（測試鎖檔：{jb.JOBSCAN_LOCK}）")
+
+# 安全護欄：import job_board 會在【本測試行程】內啟動背景 watchdog，而它的
+# kill_stalled_external() 動手路徑會執行 `systemctl --user kill --signal=SIGKILL
+# jobscan.service`。若測試途中 _EXTERNAL 恰好處於 active 且被判定逾時，這個測試
+# 就會殺掉【真實的掃描】—— 例如 22:00 那一輪。
+#
+# 只攔截這一個函式，不動 SEARCH_STALL_TIMEOUT：kill_stalled_search() 共用同一個
+# 門檻，把門檻調大會連帶讓測試 A2 永遠殺不掉子行程（已實際踩到）。
+# 背景 watchdog 走的是模組全域，因此它拿到的是這個 no-op 版本；測試 C 要驗證
+# 真正的護欄時，改呼叫下面保存下來的原函式。
+_REAL_KILL_EXTERNAL = jb.kill_stalled_external
+
+
+def _noop_kill_external(*_a, **_k):
+    """背景 watchdog 專用：這個行程永遠不對外部的掃描動手。"""
+    return None
+
+
+jb.kill_stalled_external = _noop_kill_external
+
 FAILURES: list[str] = []
 
 
@@ -163,7 +190,9 @@ check(
     jb._EXTERNAL["active"] is False,
     f"active={jb._EXTERNAL['active']}",
 )
-check("kill_stalled_external() 不得對自己的掃描動手", jb.kill_stalled_external() is None)
+# 呼叫保存下來的【原】函式（jb.kill_stalled_external 已被換成 no-op 護欄）。
+check("護欄條件成立：鎖確實在我們手上", jb._we_hold_scan_lock() is True)
+check("kill_stalled_external() 不得對自己的掃描動手", _REAL_KILL_EXTERNAL() is None)
 
 # 負向對照：就算 active 被外力重新設回 True（模擬防禦性檢查的處境），
 # 只要鎖在我們手上，kill_stalled_external() 依然必須拒絕動手。
@@ -172,13 +201,83 @@ with jb.SEARCH_LOCK:
     jb._EXTERNAL["last_read_at"] = time.monotonic() - 1000
 check(
     "即使 active 被重設為 True，持鎖者仍受 _we_hold_scan_lock() 保護",
-    jb.kill_stalled_external() is None,
+    _REAL_KILL_EXTERNAL() is None,
 )
 
 with jb.SEARCH_LOCK:
     jb._EXTERNAL["active"] = False
     jb._EXTERNAL["last_read_at"] = None
 jb._release_search_lock()
+
+# ═══ D. MAJOR-3：start_search() 的 Popen 失敗不得洩漏全機掃描鎖 ══════════════
+print("=== D. MAJOR-3：Popen 失敗時必須把鎖還回去 ===")
+
+jb.SEARCH_PROCESS = None
+jb._release_search_lock()
+check("測試前提：目前未持有鎖", jb.SEARCH_LOCK_FD is None)
+
+import unittest.mock as mock  # noqa: E402
+
+with mock.patch.object(
+    jb.subprocess, "Popen",
+    side_effect=FileNotFoundError("[Errno 2] 模擬爬蟲檔不存在"),
+):
+    ok, msg = jb.start_search()
+check("start_search() 正確回報失敗", ok is False, f"ok={ok} msg={msg!r}")
+check(
+    "失敗後不得留下鎖（fd 必須已釋放）",
+    jb.SEARCH_LOCK_FD is None,
+    f"SEARCH_LOCK_FD={jb.SEARCH_LOCK_FD}",
+)
+check("失敗後 SEARCH_PROCESS 仍為 None", jb.SEARCH_PROCESS is None)
+
+# 最關鍵的一項：下一次必須還能取鎖。修復前這裡會永遠回 "A scan is already
+# running"，而 timer 每輪都 SKIPPED、exit 0 —— 永久且靜默的全機掃描停擺。
+with mock.patch.object(
+    jb.subprocess, "Popen", side_effect=FileNotFoundError("再來一次"),
+):
+    ok2, msg2 = jb.start_search()
+check(
+    "第二次仍能取鎖（沒有把自己鎖死）",
+    "already running" not in (msg2 or ""),
+    f"ok={ok2} msg={msg2!r}",
+)
+check("第二次失敗後鎖同樣已釋放", jb.SEARCH_LOCK_FD is None)
+
+# ═══ E. 孤兒鎖自癒（reap_orphan_search_lock）══════════════════════════════════
+print("=== E. 孤兒鎖自癒：持有鎖卻沒有子程序 ===")
+
+fd = jb._acquire_search_lock()
+check("取得鎖（測試前提）", fd is not None, f"fd={fd}")
+jb.SEARCH_LOCK_HELD_SINCE = time.monotonic() - (jb.ORPHAN_LOCK_GRACE + 10)
+jb.SEARCH_PROCESS = None
+reaped = jb.reap_orphan_search_lock()
+check(
+    "超過寬限值的孤兒鎖被回收",
+    reaped == fd and jb.SEARCH_LOCK_FD is None,
+    f"回傳={reaped!r} SEARCH_LOCK_FD={jb.SEARCH_LOCK_FD}",
+)
+
+fd = jb._acquire_search_lock()
+# 「剛取得」本身就是未達寬限值的情況 —— 用新鮮的時間戳，不要回推，否則就是
+# 在測「已達寬限值」而斷言相反的事（第一版就是這樣寫錯的）。
+jb.SEARCH_LOCK_HELD_SINCE = time.monotonic()
+check("未達寬限值時不得回收", jb.reap_orphan_search_lock() is None)
+jb._release_search_lock()
+
+fd = jb._acquire_search_lock()
+jb.SEARCH_LOCK_HELD_SINCE = time.monotonic() - (jb.ORPHAN_LOCK_GRACE + 10)
+owner_proc = subprocess.Popen(["sleep", "600"])
+jb.SEARCH_PROCESS = owner_proc
+check(
+    "有子程序在跑時不得回收（那是有主的鎖，誤放會導致並發爬蟲）",
+    jb.reap_orphan_search_lock() is None,
+)
+owner_proc.kill()
+owner_proc.wait()
+jb.SEARCH_PROCESS = None
+jb._release_search_lock()
+check("清理：鎖已釋放", jb.SEARCH_LOCK_FD is None)
 
 # ═══ 結果 ════════════════════════════════════════════════════════════════════
 print()
