@@ -66,11 +66,13 @@ TIMEOUT = 400
 #   **這代表目前沒有任何測試能證明少了鎖會出問題**，這是已知且接受的狀態。
 #   限縮前提（本地檔案、行長 < PIPE_BUF）見 job_board.py 的 _out() 上方註解。
 #
-# M20（排程器跑完之後那段回到未排序的 `times[0]`）：這一段【結構上測不到】——
-#   它在 `scheduler_loop()` 裡、`INTERNAL_SCHEDULER` 為真時才會執行，而且必須
-#   等一輪 19 分鐘的真掃描結束。測試行程兩個前提都不成立，所以這個變異保證逃脫。
-#   列在這裡是為了讓「這裡沒有回歸保護」變成機器看得見的事實，而不是一句註解。
-EXPECTED_ESCAPES = {"M13", "M20"}
+# M20 在第七輪【已從這份清單移除】。舊版的理由是「那段程式碼結構上測不到：
+#   要 INTERNAL_SCHEDULER=1 且跑完一輪 19 分鐘的真掃描」。審查員證明那個理由
+#   不成立 —— 帳務邏輯本來就可以抽成純函式來測（現在是 _record_run()），而且
+#   那段「測不到」的程式碼裡就藏著 MAJOR-1（跨午夜把隔天早上記成已觸發）。
+#   M20 現在改成 _record_run() 的日期那一半，L 區逮得到它。
+#   ⚠️ 留這一段的教訓：「測不到」通常只是「還沒抽出來」的另一種說法。
+EXPECTED_ESCAPES = {"M13"}
 
 
 def git(*args, check=True):
@@ -238,18 +240,58 @@ MUTATIONS = [
         "            else:\n"
         "                want = bool(data[\"enabled\"])\n",
         "M19")),
-    # 排程器跑完之後的 next_run 計算。**這個變異預期會逃脫**（見 EXPECTED_ESCAPES
-    # 的 M20 條）：那條路徑要 INTERNAL_SCHEDULER=1 而且要先跑完一輪 19 分鐘的掃描。
-    # 放在清單裡是為了讓這個覆蓋缺口是可執行的、不是文件裡的一句話。
-    ("M20", "排程器跑完後回到未排序的 times[0]（已知無覆蓋）", lambda t: sub_once(
-        t,
-        "                    times = sorted(cfg.get(\"times\") or [\"06:00\", \"22:00\"])\n",
-        "                    times = cfg.get(\"times\", [\"06:00\", \"22:00\"])\n",
-        "M20")),
+    # M20 在第七輪被【重新設計】了。舊版是把 scheduler_loop 的 `sorted(...)` 拿掉，
+    # 並被列進 EXPECTED_ESCAPES，理由寫「要 INTERNAL_SCHEDULER=1 且跑完一輪 19 分鐘
+    # 的真掃描才會走到，結構上測不到」。審查員證明那個理由不成立（帳務可以抽成純
+    # 函式來測），而且那段程式碼裡就藏著 MAJOR-1。
+    #
+    # 現在 target 是 `_record_run()` 的【日期】那一半：把已觸發時段記在「跑完那天」
+    # 而不是「觸發那天」。22:00 起跑、00:30 結束的掃描跨過午夜 → 記到隔天去 →
+    # 隔天早上的 06:00 被判定已觸發而靜默跳過（正是 MAJOR-1 的病根之一）。
+    #
+    # 至於舊版那個「挑錯時段」的另一半，現在【結構上不可表達】：`_record_run()`
+    # 不再推導剛剛燒掉哪個時段，它接收那個時段。「不推導」比「推導對了」強 ——
+    # 所以那個方向的變異沒有對應的 target 可以改，這是刻意的。
+    ("M20", "把已觸發時段記在【跑完那天】而非【觸發那天】（跨午夜記錯日期）",
+     lambda t: sub_once(
+         t,
+         "        fired_map.setdefault(fired_date, [])\n"
+         "        if fired_time not in fired_map[fired_date]:\n"
+         "            fired_map[fired_date].append(fired_time)\n",
+         "        _d = now2.strftime(\"%Y-%m-%d\")\n"
+         "        fired_map.setdefault(_d, [])\n"
+         "        if fired_time not in fired_map[_d]:\n"
+         "            fired_map[_d].append(fired_time)\n",
+         "M20")),
     # 第三道鎖：這道是三道鎖裡唯一擋得住 curl／devtools 的，到第六輪為止沒有測試。
     ("M21", "第三道鎖失效（停用中仍可用 API 重新武裝內建排程器）", lambda t: sub_once(
         t, "                if want and not INTERNAL_SCHEDULER:\n",
         "                if False:\n", "M21")),
+    # ── 第七輪退回的修正，各自的變異 ──────────────────────────────────────────
+    ("M22", "interval_hours 的例外處理漏掉 OverflowError（1e400→inf→500）", lambda t: sub_once(
+        t, "                except (TypeError, ValueError, OverflowError):\n",
+        "                except (TypeError, ValueError):\n", "M22")),
+    ("M23", "_valid_times 用 len+isdigit+int 而非 ASCII regex（非 ASCII 數字）",
+     lambda t: sub_once(
+         t, "        if not isinstance(t, str) or not _TIME_RE.fullmatch(t):\n",
+         "        if (not isinstance(t, str) or len(t) != 5 or t[2] != \":\"\n"
+         "                or not (t[:2].isdigit() and t[3:].isdigit())\n"
+         "                or int(t[:2]) > 23 or int(t[3:]) > 59):\n", "M23")),
+    ("M24", "損壞的排程檔靜默退回預設值（不回報、不保留原檔）", lambda t: sub_once(
+         t,
+         "        salvage = SCHEDULE_FILE + \".corrupt\"\n",
+         "        return dict(SCHEDULE_DEFAULT)\n"
+         "        salvage = SCHEDULE_FILE + \".corrupt\"\n", "M24")),
+    ("M25", "post-run 的 next_run 用【現在】算而不是【跑完的當下】", lambda t: sub_once(
+        t, "    cfg[\"next_run\"] = _compute_next_run(cfg, now2)\n",
+        "    cfg[\"next_run\"] = _compute_next_run(cfg)\n", "M25")),
+    ("M26", "api_schedule 不論如何都回 ok:true（部分拒絕也宣稱成功）", lambda t: sub_once(
+        t, "        resp = {\"ok\": not warning, \"schedule\": SCHEDULE_CONFIG}\n",
+        "        resp = {\"ok\": True, \"schedule\": SCHEDULE_CONFIG}\n", "M26")),
+    ("M27", "_parse_timer_calendar 讀不到時編一個時段出來（而不是回 None）",
+     lambda t: sub_once(
+         t, "    if not specs:\n        return None\n",
+         "    if not specs:\n        return \"06:00 / 22:00\"\n", "M27")),
 ]
 
 results = []

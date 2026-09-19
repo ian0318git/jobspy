@@ -1194,6 +1194,284 @@ check(
     f"關閉→enabled={_k_off_cfg['enabled']}",
 )
 
+print("=== L. 第七輪退回：跨午夜的掃描被靜默跳過（MAJOR-1）與 post-run 帳務 ===")
+# 第七輪審查的 MAJOR-1。掃描跑完後的帳務原本是用 now2 回推「最近 6 小時內最接近
+# 的時段」。22:00 起跑、00:30 才結束的那輪跨過午夜 → now2 的日期已經是【隔天】，
+# 而 |00:30 − 06:00| = 5.5h < 6h → 把【隔天早上 06:00】記成已觸發 → 隔天 06:00 的
+# due 判定 `if t in already_fired: continue` 直接跳過（連一行 log 都沒有），
+# 而 next_run 算出來正是 06:00，面板照樣承諾它會跑。
+#
+# 這是 a6f77a6 消滅的【幽靈排程】換了一條路徑復發：畫面承諾的事不會發生，
+# 而且沒有人收到錯誤。它之所以活過第六輪，是因為那段被列進 mutate.py 的
+# EXPECTED_ESCAPES（理由：「結構上測不到」）。那個理由不成立 —— 修法把帳務抽成
+# 模組層級的純函式 `_record_run()`，不需要真掃描、不需要 19 分鐘、不需要
+# INTERNAL_SCHEDULER=1。所以 M20 也從 EXPECTED_ESCAPES 移除了。
+#
+# 【結構上的重點】:_record_run() 【不再推導】剛剛燒掉哪個時段 —— 它接收那個時段。
+# 「推導錯」在結構上不再可表達，這比「推導對了」強。仍然可以錯的是【傳錯】，
+# 所以下面測的是傳進去的參數有沒有被正確使用。
+_L_MIDNIGHT = datetime(2026, 9, 21, 0, 30)   # 22:00 起跑那輪跨過午夜後才結束
+_L_SAME_DAY = datetime(2026, 9, 20, 22, 20)
+
+
+def _l_cfg(**over):
+    cfg = {"enabled": True, "mode": "times", "interval_hours": 6,
+           "times": ["06:00", "22:00"], "next_run": None, "_fired_today": {}}
+    cfg.update(over)
+    return cfg
+
+
+# 正向控制（防空轉通過）：正常情況【必須】把時段記進去。少了這一項，一個
+# 「什麼都不記」的 _record_run 也會讓下面的「不得記成已觸發」全部通過。
+_l_same = _l_cfg()
+jb._record_run(_l_same, _L_SAME_DAY, "2026-09-20", "22:00")
+check(
+    "跑完後必須把【觸發當下那個時段】記進 _fired_today 的【觸發那天】（正向控制）",
+    _l_same["_fired_today"].get("2026-09-20") == ["22:00"],
+    f"_fired_today={_l_same['_fired_today']}",
+)
+
+_l_mid = _l_cfg()
+jb._record_run(_l_mid, _L_MIDNIGHT, "2026-09-20", "22:00")
+check(
+    "跨午夜的掃描不得記在【跑完那天】（MAJOR-1：時段屬於觸發那天）",
+    _l_mid["_fired_today"].get("2026-09-20") == ["22:00"]
+    and _l_mid["_fired_today"].get("2026-09-21") is None,
+    f"_fired_today={_l_mid['_fired_today']} next_run={_l_mid['next_run']!r}",
+)
+
+# 這是 MAJOR-1 的本體，也是整個 K/L 區的核心不變式：
+# **next_run 指的時段不得同時出現在 _fired_today 裡。**
+# 破壞它 = 面板承諾一個 due 判定會直接 continue 掉的時段。
+_l_nr = _l_mid["next_run"] or ""
+_l_nr_date, _, _l_nr_time = _l_nr.partition(" ")
+check(
+    "next_run 指的時段不得是已觸發的時段（否則畫面承諾一件不會發生的事）",
+    _l_nr_time == "06:00"
+    and _l_nr_time not in (_l_mid["_fired_today"].get(_l_nr_date) or []),
+    f"next_run={_l_nr!r} next_run 的時段={_l_nr_time!r} "
+    f"當天已觸發={_l_mid['_fired_today'].get(_l_nr_date)}",
+)
+
+# M20 的回歸保護：post-run 算出的 next_run 必須與 `_compute_next_run()` 對
+# 【同一份 cfg、同一個 now】給出同一個答案。這條在未變異的程式碼上必須成立
+# （不成立就是假陽性 —— 而假陽性的斷言比沒有斷言更糟，它會讓人以為有保護）。
+_l_rt_cases = [
+    ("跨午夜跑完", _l_cfg(), _L_MIDNIGHT, "2026-09-20", "22:00"),
+    ("同日跑完", _l_cfg(), _L_SAME_DAY, "2026-09-20", "22:00"),
+    ("當天時段全過", _l_cfg(), datetime(2026, 9, 20, 23, 30), "2026-09-20", "22:00"),
+    ("亂序 times", _l_cfg(times=["22:00", "06:00"]), _L_MIDNIGHT, "2026-09-20", "22:00"),
+    ("interval 模式", _l_cfg(mode="interval"), datetime(2026, 9, 20, 12, 0), None, None),
+]
+_l_rt_bad = []
+for _l_name, _l_c, _l_now2, _l_fd, _l_ft in _l_rt_cases:
+    jb._record_run(_l_c, _l_now2, _l_fd, _l_ft)
+    _l_expect = jb._compute_next_run(_l_c, _l_now2)
+    if _l_c["next_run"] != _l_expect:
+        _l_rt_bad.append(f"{_l_name}: {_l_c['next_run']!r} != {_l_expect!r}")
+check(
+    "post-run 的 next_run 必須等於 _compute_next_run(同一份 cfg, 同一個 now)（M20）",
+    not _l_rt_bad,
+    f"不一致={_l_rt_bad or '無'}",
+)
+
+# _compute_next_run 的 interval 分支到第七輪為止【沒有任何斷言】（審查員 m7）。
+# 它只被 K 區間接碰到（K 只檢查 mode 與 interval_hours 有沒有存進去，沒看 next_run）。
+_l_iv = _l_cfg(mode="interval", interval_hours=4,
+               last_run="2026-09-20T08:00:00")
+check(
+    "_compute_next_run 的 interval 分支必須是 last_run + interval_hours（第七輪 m7）",
+    jb._compute_next_run(_l_iv, datetime(2026, 9, 20, 12, 0))
+    == "2026-09-20T12:00:00",
+    f"得到 {jb._compute_next_run(_l_iv, datetime(2026, 9, 20, 12, 0))!r}",
+)
+
+# 壞掉的 _fired_today（手改成 list／null）不得讓帳務炸掉 —— 它只是內建排程器的
+# 記憶，重建成空的代價是「這一輪可能多掃一次」，比整條排程執行緒掛掉小得多。
+# 這一項同時是「_record_run 不會因為畸形狀態而丟例外」的守門員。
+_l_broken = _l_cfg(_fired_today=["not", "a", "dict"])
+try:
+    jb._record_run(_l_broken, _L_MIDNIGHT, "2026-09-20", "22:00")
+    _l_broken_ok = _l_broken["_fired_today"].get("2026-09-20") == ["22:00"]
+    _l_broken_msg = f"_fired_today={_l_broken['_fired_today']}"
+except Exception as e:  # noqa: BLE001 — 丟例外本身就是一項 FAIL
+    _l_broken_ok, _l_broken_msg = False, f"丟出例外：{e!r}"
+check("_fired_today 是畸形值時必須重建而不是丟例外", _l_broken_ok, _l_broken_msg)
+
+# ── 第七輪 m1／m2：兩個「驗證器自己丟例外」的路徑 ────────────────────────────
+# m1：`except (TypeError, ValueError)` 接不住 OverflowError（issubclass(OverflowError,
+# ValueError) 是 False）。JSON 的 1e400 會解析成 inf，`int(inf)` → OverflowError
+# → 逃出 api_schedule → HTTP 500。瀏覽器端 catch 會吞掉它，使用者看到「什麼都沒發生」。
+_l_inf_cfg, _l_inf_resp = _post_schedule({"interval_hours": float("inf")})
+check(
+    "interval_hours 是 inf（JSON 的 1e400）必須回 warning，不是 500",
+    not _l_inf_resp.get("__error__") and _l_inf_resp.get("warning")
+    and _l_inf_cfg["interval_hours"] == 6,
+    f"error={_l_inf_resp.get('__error__')!r} warning={(_l_inf_resp.get('warning') or '')[:40]!r} "
+    f"interval_hours={_l_inf_cfg['interval_hours']}",
+)
+
+# m2：`str.isdigit()` 對上標數字（'⁰⁶'）為真，但 `int('⁰⁶')` 丟 ValueError ——
+# 一個規格上「不合法回 None」的驗證器自己丟例外。全形數字（'０６'）更糟：
+# isdigit() 為真、int() 也成功，於是【靜默放行】一個 strptime 解不開的字串。
+# 兩者都必須被擋掉，而且【不得丟例外】。
+_l_uni_bad, _l_uni_msg = [], []
+for _l_t in ("⁰⁶:⁰⁰", "０６:００",
+             "٠٦:٠٠", "06:00​", "0۶:00"):
+    try:
+        if jb._valid_times([_l_t]) is not None:
+            _l_uni_bad.append(_l_t)
+    except Exception as e:  # noqa: BLE001 — 丟例外本身就是 FAIL
+        _l_uni_msg.append(f"{_l_t!r} 丟出 {e!r}")
+check(
+    "非 ASCII 的『數字』必須被 _valid_times 擋掉，且不得丟例外（第七輪 m2）",
+    not _l_uni_bad and not _l_uni_msg,
+    f"誤放行={_l_uni_bad} 例外={_l_uni_msg}",
+)
+# 反向控制：ASCII 的合法值仍然必須放行（否則上面可靠「全部拒絕」空轉通過）。
+check(
+    "（承上）ASCII 的合法時段仍必須放行，'00:00' 與 '23:59' 是邊界",
+    jb._valid_times(["00:00", "23:59"]) == ["00:00", "23:59"],
+    f"得到 {jb._valid_times(['00:00', '23:59'])!r}",
+)
+
+print("=== M. 第七輪退回：排程檔的靜默降級（m3）與 API 合約（m6）／timer 時段（N5）===")
+# m3：`load_schedule()` 原本是 `except (json.JSONDecodeError, IOError): pass`。
+# 檔案壞掉時使用者的設定被【靜默】換成預設值，而且啟動時的壓平／回復緊接著
+# 就會 save_schedule() —— 把那個壞掉的檔覆寫掉，唯一能救的證據也一起消失。
+#
+# 這一段【必須在子行程裡跑】：load_schedule() 讀的是模組層級的 SCHEDULE_FILE，
+# 改它會影響整個測試行程（K/L 區都在用）。子行程也順便證明「讀不到時真的
+# 不會炸掉 import」。
+_M_TMP = tempfile.mkdtemp(prefix="jobspy-sched-m-")
+# _J_TMP 在 J 區結尾就被 rmtree 掉了（第 1035 行），所以 M 區要自己的目錄 ——
+# 沿用 _J_TMP 會得到 FileNotFoundError，而那是【測試自己】的錯，不是產品碼的。
+atexit.register(shutil.rmtree, _M_TMP, ignore_errors=True)
+
+_M_LOOSE = (
+    "import os,sys,json\n"
+    "p=os.environ['JOB_BOARD_SCHEDULE_FILE']\n"
+    "open(p,'w').write('{\"enabled\": true, \"times\": [\"07:00\"')  # 寫到一半被砍\n"
+    "import job_board as jb\n"          # 匯入時就會 load_schedule()
+    "print('RESULT:'+json.dumps(jb.SCHEDULE_CONFIG.get('times')))\n"
+    "print('SALVAGED:'+str(os.path.exists(p+'.corrupt')))\n"
+    # 原路徑【應該】又存在了 —— 啟動時的壓平會寫一份乾淨的新檔。所以這裡要看的是
+    # 「新檔是不是有效的」，而不是「原路徑還在不在」（後者會誤判成失敗）。
+    "print('FRESH:'+str(bool(json.load(open(p))) and 'ok'))\n"
+    "sys.stdout.flush()\n"
+    "os._exit(0)\n"                      # 見 README：不進 finalization 才不會隨機 SIGABRT
+)
+
+
+def _m_run_corrupt(extra_env=None):
+    path = os.path.join(_M_TMP, f"corrupt-{time.time_ns()}.json")
+    env = dict(os.environ,
+               JOB_BOARD_SCHEDULE_FILE=path,
+               JOBSCAN_LOCK=os.path.join(_M_TMP, "jobscan.lock"),
+               JOBSCAN_LIVE=os.path.join(_M_TMP, "live.log"),
+               JOBSCAN_STATE=os.path.join(_M_TMP, "state.json"))
+    env.pop("JOB_BOARD_INTERNAL_SCHEDULER", None)
+    env.update(extra_env or {})
+    r = subprocess.run([sys.executable, "-c", _M_LOOSE], env=env,
+                       capture_output=True, text=True, timeout=120)
+    out = {}
+    for line in (r.stdout or "").splitlines():
+        if ":" in line:
+            k, _, v = line.partition(":")
+            out[k] = v
+    out["__rc__"] = r.returncode
+    out["__err__"] = (r.stderr or "")[-300:]
+    return out, path
+
+
+_m_corrupt, _m_path = _m_run_corrupt()
+check(
+    "損壞的排程檔必須回預設值、保留原檔（.corrupt）、且不得讓 import 失敗（m3）",
+    _m_corrupt.get("RESULT") == '["06:00", "22:00"]'
+    and _m_corrupt.get("SALVAGED") == "True"
+    and _m_corrupt.get("FRESH") == "ok"
+    and _m_corrupt.get("__rc__") == 0,
+    f"times={_m_corrupt.get('RESULT')} 原檔保留={_m_corrupt.get('SALVAGED')} "
+    f"新檔有效={_m_corrupt.get('FRESH')} rc={_m_corrupt.get('__rc__')} "
+    f"err={_m_corrupt.get('__err__')!r}",
+)
+# 「保留原檔」必須真的保得住內容 —— 只檢查檔名存在是不夠的：一個把檔案
+# 改名成 .corrupt 但內容被空的檔蓋掉的實作也會通過上面那一項。
+_m_saved = ""
+try:
+    with open(_m_path + ".corrupt", encoding="utf-8") as f:
+        _m_saved = f.read()
+except OSError as e:
+    _m_saved = f"<讀不到：{e!r}>"
+check(
+    "（承上）.corrupt 必須保有【原始內容】，不是一個空殼",
+    _m_saved == '{"enabled": true, "times": ["07:00"',
+    f".corrupt 內容={_m_saved[:60]!r}",
+)
+
+# save_schedule 必須是原子寫入（m3 的另一半），且不留 .tmp 垃圾。
+_m_sched = os.path.join(_M_TMP, f"atomic-{time.time_ns()}.json")
+_m_orig_file, _m_orig_stop = jb.SCHEDULE_FILE, None
+try:
+    jb.SCHEDULE_FILE = _m_sched
+    jb.save_schedule({"enabled": True, "times": ["06:00", "22:00"]})
+    with open(_m_sched, encoding="utf-8") as f:
+        _m_readback = json.load(f)
+    _m_leftovers = [p for p in os.listdir(_M_TMP)
+                    if p.startswith(os.path.basename(_m_sched)) and ".tmp." in p]
+    _m_atomic_ok = _m_readback.get("times") == ["06:00", "22:00"] and not _m_leftovers
+    _m_atomic_msg = f"讀回={_m_readback.get('times')} 殘留 tmp={_m_leftovers}"
+except Exception as e:  # noqa: BLE001 — 丟例外本身就是 FAIL
+    _m_atomic_ok, _m_atomic_msg = False, f"丟出例外：{e!r}"
+finally:
+    jb.SCHEDULE_FILE = _m_orig_file
+check("save_schedule 必須寫出完整可讀的檔且不留 .tmp 殘骸", _m_atomic_ok, _m_atomic_msg)
+
+# m6：`ok` 原本永遠是 true，於是「一半的欄位被拒絕」也是 ok:true —— API 合約上的不實。
+_m_ok_all, _m_ok_all_resp = _post_schedule({"times": ["07:30", "19:30"]})
+_m_ok_part, _m_ok_part_resp = _post_schedule({"times": [], "mode": "bogus"})
+check(
+    "ok 必須反映『每個欄位都生效了』：全生效→true，有被拒絕→false 且附 rejected（m6）",
+    _m_ok_all_resp.get("ok") is True and not _m_ok_all_resp.get("rejected")
+    and _m_ok_part_resp.get("ok") is False
+    and len(_m_ok_part_resp.get("rejected") or []) == 2,
+    f"全生效 ok={_m_ok_all_resp.get('ok')!r} rejected={_m_ok_all_resp.get('rejected')!r}；"
+    f"部分失敗 ok={_m_ok_part_resp.get('ok')!r} rejected={len(_m_ok_part_resp.get('rejected') or [])} 項",
+)
+
+# N5：面板顯示的時段必須來自 timer 本身，不是寫死的字串。
+# 輸入字串是【本機實測的原樣輸出】，沒有改寫 —— 用自己編的格式測等於在測自己的假設。
+_M_CAL_REAL = (
+    "{ OnCalendar=*-*-* 22:00:00 Australia/Melbourne ; next_elapse=Sun 2026-09-20 22:00:00 AEST }\n"
+    "{ OnCalendar=*-*-* 06:00:00 Australia/Melbourne ; next_elapse=Sun 2026-09-20 06:00:00 AEST }\n"
+)
+check(
+    "TimerCalendar 解析：必須取出時:分與時區，且順序固定（N5）",
+    jb._parse_timer_calendar(_M_CAL_REAL) == "06:00 / 22:00 (Australia/Melbourne)",
+    f"得到 {jb._parse_timer_calendar(_M_CAL_REAL)!r}",
+)
+# 讀不到就必須回 None（呼叫端據此顯示「讀不到時段設定」）—— 回一個編出來的
+# 時段正是這個專案在消滅的東西。
+check(
+    "（承上）解析不出來時必須回 None，不得編一個時段出來",
+    jb._parse_timer_calendar("") is None
+    and jb._parse_timer_calendar("garbage without the marker") is None,
+    f"空字串→{jb._parse_timer_calendar('')!r} "
+    f"垃圾→{jb._parse_timer_calendar('garbage without the marker')!r}",
+)
+
+# m5：前端 `catch(e){console.error(e)}` 會把「請求被拒絕」變得與「存檔成功」
+# 一模一樣。這是【原始碼層級】的檢查，不是行為覆蓋 —— 前端 JS 在這個 repo
+# 仍然沒有行為測試（見 deploy/README.md 的未涵蓋清單），不要把它當成有。
+_m_src = (Path(__file__).resolve().parent.parent / "job_board.py").read_text(encoding="utf-8")
+_m_net_alert = "catch(e){ alert('排程未儲存：'+e); }" in _m_src
+_m_json_alert = "catch(_){ alert('排程未儲存：伺服器回應不是 JSON" in _m_src
+check(
+    "前端 updateSchedule() 不得只 console.error 就吞掉失敗（原始碼層級檢查，非行為覆蓋）",
+    _m_net_alert and _m_json_alert,
+    f"連線失敗有警報={_m_net_alert} 非JSON回應有警報={_m_json_alert}",
+)
+
 # ═══ 結果 ════════════════════════════════════════════════════════════════════
 print()
 if FAILURES:

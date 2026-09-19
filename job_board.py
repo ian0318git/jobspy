@@ -28,6 +28,7 @@ import json
 import glob
 import fcntl
 import os
+import re
 import signal
 import sys
 import subprocess
@@ -1165,24 +1166,85 @@ SCHEDULE_DEFAULT = {
 
 
 def load_schedule():
-    if os.path.exists(SCHEDULE_FILE):
+    """讀排程檔。解不開時【保留原檔並留下證據】，回預設值。
+
+    第七輪審查 m3：原本是 `except (json.JSONDecodeError, IOError): pass`，於是
+    檔案壞掉時使用者的設定被【靜默】換成預設值。更糟的是啟動時的壓平／回復
+    緊接著就會 `save_schedule()` —— 把那個壞掉的檔覆寫掉，唯一可能救回來的
+    證據也沒了。使用者只會發現排程莫名其妙回到 06:00/22:00，而且沒有任何訊息。
+
+    改名的副作用正好是我們要的：原路徑沒有檔案之後，下一次 save_schedule()
+    寫的是乾淨的新檔，不會覆蓋證據；也自然避免了「每 30 秒記一次同樣的錯誤」
+    造成的日誌膨脹（那正是 2026-09-17 事故的形狀）。
+    """
+    if not os.path.exists(SCHEDULE_FILE):
+        return dict(SCHEDULE_DEFAULT)
+    try:
+        with open(SCHEDULE_FILE) as f:
+            cfg = json.load(f)
+        if not isinstance(cfg, dict):
+            raise ValueError(f"最外層必須是 JSON 物件，實際是 {type(cfg).__name__}")
+    except (json.JSONDecodeError, IOError, ValueError) as e:
+        salvage = SCHEDULE_FILE + ".corrupt"
         try:
-            with open(SCHEDULE_FILE) as f:
-                cfg = json.load(f)
-            for k, v in SCHEDULE_DEFAULT.items():
-                cfg.setdefault(k, v)
-            return cfg
-        except (json.JSONDecodeError, IOError):
-            pass
-    return dict(SCHEDULE_DEFAULT)
+            os.replace(SCHEDULE_FILE, salvage)
+            kept = f"原檔已保留在 {salvage}"
+        except OSError as e2:
+            kept = f"⚠️ 連保留原檔都失敗（{e2!r}）"
+        _out(f"[schedule] ⚠️ 無法解讀 {SCHEDULE_FILE}（{e!r}）——"
+             f"本次改用預設排程；{kept}")
+        return dict(SCHEDULE_DEFAULT)
+    for k, v in SCHEDULE_DEFAULT.items():
+        cfg.setdefault(k, v)
+    return cfg
 
 
 def save_schedule(cfg):
-    with open(SCHEDULE_FILE, "w") as f:
+    """原子寫入。
+
+    第七輪審查 m3 的另一半：原本是 `open(..., "w")`，先 truncate 再寫 —— 中斷
+    的產物正好就是 `load_schedule()` 讀不回來的那種檔案。而中斷窗口是真的：
+    `jobboard.service` 是 `Restart=always` + `MemoryMax=512M`，unit 的註解本身
+    就預期它會被 OOM 殺。tmp + os.replace 讓讀者只會看到「舊的完整檔」或
+    「新的完整檔」，不存在第三種狀態。
+
+    （`os.replace` 在同一個檔案系統內是原子的，這是 POSIX 保證。）
+    """
+    tmp = f"{SCHEDULE_FILE}.tmp.{os.getpid()}"
+    with open(tmp, "w") as f:
         json.dump(cfg, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, SCHEDULE_FILE)
 
 
 _TIMER_CACHE = {"at": 0.0, "value": None}
+
+
+def _parse_timer_calendar(text):
+    """把 `systemctl show -p TimersCalendar` 的輸出變成人看得懂的一行。
+
+    每個 OnCalendar 一行，格式（本機實測，未經改寫）：
+        { OnCalendar=*-*-* 06:00:00 Australia/Melbourne ; next_elapse=Sun ... }
+
+    抽成模組層級函式是為了可測 —— 面板顯示的時段必須來自 timer 本身，
+    而不是寫死在 HTML 裡的字串（第七輪審查 N5：寫死的字串會在有人改 timer
+    時變成一句謊，也就是幽靈排程的同一類）。
+
+    讀不到就回 None；呼叫端據此顯示「讀不到時段設定」而不是編一個出來。
+    """
+    specs = []
+    for line in text.splitlines():
+        if "OnCalendar=" not in line:
+            continue
+        parts = line.split("OnCalendar=", 1)[1].split(";", 1)[0].split()
+        if len(parts) >= 2:
+            specs.append((parts[1][:5], parts[2] if len(parts) >= 3 else ""))
+    if not specs:
+        return None
+    zones = {z for _, z in specs if z}
+    return " / ".join(sorted({t for t, _ in specs})) + (
+        f" ({zones.pop()})" if len(zones) == 1 else "")
 
 
 def get_timer_state():
@@ -1201,8 +1263,20 @@ def get_timer_state():
     if _TIMER_CACHE["value"] is not None and now - _TIMER_CACHE["at"] < 30:
         return _TIMER_CACHE["value"]
     result = {"installed": False, "next": None, "last": None,
-              "next_iso": None, "last_iso": None}
+              "next_iso": None, "last_iso": None, "calendar": None}
     try:
+        # OnCalendar 本身：第七輪審查 N5。面板原本把「每日 06:00 / 22:00（Melbourne）」
+        # 寫死在 HTML 裡 —— 現在剛好是對的，但改 timer 不會改面板，於是面板又開始
+        # 承諾一個不存在的時段（幽靈排程的同一類）。`list-timers --output=json`
+        # 沒有這個欄位，所以另外問一次；查不到就回 None，前端寧可語焉不詳也不要編。
+        cal = subprocess.run(
+            ["systemctl", "--user", "show", "jobscan.timer",
+             "-p", "TimersCalendar", "--value", "--no-pager"],
+            capture_output=True, text=True, timeout=3,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+        if cal.returncode == 0 and cal.stdout.strip():
+            result["calendar"] = _parse_timer_calendar(cal.stdout)
         proc = subprocess.run(
             ["systemctl", "--user", "list-timers", "jobscan.timer", "--all",
              "--output=json", "--no-pager"],
@@ -1236,6 +1310,13 @@ SCHEDULE_CONFIG = load_schedule()
 SCHEDULE_STOP = threading.Event()
 
 
+# ⚠️ 數字類別一律用 [0-9] 而【不是】 \d：Python 的 \d 預設匹配 Unicode 數字，
+# 所以 r"([01]\d|...)" 會放行 '0۶:00'（阿拉伯-印度數字 6）—— 第七輪審查時
+# 我自己第一版就是這樣寫的，被測試當場抓到。`re.ASCII` 也可以，但 explicit
+# class 更難被下一個人改壞。
+_TIME_RE = re.compile(r"([01][0-9]|2[0-3]):[0-5][0-9]")
+
+
 def _valid_times(value):
     """驗證時段清單，回傳原順序的複本；不合法回 None。
 
@@ -1254,36 +1335,84 @@ def _valid_times(value):
     if not isinstance(value, list) or not value:
         return None
     for t in value:
-        if (not isinstance(t, str) or len(t) != 5 or t[2] != ":"
-                or not (t[:2].isdigit() and t[3:].isdigit())
-                or int(t[:2]) > 23 or int(t[3:]) > 59):
+        # ⚠️ 用 ASCII 錨定的 regex，而不是 len()+isdigit()+int()（第七輪審查 m2）。
+        # 舊寫法兩個方向都錯：
+        #   * 上標數字：`'⁰⁶'.isdigit()` 是 True，但 `int('⁰⁶')` 丟 ValueError
+        #     —— 一個規格上「不合法就回 None」的驗證器自己丟例外 = HTTP 500。
+        #   * 全形數字：`'０６'.isdigit()` 是 True，`int('０６')` 也【成功】，
+        #     於是靜默放行一個 `datetime.strptime("%H:%M")` 解不開的字串 →
+        #     排程器每 30 秒在 except 裡記一次錯誤（約 120 行/小時的日誌膨脹，
+        #     正是 2026-09-17 那次事故的形狀），而排程永遠不會跑。
+        # regex 讓「通過驗證」與「strptime 解得開」變成等價的。
+        if not isinstance(t, str) or not _TIME_RE.fullmatch(t):
             return None
     return list(value)
 
 
-def _compute_next_run(cfg):
+def _compute_next_run(cfg, now=None):
     """算出 cfg 的下一次執行時間字串；未啟用時回 None。
 
-    抽出來是因為有兩個地方需要同一套計算（啟動時回復舊制、UI 儲存排程），
-    而原本這兩段是各自複製的，而且已經 drift 過。
+    抽出來是因為有三個地方需要同一套計算（啟動時回復舊制、UI 儲存排程、
+    掃描跑完後的帳務），而原本這三段是各自複製的 —— 複製就會 drift，
+    drift 過的版本就是第七輪的 MAJOR-1 與被豁免的 M20。
 
-    排程器迴圈（跑完之後那段）刻意【不】呼叫這個函式：它要用「跑完的當下」
-    （now2）而不是「現在」來算，語意不同。但兩者對 cfg 的解讀必須一致 ——
-    `sorted(...)` 與 `or`（而非 `get(k, default)`）兩邊都一樣，理由見
-    `scheduler_loop()` 裡 `times = sorted(cfg.get("times") or [...])` 的註解。
+    `now` 參數是第七輪審查 MAJOR-1 的修法：掃描跑完後要用【跑完的當下】
+    （now2）算，而其他呼叫者要用【現在】。原本因為「語意不同」而讓排程器
+    自己複製一份，那份複製品就是缺陷所在。參數化之後只有一份實作，
+    「兩條路徑對同一個輸入給不同答案」在結構上不可能發生。
     """
     if not cfg.get("enabled"):
         return None
+    now = now or datetime.now()
     times = sorted(cfg.get("times") or ["06:00", "22:00"])
     if cfg.get("mode") == "times":
-        now = datetime.now()
         future = [t for t in times if t > now.strftime("%H:%M")]
         if future:
             return f"{now.strftime('%Y-%m-%d')} {future[0]}"
         return f"{(now + timedelta(days=1)).strftime('%Y-%m-%d')} {times[0]}"
     last = cfg.get("last_run")
-    base = datetime.fromisoformat(last) if last else datetime.now()
+    base = datetime.fromisoformat(last) if last else now
     return (base + timedelta(hours=cfg.get("interval_hours", 6))).isoformat()
+
+
+def _record_run(cfg, now2, fired_date, fired_time):
+    """掃描跑完後的帳務：記錄剛剛燒掉哪個時段、算出下一次執行時間。就地改 cfg。
+
+    ⚠️ 這個函式存在的原因是第七輪審查的 MAJOR-1。原本這段是用 now2 回推
+    「最近 6 小時內最接近的時段」來猜剛剛燒掉的是哪一個。掃描若跨過午夜
+    （22:00 起跑、00:30 才結束），now2 的日期已經是【隔天】，而
+    `abs(00:30 − 06:00) = 5.5h < 6h` —— 於是把【隔天早上 06:00】記成已觸發。
+    隔天 06:00 的 due 判定 `if t in already_fired: continue` 直接跳過，
+    整個早上的掃描被靜默跳過（連一行 log 都沒有），而 next_run 算出來
+    正是 06:00，面板照樣承諾它會跑。這與 a6f77a6 消滅的幽靈排程是同一類：
+    畫面承諾的事不會發生，而且沒有人收到錯誤。
+
+    正解是不要在跑完之後【猜】剛剛燒掉哪個時段 —— 那個時段在觸發當下就
+    已經知道了（due 判定 break 時的那個 t），把它傳進來就好。fired_date
+    也是同理：時段屬於【觸發那天】，不是掃描結束那天。
+
+    fired_date / fired_time 為 None 時（interval 模式、或沒有時段可記）
+    只做 last_run 與 next_run，不碰 _fired_today。
+    """
+    cfg["last_run"] = now2.isoformat()
+    cfg["last_run_date"] = now2.strftime("%Y-%m-%d")
+    if fired_date and fired_time:
+        fired_map = cfg.get("_fired_today")
+        # 壞掉的 _fired_today（手改成 list、null 等）不該讓整個帳務炸掉 ——
+        # 它只是內建排程器的記憶，重建成空的代價是「這一輪可能多掃一次」。
+        if not isinstance(fired_map, dict):
+            fired_map = {}
+        fired_map.setdefault(fired_date, [])
+        if fired_time not in fired_map[fired_date]:
+            fired_map[fired_date].append(fired_time)
+        # 清掉 3 天以上的舊紀錄
+        cutoff = (now2 - timedelta(days=3)).strftime("%Y-%m-%d")
+        cfg["_fired_today"] = {d: v for d, v in fired_map.items() if d >= cutoff}
+    # 用【同一份】實作算 next_run，而不是在這裡再複製一段。第七輪的 M20 之所以
+    # 只能被宣告成「結構上測不到」，就是因為這裡是複製品、而複製品要跑完真的
+    # scheduler_loop() 才會被執行到；現在它是模組層級的純函式，可以直接呼叫。
+    cfg["next_run"] = _compute_next_run(cfg, now2)
+    return cfg
 
 # 排程主權移交 systemd 後，內建排程器的 enabled 必須壓平：留著 true 會讓 UI
 # 顯示成「已啟用」但實際上不會動作，而哪天閘門被打開就會直接雙軌觸發。
@@ -1373,6 +1502,9 @@ def scheduler_loop():
                 now = datetime.now()
                 due = False
                 mode = cfg.get("mode", "interval")
+                # 剛剛觸發的是【哪一天的哪個時段】—— 就在這裡決定。跑完之後才用
+                # now2 回推是第七輪 MAJOR-1 的成因（跨午夜會記錯日期），見 _record_run()。
+                due_date = due_time = None
 
                 if mode == "times":
                     # `sorted(...)` 與 `or` 都是刻意的，兩者都為了跟 `_compute_next_run()`
@@ -1399,6 +1531,7 @@ def scheduler_loop():
                         # the morning scan, while avoiding stale catch-up)
                         if now >= target and (now - target).total_seconds() < 21600:
                             due = True
+                            due_date, due_time = today_str, t
                             break
                 else:
                     interval = cfg.get("interval_hours", 6)
@@ -1428,38 +1561,7 @@ def scheduler_loop():
                         JOBS, DATA_FILE = load_jobs()
                         CURRENT_FILE = DATA_FILE
                         now2 = datetime.now()
-                        cfg["last_run"] = now2.isoformat()
-                        cfg["last_run_date"] = now2.strftime("%Y-%m-%d")
-                        if mode == "times":
-                            fired_map = cfg.get("_fired_today", {})
-                            today_str = now2.strftime("%Y-%m-%d")
-                            if today_str not in fired_map:
-                                fired_map[today_str] = []
-                            # Record the time that just fired
-                            fired_time = now2.strftime("%H:%M")
-                            for t in times:
-                                target = datetime.strptime(f"{today_str} {t}", "%Y-%m-%d %H:%M")
-                                if abs((now2 - target).total_seconds()) < 21600:
-                                    if t not in fired_map[today_str]:
-                                        fired_map[today_str].append(t)
-                                    break
-                            cfg["_fired_today"] = fired_map
-                            # Determine next run time
-                            future = [t for t in times if t > now2.strftime("%H:%M")]
-                            if future:
-                                next_t = future[0]
-                                next_date = now2.strftime("%Y-%m-%d")
-                            else:
-                                # All times passed -> next run is tomorrow's first slot
-                                next_t = times[0]
-                                next_date = (now2 + timedelta(days=1)).strftime("%Y-%m-%d")
-                            cfg["next_run"] = f"{next_date} {next_t}"
-                            # Clean up entries older than 3 days
-                            old_dates = [d for d in fired_map if d < (now2 - timedelta(days=3)).strftime("%Y-%m-%d")]
-                            for d in old_dates:
-                                del fired_map[d]
-                        else:
-                            cfg["next_run"] = (now2 + timedelta(hours=cfg.get("interval_hours", 6))).isoformat()
+                        _record_run(cfg, now2, due_date, due_time)
                         save_schedule(cfg)
         except Exception as e:
             _out(f"[scheduler] Error: {e}")
@@ -1614,10 +1716,21 @@ def api_schedule():
                 SCHEDULE_CONFIG["mode"] = data["mode"]
                 SCHEDULE_CONFIG.pop("_fired_today", None)  # reset tracking on mode change
         if "interval_hours" in data:
-            try:
-                hours = int(data["interval_hours"])
-            except (TypeError, ValueError):
+            # OverflowError 不在 ValueError 的繼承鏈上（實測 issubclass 為 False），
+            # 所以要明列。JSON 的 `1e400` 會解析成 `inf`，`int(inf)` → OverflowError
+            # → 逃出 api_schedule → HTTP 500（第七輪審查 m1）。而瀏覽器端的
+            # `catch(e){console.error(e)}` 會把它吞掉 —— 使用者看到的是「什麼都沒發生」。
+            # bool 也要擋：`isinstance(True, int)` 是 True，`int(True)` = 1，
+            # 於是 `{"interval_hours": true}` 會靜默變成「每 1 小時掃描」。
+            # 這與 `bool("false") is True`（enabled 那個坑）是同一類誤讀。
+            _raw_hours = data["interval_hours"]
+            if isinstance(_raw_hours, bool):
                 hours = 0
+            else:
+                try:
+                    hours = int(_raw_hours)
+                except (TypeError, ValueError, OverflowError):
+                    hours = 0
             if hours <= 0:
                 problems.append("interval_hours 必須是正整數，未變更"
                                 f"（收到 {data['interval_hours']!r}）")
@@ -1637,10 +1750,16 @@ def api_schedule():
         # （而且已經 drift）。現在共用 _compute_next_run()。
         SCHEDULE_CONFIG["next_run"] = _compute_next_run(SCHEDULE_CONFIG)
         save_schedule(SCHEDULE_CONFIG)
-        resp = {"ok": True, "schedule": SCHEDULE_CONFIG}
         warning = "；".join(filter(None, [refused, *problems]))
+        # `ok` 的語意是「這個請求被聽懂了，而且每個欄位都照要求生效了」。
+        # 第七輪審查 m6：原本不論如何都回 ok:true，於是「一半的欄位被拒絕」
+        # 也是一個 ok:true —— API 合約上的不實。HTTP 仍然維持 200（請求確實
+        # 被處理了），要分辨部分失敗請看 `rejected`。
+        resp = {"ok": not warning, "schedule": SCHEDULE_CONFIG}
         if warning:
             resp["warning"] = warning
+        if problems:
+            resp["rejected"] = list(problems)
         return jsonify(resp)
     SCHEDULE_CONFIG = load_schedule()
     payload = dict(SCHEDULE_CONFIG)
@@ -2253,9 +2372,13 @@ async function loadSchedule(){
     document.getElementById('sched-enabled').checked=!!s.enabled;
     document.getElementById('sched-mode').value=s.mode||'times';
     document.getElementById('sched-interval').value=s.interval_hours||6;
-    const times=s.times||['06:00','22:00'];
-    document.getElementById('sched-time1').value=times[0]||'06:00';
-    document.getElementById('sched-time2').value=times[1]||'22:00';
+    // 預設值只在【整份清單是空的】時候套用 —— 那正是排程器的退路
+    // （`cfg.get("times") or [...]`），所以畫面與行為一致（第七輪審查 B3）。
+    // 單一元素的清單【不補】第二格：舊寫法 `times[1]||'22:00'` 會顯示一個永遠
+    // 不會觸發的 22:00 —— 與 `times: []` 是同一類幽靈排程，只是方向相反（m4）。
+    const times=(s.times&&s.times.length)?s.times:['06:00','22:00'];
+    document.getElementById('sched-time1').value=times[0]||'';
+    document.getElementById('sched-time2').value=times[1]||'';
     syncSchedVisibility();
     applySchedReadonly();
     updateSchedDisplay(s);
@@ -2272,14 +2395,19 @@ async function updateSchedule(){
   const times=[t1,t2].filter(Boolean).sort();
   try{
     const r=await fetch('/api/schedule',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled,mode,interval_hours,times})});
-    const s=await r.json();
+    // 非 JSON 的回應（500 的 HTML、反向代理的錯誤頁）在舊寫法會讓 r.json() 丟例外
+    // → 直接進 catch → 只 console.error → 面板停在舊值。「請求被拒絕」與
+    // 「存檔成功」在畫面上長得一模一樣，正是這個區塊要修的那件事（第七輪 m5）。
+    let s=null;
+    try{ s=await r.json(); }
+    catch(_){ alert('排程未儲存：伺服器回應不是 JSON（HTTP '+r.status+'）'); return; }
     // `warning` 從第六輪就有了，但前端從來沒顯示過 —— 也就是說「請求被拒絕、
     // 值沒有變更」在畫面上與「存檔成功」長得一模一樣（面板會顯示舊值，而舊值
     // 正是使用者剛剛想改掉的東西）。後端有話要說，前端就必須說出來。
     if(s.error){alert('排程未儲存：'+s.error);return;}
     if(s.warning){alert('排程只有部分變更：\n'+s.warning);}
     updateSchedDisplay(s.schedule||s);
-  }catch(e){console.error(e);}
+  }catch(e){ alert('排程未儲存：'+e); }   // 連線失敗等：一樣要說出來，不能只 console.error
 }
 
 function updateSchedDisplay(s){
@@ -2289,7 +2417,7 @@ function updateSchedDisplay(s){
   if(SCHEDULE_READONLY){
     badge.style.display='inline'; badge.textContent='⏰ systemd';
     const t=s.timer||{};
-    let txt='每日 06:00 / 22:00（Melbourne）';
+    let txt=t.calendar?`每日 ${t.calendar}`:'排程由 systemd timer 負責（⚠️ 讀不到時段設定）';
     if(t.installed===false) txt+=' · ⚠️ timer 未安裝，排程不會執行';
     else if(s.next_run) txt+=' · 下次 '+fmt(s.next_run);
     if(t.last_iso) txt+=' · 上次 '+fmt(t.last_iso);
@@ -2301,8 +2429,10 @@ function updateSchedDisplay(s){
   if(s.enabled){
     badge.style.display='inline';
     const mode=s.mode||'times';
+    // 與 loadSchedule() 同一套正規化：空清單＝排程器會退回預設，單一元素不補。
+    const st=(s.times&&s.times.length)?s.times:['06:00','22:00'];
     let t=mode==='times'
-      ?`Auto: at ${(s.times||['06:00','22:00']).join(' & ')} daily`
+      ?`Auto: at ${st.join(' & ')} daily`
       :`Auto: every ${s.interval_hours}h`;
     if(s.next_run){const d=new Date(s.next_run);t+=` · Next: ${d.toLocaleString('en-AU',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})}`;}
     if(s.last_run){const d=new Date(s.last_run);t+=` · Last: ${d.toLocaleString('en-AU',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})}`;}
