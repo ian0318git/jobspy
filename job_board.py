@@ -183,35 +183,98 @@ CURRENT_FILE = DATA_FILE
 SEARCH_PROCESS = None
 SEARCH_OUTPUT = []
 SEARCH_START_TIME = None
+SEARCH_LAST_OUTPUT_AT = None   # time.monotonic()：最後一次收到子程序輸出的時刻
 SEARCH_LOCK = threading.Lock()
+
+# 子程序沉默超過這個秒數就判定卡死並終止。爬蟲每跑完一個搜尋詞就會印進度，
+# 正常情況下不會安靜這麼久。Jora 走 tls_client（Go 共享庫），Go 層死鎖時
+# 連 Python 傳進去的 timeout_seconds 都不會生效 —— 2026-09-17 就是這樣卡了
+# 近 50 小時，並讓排程器陷入每 30 秒重試一次的空轉。這裡是最後一道防線。
+SEARCH_STALL_TIMEOUT = 900
 
 
 def start_search():
-    global SEARCH_PROCESS, SEARCH_OUTPUT, SEARCH_START_TIME
+    global SEARCH_PROCESS, SEARCH_OUTPUT, SEARCH_START_TIME, SEARCH_LAST_OUTPUT_AT
     with SEARCH_LOCK:
         if SEARCH_PROCESS and SEARCH_PROCESS.poll() is None:
             return False, "A search is already running"
         SEARCH_OUTPUT = []
         SEARCH_START_TIME = datetime.now().isoformat()
+        SEARCH_LAST_OUTPUT_AT = time.monotonic()
         script = os.path.join(SCRIPT_DIR, "linkedin_job_search.py")
         SEARCH_PROCESS = subprocess.Popen(
             [sys.executable, "-u", script],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1, cwd=SCRIPT_DIR,
         )
-        t = threading.Thread(target=_read_search_output, daemon=True)
+        t = threading.Thread(
+            target=_read_search_output, args=(SEARCH_PROCESS,), daemon=True
+        )
         t.start()
         return True, "Search started"
 
 
-def _read_search_output():
-    global SEARCH_PROCESS, SEARCH_OUTPUT
-    if not SEARCH_PROCESS:
-        return
-    for line in SEARCH_PROCESS.stdout:
-        line = line.rstrip("\n")
-        SEARCH_OUTPUT.append((datetime.now().strftime("%H:%M:%S"), line))
-    SEARCH_PROCESS.wait()
+def _read_search_output(proc):
+    """讀子程序的 stdout 直到 EOF。
+
+    proc 由參數傳入而不是讀全域：start_search() 可能在這個執行緒還在讀的時候
+    就換掉 SEARCH_PROCESS，屆時讀全域會混到新程序的輸出。
+    """
+    global SEARCH_LAST_OUTPUT_AT
+    for line in proc.stdout:
+        with SEARCH_LOCK:
+            SEARCH_OUTPUT.append(
+                (datetime.now().strftime("%H:%M:%S"), line.rstrip("\n"))
+            )
+        SEARCH_LAST_OUTPUT_AT = time.monotonic()
+    proc.wait()
+
+
+def get_search_stall_seconds():
+    """子程序已沉默的秒數；未在執行中或仍正常時回傳 None。"""
+    with SEARCH_LOCK:
+        proc = SEARCH_PROCESS
+        last = SEARCH_LAST_OUTPUT_AT
+    if proc is None or proc.poll() is not None or last is None:
+        return None
+    idle = time.monotonic() - last
+    return idle if idle > SEARCH_STALL_TIMEOUT else None
+
+
+def kill_stalled_search():
+    """終止卡死的子程序。回傳被終止的 PID；未達門檻或無程序時回傳 None。"""
+    global SEARCH_PROCESS
+    idle = get_search_stall_seconds()
+    if idle is None:
+        return None
+    with SEARCH_LOCK:
+        proc = SEARCH_PROCESS
+        if proc is None or proc.poll() is not None:
+            return None
+        pid = proc.pid
+        SEARCH_OUTPUT.append((
+            datetime.now().strftime("%H:%M:%S"),
+            f"🛑 已 {idle / 60:.1f} 分鐘無輸出，判定卡死，終止 PID {pid}",
+        ))
+        proc.kill()
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
+    return pid
+
+
+def watchdog_loop():
+    """背景執行緒：定期檢查搜尋子程序是否卡死。"""
+    print("[watchdog] Watchdog thread started", flush=True)
+    while not SCHEDULE_STOP.is_set():
+        try:
+            pid = kill_stalled_search()
+            if pid is not None:
+                print(f"[watchdog] Terminated stalled search PID {pid}", flush=True)
+        except Exception as e:
+            print(f"[watchdog] Error: {e}", flush=True)
+        SCHEDULE_STOP.wait(60)
 
 
 def get_search_status():
@@ -263,9 +326,16 @@ def save_schedule(cfg):
 SCHEDULE_CONFIG = load_schedule()
 SCHEDULE_STOP = threading.Event()
 
+# start_search() 失敗後的退避秒數。失敗幾乎都代表已經有一個搜尋在跑（或剛卡死、
+# 還沒被 watchdog 清掉），此時每 30 秒重試一次對恢復毫無幫助，只會讓 log 以
+# 每小時 120 行的速度膨脹 —— 2026-09-17 那次就是這樣洗了兩天多的版。
+SCHEDULER_RETRY_BACKOFF = 300
+_scheduler_retry_at = 0.0
+
 
 def scheduler_loop():
     """Background thread: check every 30s if a scheduled search is due."""
+    global _scheduler_retry_at
     print("[scheduler] Scheduler thread started", flush=True)
     while not SCHEDULE_STOP.is_set():
         try:
@@ -300,9 +370,16 @@ def scheduler_loop():
                     else:
                         due = True
 
-                if due:
+                if due and time.monotonic() >= _scheduler_retry_at:
                     print(f"[scheduler] Triggering search at {now.strftime('%Y-%m-%d %H:%M')}", flush=True)
-                    ok, _ = start_search()
+                    ok, msg = start_search()
+                    if not ok:
+                        _scheduler_retry_at = time.monotonic() + SCHEDULER_RETRY_BACKOFF
+                        print(
+                            f"[scheduler] Cannot start search ({msg}); "
+                            f"backing off {SCHEDULER_RETRY_BACKOFF // 60} min",
+                            flush=True,
+                        )
                     if ok:
                         while True:
                             st = get_search_status()
@@ -353,6 +430,9 @@ def scheduler_loop():
 
 _scheduler_thread = threading.Thread(target=scheduler_loop, daemon=True)
 _scheduler_thread.start()
+
+_watchdog_thread = threading.Thread(target=watchdog_loop, daemon=True)
+_watchdog_thread.start()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -433,14 +513,20 @@ def api_schedule():
         data = request.get_json()
         if "enabled" in data:
             SCHEDULE_CONFIG["enabled"] = bool(data["enabled"])
-        if "mode" in data:
+        # 只有在值*真的*變動時才清掉當日追蹤。UI 每次儲存都會把 times/mode 一起
+        # 送上來，若照單全收地 pop，任何一次無關的儲存都會清空 _fired_today，
+        # 讓排程器誤判當日尚未執行而立刻補跑一次。
+        if "mode" in data and data["mode"] != SCHEDULE_CONFIG.get("mode"):
             SCHEDULE_CONFIG["mode"] = data["mode"]
             SCHEDULE_CONFIG.pop("_fired_today", None)  # reset tracking on mode change
         if "interval_hours" in data:
             SCHEDULE_CONFIG["interval_hours"] = int(data["interval_hours"])
         if "times" in data:
-            SCHEDULE_CONFIG["times"] = data["times"]
-            SCHEDULE_CONFIG.pop("_fired_today", None)  # reset tracking on time change
+            new_times = list(data["times"])
+            changed = sorted(new_times) != sorted(SCHEDULE_CONFIG.get("times") or [])
+            SCHEDULE_CONFIG["times"] = new_times
+            if changed:
+                SCHEDULE_CONFIG.pop("_fired_today", None)  # reset tracking on time change
         if SCHEDULE_CONFIG["enabled"]:
             if SCHEDULE_CONFIG.get("mode") == "times":
                 times = SCHEDULE_CONFIG.get("times", ["06:00", "22:00"])

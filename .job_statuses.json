@@ -123,5 +123,50 @@
     "status": "Applied",
     "notes": "Tier=HARDWARE | Score=9 | Purity=100% | Manager",
     "updated_at": "2026-08-18T17:19:58.858280"
+  },
+  "https://au.indeed.com/viewjob?jk=84b1c20aac132daa": {
+    "status": "Applied",
+    "notes": "Tier=KERNEL | Score=37 | Purity=100% | Engineer IC",
+    "updated_at": "2026-08-24T08:21:55.295455"
+  },
+  "https://www.linkedin.com/jobs/view/4452853420": {
+    "status": "Applied",
+    "notes": "Tier=KERNEL | Score=37 | Purity=100% | Engineer IC",
+    "updated_at": "2026-08-24T08:22:03.793373"
+  },
+  "https://www.linkedin.com/jobs/view/4457440100": {
+    "status": "Applied",
+    "notes": "Tier=SILICON | Score=166 | Purity=100% | Senior IC; Engineer IC",
+    "updated_at": "2026-08-27T08:21:26.150571"
+  },
+  "https://au.seek.com/job/94192960?type=standard&ref=search-standalone&origin=cardTitle": {
+    "status": "Applied",
+    "notes": "Tier=KERNEL | Score=17 | Purity=76% | Engineering Leader | \ud83d\udcb0 AUD$140k\u2013$180k",
+    "updated_at": "2026-08-27T08:22:09.645202"
+  },
+  "https://www.linkedin.com/jobs/view/4449547162": {
+    "status": "Rejected",
+    "notes": "Tier=HARDWARE | Score=12 | Purity=100% | Generic Engineer",
+    "updated_at": "2026-09-04T09:31:14.801920"
+  },
+  "https://au.indeed.com/viewjob?jk=6eab39146061a965": {
+    "status": "Applied",
+    "notes": "Tier=SILICON | Score=79 | Purity=92% | Engineer IC",
+    "updated_at": "2026-09-10T00:34:01.385411"
+  },
+  "https://www.linkedin.com/jobs/view/4464985385": {
+    "status": "Applied",
+    "notes": "Tier=SILICON | Score=79 | Purity=92% | Engineer IC",
+    "updated_at": "2026-09-10T00:34:10.536265"
+  },
+  "https://au.jora.com/job/Embedded-Linux-Engineer-63e74ffb4e5209b78688bd48c8639c05": {
+    "status": "Applied",
+    "notes": "Tier=SILICON | Score=79 | Purity=92% | Engineer IC",
+    "updated_at": "2026-09-17T11:01:50.568180"
+  },
+  "https://au.jora.com/job/Embedded-Engineer-3678d52e823f00e56ec5dc22fcee9943": {
+    "status": "Applied",
+    "notes": "Tier=KERNEL | Score=38 | Purity=100% | Engineer IC",
+    "updated_at": "2026-09-17T11:01:55.974677"
   }
 }

@@ -18,6 +18,9 @@ import csv
 import json
 import os
 import re
+import sys
+import threading
+import traceback
 from datetime import datetime
 from jobspy import scrape_jobs
 
@@ -767,6 +770,46 @@ def check_security_clearance(title, description=""):
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# 單一搜尋詞的硬性上限。Jora 走 tls_client（Go 共享庫），Go 層一旦死鎖，
+# 傳給 session.get() 的 timeout_seconds 就不會生效 —— 2026-09-17 就是這樣
+# 讓整個行程卡死將近 50 小時（12 個執行緒全部停在 futex_wait_queue）。
+# 因此改由外部計時強制放棄，不依賴底層回報逾時。
+SCRAPE_TIMEOUT = 300
+
+
+def scrape_jobs_with_timeout(timeout=SCRAPE_TIMEOUT, **kwargs):
+    """呼叫 scrape_jobs()，超過 timeout 秒就放棄該搜尋詞。
+
+    逾時回傳 None（呼叫端據此跳過此詞）；其他例外原樣往上拋，
+    由 main() 既有的 try/except 接手。
+
+    必須用 daemon thread 而非 ThreadPoolExecutor：卡在 tls_client 裡的執行緒
+    無法從外部終止，ThreadPoolExecutor 會在全域關閉階段 join 它而一起卡住。
+    daemon thread 則在主行程結束時直接被放棄。
+    """
+    result = {}
+
+    def _worker():
+        try:
+            result["jobs"] = scrape_jobs(**kwargs)
+        except BaseException as exc:  # 連 KeyboardInterrupt 都要帶回主執行緒
+            result["error"] = exc
+
+    worker = threading.Thread(target=_worker, daemon=True)
+    worker.start()
+    worker.join(timeout)
+
+    if worker.is_alive():
+        print(
+            f"   ⏱️  超過 {timeout}s 無回應，放棄此搜尋詞"
+            f"（該執行緒已洩漏，行程結束時由 OS 回收）"
+        )
+        return None
+    if "error" in result:
+        raise result["error"]
+    return result.get("jobs")
+
+
 def main():
     all_jobs = []
 
@@ -785,7 +828,7 @@ def main():
     for term in SEARCH_TERMS:
         print(f"\n🔎 Searching: '{term}' ...")
         try:
-            jobs = scrape_jobs(
+            jobs = scrape_jobs_with_timeout(
                 site_name=["linkedin", "indeed", "seek", "jora"],
                 search_term=term,
                 google_search_term=f"{term} jobs Melbourne Victoria",
@@ -796,6 +839,8 @@ def main():
                 linkedin_fetch_description=True,
                 verbose=SCRAPE_VERBOSE,
             )
+            if jobs is None:
+                continue
             print(f"   → Found {len(jobs)} raw results")
             all_jobs.append(jobs)
         except Exception as e:
@@ -1097,4 +1142,18 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    exit_code = 0
+    try:
+        main()
+    except SystemExit as exc:
+        exit_code = exc.code if isinstance(exc.code, int) else 1
+    except BaseException:
+        traceback.print_exc()
+        exit_code = 1
+    finally:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        # 跳過直譯器關閉階段的執行緒 join。被 scrape_jobs_with_timeout 放棄的
+        # tls_client 執行緒永遠不會結束，正常 return 會卡在 threading._shutdown()，
+        # 讓上面的逾時保護形同虛設。
+        os._exit(exit_code)
