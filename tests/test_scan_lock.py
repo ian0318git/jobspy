@@ -912,8 +912,29 @@ check(
 # （雖然 lock 指向暫存檔、jobscan.service 現在也是 inactive，但這個專案已經吃過
 # 一次「測試對生產 unit 送真的 SIGKILL」的虧，第四輪 MAJOR。）
 _J_TMP = tempfile.mkdtemp(prefix="jobspy-sched-")
+#
+# ⚠️ 結尾的 `os._exit(0)` 不是裝飾，是【必要的】。少了它，這個子行程有大約
+# 10% 的機率不是 exit 0 而是 **SIGABRT（rc=-6）**，於是這一區會隨機 FAIL ——
+# 2026-09-20 實測：forward 25 次中 3 次、reverse 25 次中 2 次，錯誤是
+#
+#   Fatal Python error: could not acquire lock for
+#   <_io.BufferedWriter name='<stdout>'> at interpreter shutdown,
+#   possibly due to daemon threads
+#   Python runtime state: finalizing
+#
+# 成因：`import job_board` 會在模組層啟動 watchdog / jobscan 監看 / 排程器三個
+# daemon 執行緒（`_out()` 會寫 stdout）。`-c` 程式一結束，主執行緒就進入
+# interpreter finalization，此時那些執行緒還在跑，一寫 stdout 就撞上
+# `Py_FatalError`。**這是「測試寫法」的問題，不是生產路徑的問題** ——
+# 生產的 jobboard.service 收到 SIGTERM 時 Python 沒裝 handler（實測
+# `signal.getsignal(SIGTERM)` 回 0 = SIG_DFL），核心直接終止、根本不跑
+# finalization，所以 journal 裡 0 筆 ABRT。只有在「直譯器正常結束」時才會踩到。
+#
+# 用 `os._exit(0)` 跳過 finalization → 決定性 exit 0。這【不會】削弱這一區：
+# 排程檔是 import 期間同步寫完的，斷言讀的是磁碟上的內容；若 `save_schedule()`
+# 根本沒被呼叫，讀回來的就是 seed 本身，兩項都會 FAIL（已用 M14/M15 驗證）。
 _J_TRIPWIRE = (
-    "import subprocess\n"
+    "import subprocess, sys, os\n"
     "_real = subprocess.run\n"
     "def _guard(*a, **k):\n"
     "    cmd = a[0] if a else k.get('args')\n"
@@ -922,6 +943,8 @@ _J_TRIPWIRE = (
     "    return _real(*a, **k)\n"
     "subprocess.run = _guard\n"
     "import job_board\n"
+    "sys.stdout.flush()\n"
+    "os._exit(0)\n"   # ← 見上方：跳過 finalization，避開 daemon 執行緒的 SIGABRT
 )
 
 
@@ -947,8 +970,13 @@ def _startup_schedule(seed: dict, internal: bool) -> dict:
                        capture_output=True, text=True, timeout=120)
     if r.returncode != 0:
         return {"__error__": (r.stderr or r.stdout)[-400:]}
-    with open(path) as f:
-        return json.load(f)
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        # 壞掉的 JSON 要在這裡變成【一項 FAIL】，不是讓 traceback 冒出去把整支
+        # 測試炸掉 —— 後者會讓後面的區段全部不執行，而且看起來像工具壞了。
+        return {"__error__": f"排程檔讀不回來：{e!r}"}
 
 
 def _seed(enabled: bool, managed_by: str) -> dict:
