@@ -874,18 +874,25 @@ def _is_direct_stdout_write(node: ast.AST) -> bool:
             and f.value.value.id == "sys")
 
 
-_stdout_calls = [
-    n.lineno for n in ast.walk(_jb_ast) if isinstance(n, ast.Call)
-    and (isinstance(n.func, ast.Name) and n.func.id == "print"
-         or _is_direct_stdout_write(n))
-]
-_violations = [ln for ln in _stdout_calls
-               if not (_out_span[0] <= ln <= _out_span[1])]
+# ⚠️ 豁免的【只有】_out() 內部那一次 sys.stdout.write —— `print()` 是
+# **任何位置**都違規，包括 _out() 自己的身體。
+#
+# 第一版把「落在 _out span 內」當成整段豁免，結果 M11（把 _out 的內容換成
+# print(line, flush=True)）的那個 print 也在 span 內，被一起放行了 ——
+# 這一項根本沒開火。是對照「M11 只有 2 個 FAIL」才發現的：照理 H1、H2、I
+# 三項都該響。（感謝變異測試，它不只驗證修正，也驗證了驗證本身。）
+_prints = [n.lineno for n in ast.walk(_jb_ast)
+           if isinstance(n, ast.Call)
+           and isinstance(n.func, ast.Name) and n.func.id == "print"]
+_stray_writes = [n.lineno for n in ast.walk(_jb_ast)
+                 if isinstance(n, ast.Call) and _is_direct_stdout_write(n)
+                 and not (_out_span[0] <= n.lineno <= _out_span[1])]
+_violations = sorted(_prints + _stray_writes)
 check(
     "job_board.py 不得有 live 的 print()／直接 sys.stdout.write（一律走 _out）",
     _out_node is not None and not _violations,
     f"違規行={_violations}" if _violations else
-    f"_out 位於 {_out_span}，其餘 {len(_stdout_calls)} 處皆在 _out 內",
+    f"_out 位於 {_out_span}，{len(_stray_writes)} 處直接寫入皆在 _out 內、無 print",
 )
 
 # ═══ 結果 ════════════════════════════════════════════════════════════════════
