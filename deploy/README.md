@@ -118,14 +118,14 @@ tail -f logs/cron_search.log
 
 ## 測試覆蓋（誠實聲明）
 
-**這個專案的自動化測試只有一支**：`tests/test_scan_lock.py`（58 項檢查）。
+**這個專案的自動化測試只有一支**：`tests/test_scan_lock.py`（64 項檢查）。
 其餘全部是手動驗證 —— 上面各節的「驗證」指令就是手動程序。
 
 ```bash
 cd /home/ian/github-project/jobspy
 .venv/bin/python tests/test_scan_lock.py     # 通過時印「✅ 全數通過」且 exit 0
 
-# 要引用「幾項」時用這個量，不要憑印象寫 —— 這個數字已經腐化過五次（28→39→53→55→56→58）：
+# 要引用「幾項」時用這個量，不要憑印象寫 —— 這個數字已經腐化過六次（28→39→53→55→56→58→64）：
 .venv/bin/python tests/test_scan_lock.py | grep -c '\[PASS\]'
 ```
 
@@ -142,6 +142,7 @@ cd /home/ian/github-project/jobspy
 | H | 3 | 日誌每行必須**一次** `write()` 寫出（第五輪退回，見下） |
 | I | 1 | `job_board.py` 不得有 live 的 `print()`（第五輪退回） |
 | J | 2 | 啟動時的排程主權轉移：兩個方向都要正確（見「回復到舊制」一節） |
+| K | 6 | `api_schedule` 的輸入驗證：幽靈排程（`times: []`）、非物件主體、`enabled` 的字串陷阱（第六輪退回） |
 
 > **H 區的 `PYTHONUNBUFFERED` 前提**：黏行的成因（`print` 拆成兩次 `write()`）
 > 只有 stdout **不緩衝**時才會顯現 —— 第五輪審查用有緩衝的檔案實測，`print`
@@ -156,6 +157,14 @@ cd /home/ian/github-project/jobspy
 - **跳線（tripwire）**：`jb.subprocess.run` 被包了一層，任何 argv 含 `"kill"` 的呼叫
   當場拋 `AssertionError`。合法用途（F7b）本來就會 mock 掉 `subprocess.run`，
   所以**根本走不到跳線** —— 它只在寫錯時響，不需要 opt-in 開關。
+- **第二道跳線：`subprocess.Popen`**（第六輪審查的 MAJOR M2）。排程器啟動爬蟲走的是
+  `subprocess.Popen([sys.executable, "-u", "linkedin_job_search.py"])`，
+  **完全繞過只擋 `subprocess.run` 的那道**。也就是說第六輪之前的隔離不是護欄，
+  而是「種子排程的 `interval_hours` 剛好很大」這個常數 —— 種子一逾期（那一輪真的
+  發生過兩次，`job_board.log` 兩筆 `[scheduler] Triggering search`），子行程會在
+  **生產目錄**跑起真的爬蟲。審查員用原封不動的跳線實測重現。現在它是一條斷言。
+  **兩道都必須裝在 `import job_board` 之前** —— `job_board` 在模組層就啟動背景
+  執行緒，插在其後會有 race。
 - `run_scan.sh` 的 `LOCK`/`LIVE`/`STATE` 可用環境變數覆寫，就是為了讓手動的
   端到端測試**不污染生產的 `search_state.json`**（第三輪審查的 MINOR）。
 
@@ -175,10 +184,11 @@ cd /home/ian/github-project/jobspy
 .venv/bin/python tests/mutate.py     # 需乾淨的工作區；在 /tmp 隔離副本裡跑
 ```
 
-目前 **15 個變異、14 個被逮、1 個已知逃脫**（M13，理由見 `../DECISIONS.md`
-第四輪條目；`mutate.py` 的 `EXPECTED_ESCAPES` 把「已理解的逃脫」與「沒被發現的
-覆蓋缺口」分開回報，只有後者會讓退出碼變 1）。**若你新增修正卻找不到會失敗的
-變異，代表那個修正沒有被測試覆蓋。**
+目前 **20 個變異、18 個被逮、2 個已知逃脫**（M13、M20；`mutate.py` 的
+`EXPECTED_ESCAPES` 把「已理解的逃脫」與「沒被發現的覆蓋缺口」分開回報，只有後者
+會讓退出碼變 1。M20 的用意正是**讓一個覆蓋缺口變成機器看得見的事實**，而不是
+文件裡的一句話）。**若你新增修正卻找不到會失敗的變異，代表那個修正沒有被測試
+覆蓋** —— 那就把那個變異加進來、列進 `EXPECTED_ESCAPES`，讓缺口誠實地站出來。
 
 > ⚠️ **這個工具不會碰生產目錄。** 第五輪審查抓到：舊版直接改寫 repo 裡的
 > `job_board.py`，當時的 13 個變異每個會在磁碟上存在 5–25 秒，而 `jobboard.service`
@@ -189,10 +199,22 @@ cd /home/ian/github-project/jobspy
 
 > **變異表的數字是可重現的。** 這句話在 2026-09-20 之前是**假的** —— J 區有一項
 > 會間歇性失敗（見下方第五個坑），同一份程式碼連跑兩次會得到不同的 P/F。
-> 修掉之後連跑兩次逐項相同。**若你看到數字漂移，先當成有東西不穩定，不要當成
-> 「本來就會這樣」。**
+> 修掉之後**連跑四次逐項相同**（第一次只跑兩次就下結論，被審查員用第三次推翻 ——
+> 兩次不是證據）。**若你看到數字漂移，先當成有東西不穩定，不要當成「本來就會
+> 這樣」。**
+>
+> ⚠️ **跑的時候不要動 `job_board.py`。** 工具會在結束時比對生產檔案的 sha256；
+> 中途改檔（即使只是加一行註解）會讓它回報 sha 不符。那個回報是**對的** ——
+> 但該輪的數字就不能再當成證據，得重跑。（第六輪真的發生過：我在背景跑的時候
+> 順手改了 `job_board.py`。）
+>
+> ⚠️ **看到那個 sha 警告，先用眼睛看 `git diff`，不要反射性 `git checkout`。**
+> 「檔案變了」有兩個成因、處置相反：**變異外洩**（只有突變那幾行 → `git checkout`
+> 是對的）與**你自己在跑的期間編輯過**（→ `git checkout` 會把你剛寫好的工作
+> 整批刪掉）。一個只知道「檔案變了」的偵測器，不該建議一個會刪掉未提交工作的
+> 動作；`mutate.py` 的訊息已經改成先請你看 diff。
 
-五個踩過的坑，寫在這裡免得重蹈：
+六個踩過的坑，寫在這裡免得重蹈：
 
 - **假變異**：改到註解的變異**不可能改變行為**，所以永遠不會 FAIL、永遠「逃脫」。
   看到「逃脫」先懷疑變異本身。
@@ -216,14 +238,45 @@ cd /home/ian/github-project/jobspy
   daemon 執行緒，而 `-c` 一結束主執行緒就進入 interpreter finalization，那些
   執行緒還在寫 stdout → `Fatal Python error: could not acquire lock for
   <_io.BufferedWriter name='<stdout>'> at interpreter shutdown` → **SIGABRT**。
-  實測 forward 25 次中 3 次、reverse 25 次中 2 次。
-  **修法是子行程結尾用 `os._exit(0)` 跳過 finalization。**
-  > 這**不是**生產缺陷，已查證：`systemctl stop` 送 SIGTERM 時 Python 沒裝 handler
-  > （`signal.getsignal(SIGTERM)` 回 `0` = `SIG_DFL`），核心直接終止、不跑
-  > finalization，所以 journal 從 2026-09-19 至今 0 筆 ABRT。只有在「直譯器
-  > **正常結束**」時才會踩到。
-  > **但任何這裡新寫的測試只要用子行程 import `job_board`，就必須這樣收尾**，
+  **修法是子行程結束前 `sys.stdout.flush()`，再 `os._exit(0)` 跳過 finalization。**
+  > ⚠️ **這一段原本寫的數字（forward 3/25、reverse 2/25）我自己重測不出來，
+  > 審查員也重測不出來。** 原因是那些數字來自一個我沒有描述清楚的子行程組態；
+  > 沒有描述組態的數字不是證據。重測（每個 60 次，組態明寫）：
+  >
+  > | 組態 | ABRT |
+  > |---|---|
+  > | A ＝ 現在的程式碼**拿掉** `os._exit(0)`（保留 `flush()`） | **0 / 60** |
+  > | B ＝ `d80fb93` 的原始版（沒有 `flush()`、沒有 `os._exit(0)`） | **15 / 60 = 25%** |
+  > | C ＝ 同 B，但子行程的 stdout 導到**檔案**而非管線 | **3 / 60 = 5%** |
+  >
+  > **A 是關鍵**：光靠 `flush()` 就足以讓 ABRT 完全消失，不需要 `os._exit(0)`。
+  > 我原本把功勞記在 `os._exit(0)` 上，是錯的 —— `os._exit(0)` 只是第二道保險。
+  > 成因是「finalization 當下還有未送出的緩衝資料」，而管線比檔案更容易踩到
+  > （B vs C：25% vs 5%）—— 所以「我用檔案測沒事」不能推論到管線。
+  >
+  > **這不是生產缺陷，但理由要說對。** 原本只寫了「SIGTERM 是 `SIG_DFL`、不跑
+  > finalization」，那只涵蓋 `systemctl stop` 那條路。生產**還有**正常結束的路徑
+  > （werkzeug `serve_forever` 攔到 `KeyboardInterrupt`、埠被佔用時的 `SystemExit`），
+  > 審查員實測那兩條 6/6 rc=-15、20/20 rc=1，**ABRT 0 次**。真正的護欄是 unit 裡的
+  > `Environment=PYTHONUNBUFFERED=1`：它讓 `sys.stdout.buffer` 變成 **`FileIO`**
+  > 而不是 `BufferedWriter`（本機實測：未設 → `TextIOWrapper/BufferedWriter`，
+  > 設了 → `TextIOWrapper/FileIO`）—— 而那個 fatal error 的訊息點名的是
+  > `BufferedWriter`。**拿掉 `PYTHONUNBUFFERED=1`，這條推理就整段失效。**
+  > **任何這裡新寫的測試只要用子行程 import `job_board`，就必須照 A 收尾**，
   > 否則你會得到一個隨機紅的測試，而隨機紅的測試最後會被人加 `|| true` 繞過。
+  > 測試子行程繼承的是測試環境，**不是** unit 的 `PYTHONUNBUFFERED=1`。
+
+- **⚠️ 測試「崩潰」與測試「失敗」在變異表上看起來一樣 —— 都是 0 個 FAIL**：
+  這是第六輪我自己踩到的。`check()` 只有在被呼叫時才會印 `[FAIL]`，而
+  `mutate.py` 數的就是 `[FAIL]`。所以一個讓測試**在跑到斷言之前就 traceback
+  死掉**的變異，會得到 0 個 FAIL、看起來「什麼都沒抓到」→ 被記成逃脫。
+  實際發生的地方：K 區第一版用 `mock.patch.object(jb, "jsonify", side_effect=
+  lambda **k: k)`，而產品碼寫的是 `return jsonify(resp)`（**位置**引數）→
+  TypeError → 整個測試檔死在 K 區第二項，後面全部不執行。
+  **修法有兩層**：(1) 測試碼自己把例外收成 dict（`_post_schedule` 的
+  `except Exception` 回 `{"__error__": ...}`）；(2) 任何「讀檔／呼叫產品碼」
+  的輔助函式一律不讓例外冒出去（`_startup_schedule` 的排程檔讀取同理）。
+  **看到某個變異逃脫，先確認測試是「跑完之後有 FAIL」還是「根本沒跑完」。**
 
 ### ⚠️ 未涵蓋（不要以為有測試就安全）
 
@@ -239,12 +292,16 @@ cd /home/ian/github-project/jobspy
   而 stray holder 持鎖時 state 停在上一輪的 `finished` → phase 閘門直接 return →
   **沒有任何機制會放掉那把鎖**。已知、未修，理由與解法見 `../DECISIONS.md`
   第四輪條目的「已知限制」。
-- **排程器「跑完之後」算下一次的那段沒被測到（已知、未修）**：`scheduler_loop()`
-  跑完一輪後用 `times[0]`（**未排序**）算下一個時段，而 UI 儲存那條用
-  `sorted(times)`。若 `times` 被存成 `["22:00","06:00"]` 且當天時段都已過，
-  排程器會算出「今天 22:00」而不是「明天 06:00」。**只有在內建排程器啟用時
-  才會走到**（目前主權在 timer），所以擱著；已記在 `job_board.py` 的
-  `_compute_next_run()` docstring 與 `../DECISIONS.md` 的已知限制。
+- **排程器「跑完之後」算下一次的那段：已修，但結構上測不到（＝沒有回歸保護）**。
+  第六輪修掉了：`scheduler_loop()` 跑完一輪後原本用 `times[0]`（**未排序**）算下
+  一個時段，而 UI 儲存那條用 `sorted(times)` —— 兩條路徑對同一個 cfg 有不同解讀。
+  現在兩邊都是 `sorted(cfg.get("times") or [...])`，連 `or`（而非 `get(k, default)`）
+  也對齊了，所以舊版寫進檔案的空清單 `[]` 在兩邊都會退回預設時段。
+  **但這段程式碼要 `JOB_BOARD_INTERNAL_SCHEDULER=1` 而且得先跑完一輪 19 分鐘的
+  真掃描才會執行**，測試兩個前提都不成立。變異 `M20` 就是這一段，它**保證逃脫**，
+  列在 `EXPECTED_ESCAPES` 裡是刻意的：讓這個缺口是機器看得見的事實，而不是
+  文件裡的一句安慰。**改到這段時請手動驗證**（開閘門、把 `times` 存成
+  `["22:00","06:00"]`、確認跑完後 `next_run` 是隔天的 06:00）。
 - **systemd 本身的行為**：`Persistent=true` 補跑、`Type=oneshot` 的逾時、
   `copytruncate` 輪替，都是實測記錄在 `../DECISIONS.md`，但**沒有回歸測試**
   —— 升級 systemd 或改 unit 後必須重測。

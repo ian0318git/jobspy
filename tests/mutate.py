@@ -65,7 +65,12 @@ TIMEOUT = 400
 #   留著它是 defence in depth，不是那個修正。
 #   **這代表目前沒有任何測試能證明少了鎖會出問題**，這是已知且接受的狀態。
 #   限縮前提（本地檔案、行長 < PIPE_BUF）見 job_board.py 的 _out() 上方註解。
-EXPECTED_ESCAPES = {"M13"}
+#
+# M20（排程器跑完之後那段回到未排序的 `times[0]`）：這一段【結構上測不到】——
+#   它在 `scheduler_loop()` 裡、`INTERNAL_SCHEDULER` 為真時才會執行，而且必須
+#   等一輪 19 分鐘的真掃描結束。測試行程兩個前提都不成立，所以這個變異保證逃脫。
+#   列在這裡是為了讓「這裡沒有回歸保護」變成機器看得見的事實，而不是一句註解。
+EXPECTED_ESCAPES = {"M13", "M20"}
 
 
 def git(*args, check=True):
@@ -233,6 +238,14 @@ MUTATIONS = [
         "            else:\n"
         "                want = bool(data[\"enabled\"])\n",
         "M19")),
+    # 排程器跑完之後的 next_run 計算。**這個變異預期會逃脫**（見 EXPECTED_ESCAPES
+    # 的 M20 條）：那條路徑要 INTERNAL_SCHEDULER=1 而且要先跑完一輪 19 分鐘的掃描。
+    # 放在清單裡是為了讓這個覆蓋缺口是可執行的、不是文件裡的一句話。
+    ("M20", "排程器跑完後回到未排序的 times[0]（已知無覆蓋）", lambda t: sub_once(
+        t,
+        "                    times = sorted(cfg.get(\"times\") or [\"06:00\", \"22:00\"])\n",
+        "                    times = cfg.get(\"times\", [\"06:00\", \"22:00\"])\n",
+        "M20")),
 ]
 
 results = []
@@ -282,7 +295,18 @@ PROD_AFTER = sha256(PROD_TARGET)
 print(f"生產檔案驗證：sha256 {'不變 ✓' if PROD_AFTER == PROD_BEFORE else '★已改變★'}"
       f"  {PROD_AFTER[:16]}…")
 if PROD_AFTER != PROD_BEFORE:
-    print("✗ 生產的 job_board.py 被改動了！請立刻 git checkout -- job_board.py")
+    # ⚠️ 這個警告有兩個成因，而且【處置相反】：
+    #   (a) 真的外洩 —— 某個變異寫進了生產檔。要救：`git checkout -- job_board.py`。
+    #   (b) 有人在這一輪跑的期間【自己編輯了】job_board.py。要救：什麼都別做，
+    #       你的編輯是對的，這一輪的數字不能用而已。
+    # 原本這裡直接印「請立刻 git checkout」—— 那會把 (b) 的情況下使用者剛寫好的
+    # 工作【整批刪掉】。一個偵測器不該在只知道「檔案變了」的時候，建議一個
+    # 會刪掉未提交工作的動作。所以先讓人自己看一眼。
+    print("✗ 生產的 job_board.py 在這一輪期間被改動了！")
+    print("  先看 diff 再決定 —— 【不要】反射性地 git checkout：")
+    print("    git diff --stat job_board.py")
+    print("  · 變異外洩 → 只有突變的幾行，救法：git checkout -- job_board.py")
+    print("  · 你自己在跑的期間編輯過 → 你的編輯是對的，這一輪的數字作廢，重跑即可")
     sys.exit(2)
 print(f"隔離副本已移除：{not WORK.exists()}")
 

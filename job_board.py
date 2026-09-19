@@ -1265,14 +1265,12 @@ def _compute_next_run(cfg):
     """算出 cfg 的下一次執行時間字串；未啟用時回 None。
 
     抽出來是因為有兩個地方需要同一套計算（啟動時回復舊制、UI 儲存排程），
-    而原本這兩段是各自複製的。實際上已經 drift 過：UI 那條用 `sorted(times)`，
-    排程器跑完那條用 `times[0]`（未排序）—— times 若被存成 `["22:00","06:00"]`
-    且當日時段都已過，排程器會把下一次算成 22:00（今天，已過）而不是 06:00
-    （明天）。UI 那條是對的，這裡沿用 sorted()。
+    而原本這兩段是各自複製的，而且已經 drift 過。
 
-    排程器迴圈（跑完之後那段）刻意【不】改用這個函式：它要用「跑完的當下」
-    （now2）而不是「現在」來算，語意不同。那個 times[0] 的排序問題仍待處理，
-    記在 DECISIONS.md 的已知限制裡。
+    排程器迴圈（跑完之後那段）刻意【不】呼叫這個函式：它要用「跑完的當下」
+    （now2）而不是「現在」來算，語意不同。但兩者對 cfg 的解讀必須一致 ——
+    `sorted(...)` 與 `or`（而非 `get(k, default)`）兩邊都一樣，理由見
+    `scheduler_loop()` 裡 `times = sorted(cfg.get("times") or [...])` 的註解。
     """
     if not cfg.get("enabled"):
         return None
@@ -1377,7 +1375,17 @@ def scheduler_loop():
                 mode = cfg.get("mode", "interval")
 
                 if mode == "times":
-                    times = cfg.get("times", ["06:00", "22:00"])
+                    # `sorted(...)` 與 `or` 都是刻意的，兩者都為了跟 `_compute_next_run()`
+                    # 一致（第六輪審查的 m2 就是這兩條路徑對同一個 cfg 有不同解讀）：
+                    #   * `or` 而非 `get(k, default)` —— 空清單也退回預設時段，否則這裡
+                    #     空轉（due 永遠 False）而面板顯示「06:00 會掃描」。
+                    #     `_valid_times()` 已經讓新的 `[]` 寫不進來，但【舊版寫進去的】
+                    #     `[]` 還躺在檔案裡，所以要兩邊都對同一個輸入給同一個答案。
+                    #   * `sorted(...)` —— 下面的 `times[0]` 是「今天都已過，取明天第一個
+                    #     時段」，未排序時 `["22:00","06:00"][0]` 會給出 22:00（已過）。
+                    #     `times` 的順序是使用者可見的，所以 `_valid_times()` 保留原順序，
+                    #     排序只發生在【需要順序語意】的地方。
+                    times = sorted(cfg.get("times") or ["06:00", "22:00"])
                     today_str = now.strftime("%Y-%m-%d")
                     # Track which (date_time) combos have already fired
                     fired_map = cfg.get("_fired_today", {})
