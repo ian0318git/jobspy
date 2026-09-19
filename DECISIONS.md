@@ -124,24 +124,84 @@ systemctl --user show jobscan.service -p ActiveState --value
    `finally` 有沒有跑到）、攔 SIGTERM/SIGINT 就地還原、結束時用 `git diff --stat`
    驗證還原，而不是比對樣式。
 
-### 第五輪變異測試結果（10/10 被逮）
+### 順帶修掉：日誌行會因執行緒交錯而黏在一起
+
+在生產的 `job_board.log` 實際看到：
+
+```
+[23:39:24] [watchdog] Watchdog thread started[23:39:24] [jobscan] External scan watcher started======
+```
+
+`print()` 是**兩次** write()（先內容、再換行）。stdout 在 systemd 的
+`StandardOutput=append:` 下是 O_APPEND 的檔案，watchdog 執行緒與 jobscan 監看
+執行緒（還有啟動 banner）交錯時，換行就落到別人的文字後面，兩行黏成一行。
+23:05 那次啟動正常、23:39 那次黏住 —— 是間歇性 race。
+
+**這正好抵銷 MINOR 2.4 的目的**：加時戳就是為了讓順序可對齊，黏行比沒有時戳更難追。
+
+**修法**：`_out()` 對每一行只呼叫一次 `write()`（O_APPEND 下單次 write 具原子性）。
+所有可能被背景執行緒呼叫的 `print()` 都改走它 —— watchdog、jobscan 監看、
+scheduler 執行緒，以及 **Flask 請求執行緒**（`get_timer_state`／`load_jobs`／
+`start_search` 都可由 request handler 觸發）。啟動 banner 也改了，它正是當事者之一。
+
+**過程中被自己抓到兩次**：
+
+1. 第一版只換掉兩個多行 `print()` 的**第一行**，把尾端的 `flush=True` 留著 ——
+   `_out()` 當場 `TypeError`，scheduler 執行緒直接死掉。**`py_compile` 會過，
+   只有真的 import 才看得出來。**
+2. 第一版的回歸測試**沒有逮到修正前的實作**（見下）。
+
+### ⚠️ 一個「有修正、沒有回歸保護」的實例，而且是我自己犯的
+
+H 區第一版用 8 執行緒 × 40 行對 `StringIO` 猛寫，斷言沒有黏行。**結果把 `_out()`
+退回修正前的 `print()`（變異 M11）之後，55/55 全數通過** —— 這正是本專案被咬過
+兩次的形狀，而我剛剛才在同一份文件裡寫下那條教訓。
+
+原因：`StringIO` 太快，GIL 在兩次 `write()` 之間幾乎不切換，race 逼不出來。
+而把競爭拉高到會不定期失敗就變成「不穩定的測試」—— 本專案也吃過那個虧。
+
+**改法：斷言 race 的【成因】，不賭 race 本身。** `print()` 一定拆成兩次 write()，
+這是確定的；於是「每行只呼叫一次 write()」就等價於「黏行結構上不可能」，
+而且是決定性的。用一個記錄呼叫次數的假 stdout 來驗。
+
+同時，原本那個併發測試**保留但重新標示**：它是行完整性的一般性煙霧測試，
+**不是** 這個缺陷的守衛（M11 也會通過它）。繼續宣稱它有保護作用，
+就是同一種錯用小包裝再犯一次。
+
+### 第五輪變異測試結果（`tests/mutate.py`，13 個變異，12 被逮、1 已知逃脫）
+
+變異工具從 `/tmp` 搬進版控（`tests/mutate.py`），**上面每一個「被逮」的宣稱
+都可以用一行指令重跑**。
 
 | 變異 | 內容 | 結果 |
 |---|---|---|
-| M1 | 孤兒回收判準改回 `proc is not None` | 52P / 1F ✅ |
-| M2 | 拿掉 `_read_search_output` 的 try/finally | 52P / 1F ✅ |
-| M3 | 拿掉 `Popen(errors="replace")` | 52P / 1F ✅ |
-| M4 | 拿掉 `kill_stalled_external` 的 phase 閘門 | 51P / 2F ✅ |
-| M5 | 拿掉 cmdline 身分檢查 | 52P / 1F ✅ |
-| M6 | 拿掉 systemd 分支的 ActiveState 前置檢查 | 51P / 2F ✅ |
-| M7 | 拿掉 `_external_begin` 身分閘門 | 51P / 2F ✅ |
-| M8 | `kill_stalled_external` 整個 no-op | 48P / 5F ✅ |
-| M9 | 拿掉 TOCTOU 重檢 | 52P / 1F ✅ |
-| M10 | `_pid_is_our_scan` 退回子字串比對 | 52P / 1F ✅ |
+| M1 | 孤兒回收判準改回 `proc is not None` | 54P / 1F ✅ |
+| M2 | 拿掉 `_read_search_output` 的 try/finally | 54P / 1F ✅ |
+| M3 | 拿掉 `Popen(errors="replace")` | 54P / 1F ✅ |
+| M4 | 拿掉 `kill_stalled_external` 的 phase 閘門 | 53P / 2F ✅ |
+| M5 | 拿掉 cmdline 身分檢查 | 54P / 1F ✅ |
+| M6 | 拿掉 systemd 分支的 ActiveState 前置檢查 | 53P / 2F ✅ |
+| M7 | 拿掉 `_external_begin` 身分閘門 | 53P / 2F ✅ |
+| M8 | `kill_stalled_external` 整個 no-op | 50P / 5F ✅ |
+| M9 | 拿掉 TOCTOU 重檢 | 54P / 1F ✅ |
+| M10 | `_pid_is_our_scan` 退回子字串比對 | 54P / 1F ✅ |
+| M11 | `_out` 退回 `print()`（修正前行為、無鎖） | 54P / 1F ✅ |
+| M12 | 保留鎖但用 `print()`（兩次 write） | 54P / 1F ✅ |
+| M13 | 拿掉鎖、保留單次 write | 55P / 0F ⚠️ **已知逃脫** |
 
 > M10 只被**一項**逮到，就是 F3 反轉後的那條「冒名者必須被拒」。這是第四輪把 F3
 > 從「斷言冒名者必須被認可」改成「必須被拒絕」的直接價值 —— **把弱點寫成規格的
 > 測試，比沒有測試更糟**，因為它會主動阻止別人修。
+
+> **M13 逃脫是刻意記錄下來的，不是漏掉。** 它證明**那把 `_LOG_LOCK` 不是
+> load-bearing**：黏行的成因是 `print()` 的兩次 write()，單次 write 就足以讓它
+> 結構上不可能（M12 被逮、M13 逃脫，兩者合起來正好把因果釘死）。
+> 鎖留著是 defence in depth，**但目前沒有任何測試能證明少了它會出問題**。
+> 「兩個都必要」的原註解是錯的，已更正。
+>
+> `mutate.py` 用 `EXPECTED_ESCAPES` 把「已知且已理解的逃脫」與「沒被發現的覆蓋
+> 缺口」分開回報 —— 混在一起會讓這個工具失去訊號。**已知逃脫不影響退出碼，
+> 但一定會印出來，且必須在這裡有對應說明**（就是這一段）。
 
 ### 已知限制（本輪未修，誠實列出）
 

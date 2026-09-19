@@ -118,14 +118,14 @@ tail -f logs/cron_search.log
 
 ## 測試覆蓋（誠實聲明）
 
-**這個專案的自動化測試只有一支**：`tests/test_scan_lock.py`（53 項檢查）。
+**這個專案的自動化測試只有一支**：`tests/test_scan_lock.py`（55 項檢查）。
 其餘全部是手動驗證 —— 上面各節的「驗證」指令就是手動程序。
 
 ```bash
 cd /home/ian/github-project/jobspy
 .venv/bin/python tests/test_scan_lock.py     # 通過時印「✅ 全數通過」且 exit 0
 
-# 要引用「幾項」時用這個量，不要憑印象寫 —— 這個數字已經腐化過兩次（28→39→53）：
+# 要引用「幾項」時用這個量，不要憑印象寫 —— 這個數字已經腐化過三次（28→39→53→55）：
 .venv/bin/python tests/test_scan_lock.py | grep -c '\[PASS\]'
 ```
 
@@ -139,6 +139,7 @@ cd /home/ian/github-project/jobspy
 | F | 17 | 孤兒鎖盲區、誤殺無關行程、幻影掃描、假成功、`cmdline` 身分驗證（第三輪退回） |
 | F7 | 7 | 殺戮路徑的**正向**覆蓋：必須開火、且目標真的死掉（第四輪退回） |
 | G | 4 | `errors="replace"` 與 TOCTOU 重檢的回歸保護（第四輪退回） |
+| H | 2 | 日誌每行必須**一次** `write()` 寫出（見下） |
 
 **測試本身有護欄**（因為它 import `job_board` 會連帶啟動背景 watchdog）：
 
@@ -159,17 +160,33 @@ cd /home/ian/github-project/jobspy
 > **任何直接呼叫 `_REAL_KILL_EXTERNAL()` 的新測試都必須 mock `subprocess.run`。**
 
 **以變異實驗自我驗證**：每一項修正都做過「把它改回去，確認測試會 FAIL」。
-沒有 FAIL 的修正等於沒有回歸保護。目前 **10 個變異全數被捕捉**（詳見
-`../DECISIONS.md` 第四輪條目的變異表）。**若你新增修正卻找不到會失敗的變異，
-代表那個修正沒有被測試覆蓋。**
+沒有 FAIL 的修正等於沒有回歸保護。工具已進版控，**上面每一個「被逮」的宣稱
+都可以自己重跑**：
 
-兩個踩過的坑，寫在這裡免得重蹈：
+```bash
+cd /home/ian/github-project/jobspy
+.venv/bin/python tests/mutate.py      # 需要乾淨的工作區；會改寫並還原 job_board.py
+```
+
+目前 **13 個變異、12 個被逮、1 個已知逃脫**（M13，理由見 `../DECISIONS.md`
+第四輪條目；`mutate.py` 的 `EXPECTED_ESCAPES` 把「已理解的逃脫」與「沒被發現的
+覆蓋缺口」分開回報，只有後者會讓退出碼變 1）。**若你新增修正卻找不到會失敗的
+變異，代表那個修正沒有被測試覆蓋。**
+
+三個踩過的坑，寫在這裡免得重蹈：
 
 - **假變異**：改到註解的變異**不可能改變行為**，所以永遠不會 FAIL、永遠「逃脫」。
   看到「逃脫」先懷疑變異本身。
 - **殘留檢查不能用 grep**：「把 `kill_stalled_external` 整個 no-op」的變異是一個
   裸的 `return None`，任何樣式比對都抓不到。還原一律用
   `git checkout -- job_board.py`，並以 `git diff --stat` 驗證。
+- **⚠️ 有修正 ≠ 有回歸保護，連寫測試的人自己都會中**：H 區第一版用 8 執行緒對
+  `StringIO` 猛寫、斷言沒有黏行 —— 結果把 `_out()` 退回修正前的 `print()`（M11）
+  之後**全數通過**。`StringIO` 太快，GIL 在兩次 `write()` 之間幾乎不切換，
+  race 逼不出來。**改成斷言成因**（用假的 stdout 數 `write()` 呼叫次數，
+  必須恰好 1 次），這是決定性的、不會間歇性失敗。
+  原本那個併發測試**保留但已重新標示**為一般性煙霧測試 —— **它不是這個缺陷的
+  守衛**。繼續宣稱它有保護作用，就是同一種錯用小包裝再犯一次。
 
 ### ⚠️ 未涵蓋（不要以為有測試就安全）
 
