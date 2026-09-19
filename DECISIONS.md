@@ -97,25 +97,39 @@ M5 漂移（`56P/2F` ↔ `57P/1F`）。
 `INTERNAL_SCHEDULER=1` 且先跑完一輪真掃描。變異 `M20` 就是它，**保證逃脫**，
 刻意列進 `EXPECTED_ESCAPES`。
 
-### 變異表（第六輪，連跑四次逐項相同）
+### 6. 盤點時發現的第五個缺口：第三道鎖從來沒有測試
 
-`tests/mutate.py`，每個變異 = 「把某項修正改回去」，看測試會不會響。四次
-（`1 + 2` 背景 + 1）逐項、逐數字相同，退出碼 0，生產檔案 sha256 不變。
+補完 m2 之後，用新蓋好的 `_post_schedule()` 把 `api_schedule` 的每一條分支走一遍，
+發現**三道鎖裡唯一擋得住 curl／devtools 的那道**（`want and not INTERNAL_SCHEDULER`
+→ 拒絕並回 warning）**到第六輪為止沒有任何測試**。前端唯讀只是 UI 層的禮貌，
+這道才是真正的閘門；少了它，兩條觸發路徑同時存在＝2026-08-13 的並發事故。
+補上 K7（含反向控制：**關閉必須永遠有效**，否則這道鎖會順手把「停用排程」也擋掉）
+與 M21。
+
+**這不是被審查員抓到的，是自己盤點出來的** —— 而盤點的契機是為 m2 蓋了一個
+「可以在測試行程裡直接 POST」的鷹架。**能便宜的造出輸入，就會看見原本看不見的分支。**
+
+### 變異表（第六輪，65 項檢查，21 個變異）
+
+`tests/mutate.py`，每個變異 = 「把某項修正改回去」，看測試會不會響。
+最終版本（含 M21）在乾淨副本連跑**兩次**，逐項、逐數字相同，退出碼 0，
+生產檔案 sha256 不變。加上 M21 之前的四次，這一輪總共跑了**六次**。
 
 | 變異 | 結果 | 變異 | 結果 |
 |---|---|---|---|
-| M1 回收判準改回 `proc is not None` | 63P/1F ✅ | M11 `_out` 退回 `print()` | 61P/3F ✅ |
-| M2 拿掉 `try/finally` | 63P/1F ✅ | M12 保留鎖但用 `print()` | 61P/3F ✅ |
-| M3 拿掉 `errors="replace"` | 63P/1F ✅ | M13 拿掉 `_LOG_LOCK` | 64P/0F ❌ 已知逃脫 |
-| M4 拿掉 phase 閘門 | 62P/2F ✅ | M14 回復舊制分支不執行 | 63P/1F ✅ |
-| M5 拿掉 cmdline 身分檢查 | 62P/2F ✅ | M15 回復舊制時不算 `next_run` | 63P/1F ✅ |
-| M6 拿掉 `ActiveState` 前置檢查 | 62P/2F ✅ | M16 `times` 不驗證 | 62P/2F ✅ |
-| M7 拿掉 `_external_begin` 身分閘門 | 62P/2F ✅ | M17 `_valid_times` 不檢查內容 | 61P/3F ✅ |
-| M8 `kill_stalled_external` no-op | 59P/5F ✅ | M18 拿掉主體型別檢查 | 63P/1F ✅ |
-| M9 拿掉 TOCTOU 重檢 | 63P/1F ✅ | M19 `enabled` 寬鬆 `bool()` | 63P/1F ✅ |
-| M10 `_pid_is_our_scan` 退回子字串比對 | 63P/1F ✅ | M20 排程器跑完後回到未排序 `times[0]` | ❌ 已知逃脫（見上） |
+| M1 回收判準改回 `proc is not None` | 64P/1F ✅ | M12 保留鎖但用 `print()` | 62P/3F ✅ |
+| M2 拿掉 `try/finally` | 64P/1F ✅ | M13 拿掉 `_LOG_LOCK` | 65P/0F ❌ 已知逃脫 |
+| M3 拿掉 `errors="replace"` | 64P/1F ✅ | M14 回復舊制分支不執行 | 64P/1F ✅ |
+| M4 拿掉 phase 閘門 | 63P/2F ✅ | M15 回復舊制時不算 `next_run` | 64P/1F ✅ |
+| M5 拿掉 cmdline 身分檢查 | 63P/2F ✅ | M16 `times` 不驗證 | 63P/2F ✅ |
+| M6 拿掉 `ActiveState` 前置檢查 | 63P/2F ✅ | M17 `_valid_times` 不檢查內容 | 62P/3F ✅ |
+| M7 拿掉 `_external_begin` 身分閘門 | 63P/2F ✅ | M18 拿掉主體型別檢查 | 64P/1F ✅ |
+| M8 `kill_stalled_external` no-op | 60P/5F ✅ | M19 `enabled` 寬鬆 `bool()` | 64P/1F ✅ |
+| M9 拿掉 TOCTOU 重檢 | 64P/1F ✅ | M20 排程器跑完後回到未排序 `times[0]` | 65P/0F ❌ 已知逃脫 |
+| M10 `_pid_is_our_scan` 退回子字串比對 | 64P/1F ✅ | M21 第三道鎖失效 | 64P/1F ✅ |
+| M11 `_out` 退回 `print()` | 62P/3F ✅ | | |
 
-**18/20 被逮，2 個已知逃脫。** M13（拿掉 `_LOG_LOCK`）與 M20 都不是「沒被發現的
+**19/21 被逮，2 個已知逃脫。** M13（拿掉 `_LOG_LOCK`）與 M20 都不是「沒被發現的
 覆蓋缺口」，而是「已理解且接受」—— 兩者的理由都寫在 `mutate.py` 的
 `EXPECTED_ESCAPES` 旁邊。
 

@@ -118,14 +118,14 @@ tail -f logs/cron_search.log
 
 ## 測試覆蓋（誠實聲明）
 
-**這個專案的自動化測試只有一支**：`tests/test_scan_lock.py`（64 項檢查）。
+**這個專案的自動化測試只有一支**：`tests/test_scan_lock.py`（65 項檢查）。
 其餘全部是手動驗證 —— 上面各節的「驗證」指令就是手動程序。
 
 ```bash
 cd /home/ian/github-project/jobspy
 .venv/bin/python tests/test_scan_lock.py     # 通過時印「✅ 全數通過」且 exit 0
 
-# 要引用「幾項」時用這個量，不要憑印象寫 —— 這個數字已經腐化過六次（28→39→53→55→56→58→64）：
+# 要引用「幾項」時用這個量，不要憑印象寫 —— 這個數字已經腐化過六次（28→39→53→55→56→58→65）：
 .venv/bin/python tests/test_scan_lock.py | grep -c '\[PASS\]'
 ```
 
@@ -142,7 +142,7 @@ cd /home/ian/github-project/jobspy
 | H | 3 | 日誌每行必須**一次** `write()` 寫出（第五輪退回，見下） |
 | I | 1 | `job_board.py` 不得有 live 的 `print()`（第五輪退回） |
 | J | 2 | 啟動時的排程主權轉移：兩個方向都要正確（見「回復到舊制」一節） |
-| K | 6 | `api_schedule` 的輸入驗證：幽靈排程（`times: []`）、非物件主體、`enabled` 的字串陷阱（第六輪退回） |
+| K | 7 | `api_schedule` 的輸入驗證：幽靈排程（`times: []`）、非物件主體、`enabled` 的字串陷阱、第三道鎖（不得重新武裝）（第六輪退回） |
 
 > **H 區的 `PYTHONUNBUFFERED` 前提**：黏行的成因（`print` 拆成兩次 `write()`）
 > 只有 stdout **不緩衝**時才會顯現 —— 第五輪審查用有緩衝的檔案實測，`print`
@@ -184,7 +184,7 @@ cd /home/ian/github-project/jobspy
 .venv/bin/python tests/mutate.py     # 需乾淨的工作區；在 /tmp 隔離副本裡跑
 ```
 
-目前 **20 個變異、18 個被逮、2 個已知逃脫**（M13、M20；`mutate.py` 的
+目前 **21 個變異、19 個被逮、2 個已知逃脫**（M13、M20；`mutate.py` 的
 `EXPECTED_ESCAPES` 把「已理解的逃脫」與「沒被發現的覆蓋缺口」分開回報，只有後者
 會讓退出碼變 1。M20 的用意正是**讓一個覆蓋缺口變成機器看得見的事實**，而不是
 文件裡的一句話）。**若你新增修正卻找不到會失敗的變異，代表那個修正沒有被測試
@@ -288,6 +288,11 @@ cd /home/ian/github-project/jobspy
 - **`run_scan.sh` 的 bash 端：零自動化測試。** 鎖重試、`SKIPPED` 路徑、`LOCK_WAIT`
   驗證、`finish()`／`trap` 的退出碼語意，全部只有手動驗證過。改這支腳本時請照
   上面「手動操作」一節實測。
+- **前端 JS：零自動化測試。** `updateSchedule()` 現在會顯示後端回傳的
+  `warning`／`error`（第六輪補的 —— 在那之前，請求被拒絕與存檔成功在畫面上長得
+  一模一樣）。**沒有任何測試守著它**。刻意不加一個「grep 有沒有 `s.warning`」
+  的檢查：那種測試只會給假信心（README 上面才剛說過「殘留檢查不能用 grep」）。
+  改到那段 JS 時請用手動驗證：devtools 送 `{"times": []}`，確認跳 alert。
 - **stray holder 造成的卡死**：`trigger=manual` 的手動掃描沒有 unit 可等，
   而 stray holder 持鎖時 state 停在上一輪的 `finished` → phase 閘門直接 return →
   **沒有任何機制會放掉那把鎖**。已知、未修，理由與解法見 `../DECISIONS.md`
