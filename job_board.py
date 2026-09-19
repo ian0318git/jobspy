@@ -26,6 +26,7 @@ Features:
 
 import json
 import glob
+import fcntl
 import os
 import sys
 import subprocess
@@ -52,6 +53,26 @@ os.chdir(SCRIPT_DIR)
 
 SCHEDULE_FILE = os.path.join(SCRIPT_DIR, ".job_board_schedule.json")
 STATUS_FILE   = os.path.join(SCRIPT_DIR, ".job_statuses.json")
+
+# ── Scheduler ownership ──────────────────────────────────────────────────────
+# 2026-09-19：搜尋排程的主權已移交 systemd（deploy/jobscan.timer）。原因是內建
+# 排程器的補跑視窗是硬性 6 小時，機器休眠到中午過後才醒，當天的早上掃描就會被
+# 整天跳過；而這台 VM 是跟著宿主機一起被 suspend、無法自行醒來（所以
+# WakeSystem= 無效），唯一可行的是「醒來後補跑」，那正是 systemd 的
+# Persistent=true 的原生行為。
+#
+# 內建排程器【停用但保留】：程式碼與 watchdog 都還在，UI 的 🔍 Re-Search 仍共用
+# start_search()。要救回內建排程只需在 jobboard.service 加
+# Environment=JOB_BOARD_INTERNAL_SCHEDULER=1 後重啟，不必改任何程式碼。
+INTERNAL_SCHEDULER = os.environ.get("JOB_BOARD_INTERNAL_SCHEDULER", "0") == "1"
+
+# 掃描狀態的空檔（由 run_scan.sh 維護，看板只讀）。看板靠它們「看見」由 systemd
+# timer 或手動啟動的外部爬蟲 —— 那時 SEARCH_PROCESS 是 None，光看行程內狀態
+# 會誤判成「沒在跑」。
+LOG_DIR       = os.path.join(SCRIPT_DIR, "logs")
+JOBSCAN_LOCK  = os.path.join(LOG_DIR, "jobscan.lock")
+JOBSCAN_STATE = os.path.join(LOG_DIR, "search_state.json")
+JOBSCAN_LIVE  = os.path.join(LOG_DIR, "search_current.log")
 
 app = Flask(__name__)
 
@@ -192,12 +213,94 @@ SEARCH_LOCK = threading.Lock()
 # 近 50 小時，並讓排程器陷入每 30 秒重試一次的空轉。這裡是最後一道防線。
 SEARCH_STALL_TIMEOUT = 900
 
+# SEARCH_OUTPUT 的長度上限。前端只顯示最後 80 行，但整份緩衝區沒有上限的話，
+# 一輪 48 個搜尋詞的長跑會讓記憶體無界成長。4000 行足以涵蓋任何合理的回溯需求。
+OUTPUT_KEEP = 4000
+
+# 本行程持有的掃描鎖。只有 start_search() 啟動的子程序會用到；由 timer 或手動
+# 啟動的外部爬蟲，鎖在它們自己的行程裡，看板只能「觀察」不能代為釋放。
+# SEARCH_LOCK_OWNER 記住鎖屬於哪個 Popen，用來防止「上一輪的 reader thread 拖到
+# 現在才收尾，卻把新一輪的鎖放掉」。
+SEARCH_LOCK_FD = None
+SEARCH_LOCK_OWNER = None
+
+
+def _lock_held(path):
+    """檢查 flock 是否正被（別的行程）持有。回傳 True/False；無法判斷時 None。
+
+    用 fcntl.flock 而不是去呼叫 flock(1)：兩者是同一把鎖，所以不需要 spawn 子程序。
+    注意「檔案存在」不代表有人在跑 —— flock 是 advisory lock 且綁在 fd 上，行程
+    結束時由核心自動釋放，因此永遠不會有 stale lock，不需要也不應該寫清理邏輯。
+    """
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return True                       # 有人持有
+    else:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
+def _acquire_search_lock():
+    """為本行程的子程序取得掃描鎖。成功回傳 fd；已被別人持有則回傳 None。"""
+    global SEARCH_LOCK_FD, SEARCH_LOCK_OWNER
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        fd = os.open(JOBSCAN_LOCK, os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError as e:
+        print(f"[search] 無法開啟掃描鎖 {JOBSCAN_LOCK}: {e}", flush=True)
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    SEARCH_LOCK_FD, SEARCH_LOCK_OWNER = fd, None
+    return fd
+
+
+def _release_search_lock(owner=None):
+    """釋放本行程持有的掃描鎖。可重複呼叫；沒持有時是 no-op。
+
+    owner 給定時，只有當鎖仍屬於該子程序才釋放 —— 否則一個拖到很晚才收尾的舊
+    reader thread 會把新一輪搜尋的鎖放掉，等於門戶洞開。
+    """
+    global SEARCH_LOCK_FD, SEARCH_LOCK_OWNER
+    if owner is not None and SEARCH_LOCK_OWNER is not owner:
+        return
+    fd, SEARCH_LOCK_FD, SEARCH_LOCK_OWNER = SEARCH_LOCK_FD, None, None
+    if fd is None:
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
 
 def start_search():
     global SEARCH_PROCESS, SEARCH_OUTPUT, SEARCH_START_TIME, SEARCH_LAST_OUTPUT_AT
+    global SEARCH_LOCK_OWNER
     with SEARCH_LOCK:
         if SEARCH_PROCESS and SEARCH_PROCESS.poll() is None:
             return False, "A search is already running"
+        # 上一輪的子程序已結束、但 reader thread 可能還沒收尾，鎖或許還握在我們
+        # 手上。先放掉再重新取，才能正確回答「現在到底有沒有人在跑」。
+        if SEARCH_PROCESS is not None:
+            _release_search_lock()
+        # 全機唯一的鎖：systemd timer 的 run_scan.sh 與手動 run_search.sh 也取同一把。
+        if _acquire_search_lock() is None:
+            return False, "A scan is already running (systemd timer or manual run)"
         SEARCH_OUTPUT = []
         SEARCH_START_TIME = datetime.now().isoformat()
         SEARCH_LAST_OUTPUT_AT = time.monotonic()
@@ -207,11 +310,27 @@ def start_search():
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1, cwd=SCRIPT_DIR,
         )
+        # 鎖現在屬於這一輪；之後 reader thread / watchdog 才能據此安全釋放。
+        SEARCH_LOCK_OWNER = SEARCH_PROCESS
         t = threading.Thread(
             target=_read_search_output, args=(SEARCH_PROCESS,), daemon=True
         )
         t.start()
         return True, "Search started"
+
+
+def _append_output(line, when=None):
+    """把一行輸出推進 SEARCH_OUTPUT，並維持長度上限。
+
+    外部掃描（timer / 手動）與看板自己觸發的掃描共用這個緩衝區，所以「上限」
+    必須在唯一的入口處理，否則長跑會讓記憶體無界成長。
+    """
+    with SEARCH_LOCK:
+        SEARCH_OUTPUT.append(
+            ((when or datetime.now()).strftime("%H:%M:%S"), line)
+        )
+        if len(SEARCH_OUTPUT) > OUTPUT_KEEP:
+            del SEARCH_OUTPUT[:-OUTPUT_KEEP]
 
 
 def _read_search_output(proc):
@@ -222,12 +341,11 @@ def _read_search_output(proc):
     """
     global SEARCH_LAST_OUTPUT_AT
     for line in proc.stdout:
-        with SEARCH_LOCK:
-            SEARCH_OUTPUT.append(
-                (datetime.now().strftime("%H:%M:%S"), line.rstrip("\n"))
-            )
+        _append_output(line.rstrip("\n"))
         SEARCH_LAST_OUTPUT_AT = time.monotonic()
     proc.wait()
+    # 子程序結束＝這一輪掃描結束，鎖必須立刻放掉，否則 timer 的下一輪會被擋住。
+    _release_search_lock(proc)
 
 
 def get_search_stall_seconds():
@@ -252,11 +370,11 @@ def kill_stalled_search():
         if proc is None or proc.poll() is not None:
             return None
         pid = proc.pid
-        SEARCH_OUTPUT.append((
-            datetime.now().strftime("%H:%M:%S"),
-            f"🛑 已 {idle / 60:.1f} 分鐘無輸出，判定卡死，終止 PID {pid}",
-        ))
+        _append_output(f"🛑 已 {idle / 60:.1f} 分鐘無輸出，判定卡死，終止 PID {pid}")
         proc.kill()
+        # 立刻放鎖：reader thread 可能正卡在 proc.stdout 的讀取上，不會那麼快收尾，
+        # 拖著不放會讓 timer 的下一輪掃描無謂地被擋掉。
+        _release_search_lock(proc)
     try:
         proc.wait(timeout=10)
     except subprocess.TimeoutExpired:
@@ -323,8 +441,76 @@ def save_schedule(cfg):
         json.dump(cfg, f, indent=2)
 
 
+_TIMER_CACHE = {"at": 0.0, "value": None}
+
+
+def get_timer_state():
+    """查 jobscan.timer 的下次／上次觸發時間。查不到時回 {"installed": False}。
+
+    用 `list-timers --output=json` 而不是解析人類可讀字串：JSON 裡的 next/last 是
+    µs epoch 整數，不會被 locale 或時區縮寫影響。
+
+    快取 30 秒：前端會週期性輪詢，每次都 spawn 一個 systemctl 太浪費，而排程的
+    真實值本來就只以分鐘為單位變動。
+
+    installed=False 本身就是一個靜默失敗偵測器 —— 排程跑掉的頭號原因就是 timer
+    根本沒裝好，UI 直接顯示出來會比事後翻 journal 快得多。
+    """
+    now = time.monotonic()
+    if _TIMER_CACHE["value"] is not None and now - _TIMER_CACHE["at"] < 30:
+        return _TIMER_CACHE["value"]
+    result = {"installed": False, "next": None, "last": None, "next_iso": None}
+    try:
+        proc = subprocess.run(
+            ["systemctl", "--user", "list-timers", "jobscan.timer", "--all",
+             "--output=json", "--no-pager"],
+            capture_output=True, text=True, timeout=3,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            for u in json.loads(proc.stdout):
+                if u.get("unit") != "jobscan.timer":
+                    continue
+                result["installed"] = True
+                nxt = u.get("next") or None
+                result["next"] = nxt
+                result["last"] = u.get("last") or None
+                if nxt:
+                    result["next_iso"] = datetime.fromtimestamp(
+                        nxt / 1_000_000).strftime("%Y-%m-%d %H:%M:%S")
+                break
+    except (OSError, subprocess.SubprocessError, ValueError) as e:
+        print(f"[timer] 查詢 jobscan.timer 失敗: {e}", flush=True)
+    _TIMER_CACHE["at"], _TIMER_CACHE["value"] = now, result
+    return result
+
+
 SCHEDULE_CONFIG = load_schedule()
 SCHEDULE_STOP = threading.Event()
+
+# 排程主權移交 systemd 後，內建排程器的 enabled 必須壓平：留著 true 會讓 UI
+# 顯示成「已啟用」但實際上不會動作，而哪天閘門被打開就會直接雙軌觸發。
+# 只在真的需要變更時才寫檔，避免每次啟動都無謂地改動檔案。
+if not INTERNAL_SCHEDULER:
+    _sched_changed = False
+    if SCHEDULE_CONFIG.get("enabled"):
+        SCHEDULE_CONFIG["enabled"] = False
+        SCHEDULE_CONFIG["next_run"] = None
+        _sched_changed = True
+    # _fired_today 是內建排程器的「當日已觸發」紀錄，停用後語意不存在，一律清掉。
+    # 條件刻意寫成「非空」而非「鍵存在」：load_schedule() 的 setdefault 每次載入
+    # 都會把 SCHEDULE_DEFAULT 裡那個空的 {} 補回來，若照「存在就清」會導致每次
+    # 啟動都判定為有變更而寫檔，白白製造 churn。
+    if SCHEDULE_CONFIG.get("_fired_today"):
+        SCHEDULE_CONFIG.pop("_fired_today", None)
+        _sched_changed = True
+    if SCHEDULE_CONFIG.get("managed_by") != "systemd-timer":
+        SCHEDULE_CONFIG["managed_by"] = "systemd-timer"
+        _sched_changed = True
+    if _sched_changed:
+        save_schedule(SCHEDULE_CONFIG)
+        print("[scheduler] Internal scheduler disabled; schedule.enabled cleared "
+              "(systemd timer owns the schedule)", flush=True)
 
 # start_search() 失敗後的退避秒數。失敗幾乎都代表已經有一個搜尋在跑（或剛卡死、
 # 還沒被 watchdog 清掉），此時每 30 秒重試一次對恢復毫無幫助，只會讓 log 以
@@ -334,8 +520,19 @@ _scheduler_retry_at = 0.0
 
 
 def scheduler_loop():
-    """Background thread: check every 30s if a scheduled search is due."""
+    """Background thread: check every 30s if a scheduled search is due.
+
+    2026-09-19：排程主權已移交 deploy/jobscan.timer，本函式預設不執行。這裡是
+    直接結束執行緒，而不是每 30 秒檢查一次旗標 —— 停用後才能真的做到零喚醒、
+    零 log、零 CPU。代價只是「要救回來得重啟服務」，而環境變數本來就只在啟動
+    時讀取，所以那個代價本來就存在。
+    """
     global _scheduler_retry_at
+    if not INTERNAL_SCHEDULER:
+        print("[scheduler] Internal scheduler DISABLED "
+              "(deploy/jobscan.timer owns the schedule). "
+              "Set JOB_BOARD_INTERNAL_SCHEDULER=1 to re-enable.", flush=True)
+        return
     print("[scheduler] Scheduler thread started", flush=True)
     while not SCHEDULE_STOP.is_set():
         try:
@@ -511,8 +708,16 @@ def api_schedule():
     global SCHEDULE_CONFIG
     if request.method == "POST":
         data = request.get_json()
+        refused = None
         if "enabled" in data:
-            SCHEDULE_CONFIG["enabled"] = bool(data["enabled"])
+            want = bool(data["enabled"])
+            # 第三道鎖：即使有人繞過前端（curl、devtools），也不能把內建排程器
+            # 重新武裝。兩條觸發路徑同時存在就是 2026-08-13 的並發事故。
+            if want and not INTERNAL_SCHEDULER:
+                refused = ("內建排程器已停用（排程由 systemd timer 負責），"
+                           "enabled 未變更")
+                want = False
+            SCHEDULE_CONFIG["enabled"] = want
         # 只有在值*真的*變動時才清掉當日追蹤。UI 每次儲存都會把 times/mode 一起
         # 送上來，若照單全收地 pop，任何一次無關的儲存都會清空 _fired_today，
         # 讓排程器誤判當日尚未執行而立刻補跑一次。
@@ -548,9 +753,19 @@ def api_schedule():
         else:
             SCHEDULE_CONFIG["next_run"] = None
         save_schedule(SCHEDULE_CONFIG)
-        return jsonify({"ok": True, "schedule": SCHEDULE_CONFIG})
+        resp = {"ok": True, "schedule": SCHEDULE_CONFIG}
+        if refused:
+            resp["warning"] = refused
+        return jsonify(resp)
     SCHEDULE_CONFIG = load_schedule()
-    return jsonify(SCHEDULE_CONFIG)
+    payload = dict(SCHEDULE_CONFIG)
+    if not INTERNAL_SCHEDULER:
+        # 排程的真實來源是 systemd，這裡只覆蓋回應內容、不寫檔 —— 免得把
+        # systemd 的計算結果持久化成一個會過期的假 state。
+        payload["managed_by"] = "systemd-timer"
+        payload["timer"] = get_timer_state()
+        payload["next_run"] = payload["timer"]["next_iso"]
+    return jsonify(payload)
 
 
 def compute_stats():

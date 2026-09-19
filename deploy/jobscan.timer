@@ -1,0 +1,27 @@
+[Unit]
+Description=Embedded job scan timer (06:00 & 22:00 Melbourne; Persistent catches up missed runs)
+# 不要加 Requires=jobscan.service。
+#
+# 這點與 alpha-validator 的 timer 不同，是刻意的。timer 的 [Unit] Requires= 會在
+# 【timer 啟動的當下】就拉動被依賴的 service。alpha 的 journal 是鐵證：
+#     23:09:57 boot  →  23:10:04 alpha-pre-market.service Started  →  23:10:05 Finished
+# 他們能在開機 7 秒後被拉動卻只跑 1 秒，是因為 wrapper.sh 有 .done marker 擋掉；
+# jobspy 沒有 done marker，照抄會變成「每次開機、每次 restart timer 都多掃一輪」，
+# 造成隨機時段的掃描與不必要的爬取額度消耗。
+# timer 本來就會啟動它 Unit= 指向的 service，所以 Requires= 純屬多餘。
+
+[Timer]
+# 本機系統時區已是 Australia/Melbourne，仍明寫時區（對齊 alpha 慣例）：
+# 這樣宿主機時區若有變動，掃描時間仍固定是墨爾本在地的早上 6 點與晚上 10 點。
+OnCalendar=*-*-* 06:00:00 Australia/Melbourne
+OnCalendar=*-*-* 22:00:00 Australia/Melbourne
+# 休眠／關機期間錯過的時段，在機器恢復後補跑一次。
+# 這是本遷移的核心：內建排程器的補跑視窗是硬性 6 小時，23:00 睡到隔天 12:30
+# 才醒就會整天不掃描；而這台 VM 是跟著宿主機一起被 suspend，無法自行醒來
+# （所以 WakeSystem= 無效），只剩「醒來後補跑」這條路。
+# 多個 OnCalendar 共用一個 timer，錯過多個時段只會補跑一次，不會連跑兩輪。
+Persistent=true
+Unit=jobscan.service
+
+[Install]
+WantedBy=timers.target

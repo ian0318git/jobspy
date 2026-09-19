@@ -1,0 +1,30 @@
+[Unit]
+Description=Embedded job scan (linkedin_job_search.py via run_scan.sh, flock-guarded)
+After=network-online.target
+Wants=network-online.target
+# 刻意【不寫】Requires= 於此，且刻意【不寫】[Install]：
+#   - 沒有 [Install] → 讓 `systemctl --user enable jobscan.service` 在結構上不可能，
+#     避免哪天有人手滑把它變成「每次開機掃描一次」。
+#   - 這個 unit 只由 jobscan.timer 以 Unit= 啟動。
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/ian/github-project/jobspy
+Environment=PYTHONUNBUFFERED=1
+# 走 run_scan.sh：flock 保證 timer / dashboard / 手動三條路徑共用同一把鎖，
+# 全機同時間只會有一個爬蟲。狀態檔與即時日誌也由它維護（看板據此顯示進度）。
+ExecStart=/home/ian/github-project/jobspy/run_scan.sh systemd-timer
+# 正常一輪約 19 分鐘，而 systemd 對 oneshot 的預設 TimeoutStartSec 是 90 秒
+# —— 不設的話每一次正常執行都會被殺掉。
+#
+# 為什麼是 5h 而不是像 alpha-validator 那樣設 0（無限）：
+# 理論最差 = 48 個搜尋詞 × SCRAPE_TIMEOUT 300 秒 = 14400s = 4 小時，是有界的，
+# 所以 5h 不可能誤殺正常執行。反過來說，Type=oneshot 一次只能有一個 instance，
+# 若某次真的卡死又沒有逾時，unit 會永遠停在 activating，之後【每一次】timer
+# 觸發都會被 systemd 視為「已經在跑了」而整批吞掉 —— 22:00 再也不會執行，而
+# `list-timers` 仍會顯示一個漂亮的 NEXT 時間。那正是 2026-09-17 那次 50 小時
+# 靜默卡死的同一種病。逾時後 SIGTERM 會讓 run_scan.sh 記下 exit_code=143，
+# 看板會顯示「上次掃描未正常結束」，不會靜默。
+TimeoutStartSec=5h
+StandardOutput=append:/home/ian/github-project/jobspy/logs/cron_search.log
+StandardError=append:/home/ian/github-project/jobspy/logs/cron_search.log
