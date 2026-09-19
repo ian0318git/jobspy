@@ -892,7 +892,7 @@ check(
     "job_board.py 不得有 live 的 print()／直接 sys.stdout.write（一律走 _out）",
     _out_node is not None and not _violations,
     f"違規行={_violations}" if _violations else
-    f"_out 位於 {_out_span}，{len(_stray_writes)} 處直接寫入皆在 _out 內、無 print",
+    f"_out 位於 {_out_span}；print 呼叫 0 處、_out 外的直接寫入 {len(_stray_writes)} 處",
 )
 
 # ═══ 結果 ════════════════════════════════════════════════════════════════════
