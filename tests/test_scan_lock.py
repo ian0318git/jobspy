@@ -738,14 +738,52 @@ wait_dead(victim2)
 # 誘餌活著」。上面 atexit 是備援，這裡是正常路徑的保證。
 reap_all_spawned()
 
-# ═══ H. 併發日誌：整行必須一次寫出 ════════════════════════════════════════════
-print("=== H. 併發日誌：print() 的換行會被吃掉 ===")
+# ═══ H. 日誌：整行必須一次 write() ════════════════════════════════════════════
+print("=== H. 日誌整行一次 write（print() 的換行會被別的行吃掉）===")
 
 # 2026-09-19 在生產的 job_board.log 實際看到兩行黏在一起：
 #   [23:39:24] [watchdog] Watchdog thread started[23:39:24] [jobscan] ... started=====
 # 成因是 print() 分成兩次 write()（內容、換行），多執行緒在 O_APPEND 下交錯。
-# 這正好抵銷 _log() 加時戳的目的（加時戳就是為了對齊）。修法是整行一次寫。
-# 23:05 那次正常、23:39 那次黏住 —— 是間歇性 race，所以這裡用高併發把它逼出來。
+# 這正好抵銷 _log() 加時戳的目的（加時戳就是為了對齊，黏行反而更難追）。
+# 23:05 啟動正常、23:39 啟動黏住 —— 是間歇性 race，不是每次都會中。
+#
+# ⚠️ 這裡【刻意不】用高併發去逼那個 race。試過了，行不通：用 8 執行緒 × 40 行
+# 對 StringIO 猛寫，退回 print() 的變異（M11）照樣 55/55 全過 —— StringIO 太快，
+# GIL 在兩次 write() 之間幾乎不切換。而把競爭拉高到會不定期失敗，就變成
+# 「不穩定的測試」，本專案已經吃過那個虧（比沒有測試更糟）。
+#
+# 改成斷言 race 的【成因】，這是決定性的：print() 一定是兩次 write()。
+# 只要 _out() 對每一行只呼叫一次 write()，黏行在結構上就不可能發生 ——
+# 因為 O_APPEND 下的單次 write() 具原子性。
+
+
+class _WriteRecorder(io.TextIOBase):
+    """假的 stdout：記錄每一次 write() 呼叫，不保留內容。"""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def write(self, s: str) -> int:      # type: ignore[override]
+        self.calls.append(s)
+        return len(s)
+
+    def flush(self) -> None:
+        pass
+
+
+_rec = _WriteRecorder()
+with contextlib.redirect_stdout(_rec):
+    jb._log("測試訊息")
+
+check(
+    "_log() 必須把整行用【一次】write() 寫出（print 會拆成兩次，換行就會被吃掉）",
+    len(_rec.calls) == 1 and bool(re.match(r"^\[\d\d:\d\d:\d\d\] 測試訊息\n$", _rec.calls[0])),
+    f"write() 次數={len(_rec.calls)}  內容={_rec.calls!r}",
+)
+
+# 下面這一項是【一般性煙霧測試】，不是上面那個缺陷的守衛 ——
+# 已實測：M11（把 _out 退回 print）在這一項也會通過。留著是因為它驗證的是
+# 另一個性質（高併發下每一行都完整、沒有遺失或被截斷），那個性質上面那項沒涵蓋。
 _H_BUF = io.StringIO()
 _H_T, _H_L = 8, 40
 
@@ -763,21 +801,15 @@ with contextlib.redirect_stdout(_H_BUF):
         _t.join()
 
 _h_lines = _H_BUF.getvalue().splitlines()
-_re_ts = re.compile(r"\[\d\d:\d\d:\d\d\]")
 # 黏行的精確特徵：同一行出現兩個以上的時戳。背景 watchdog 若剛好也寫一行，
 # 那行只會有一個時戳、且不符合下面的完整樣式，不會造成偽陽性。
-_merged = [ln for ln in _h_lines if len(_re_ts.findall(ln)) > 1]
+_merged = [ln for ln in _h_lines if len(re.findall(r"\[\d\d:\d\d:\d\d\]", ln)) > 1]
 _intact = [ln for ln in _h_lines
            if re.match(r"^\[\d\d:\d\d:\d\d\] thread=\d+ line=\d+$", ln)]
 check(
-    "併發 _log() 不得把兩行黏成一行（整行必須一次 write）",
-    not _merged,
-    f"黏行數={len(_merged)}" + (f"  例：{_merged[0][:80]!r}" if _merged else ""),
-)
-check(
-    "（承上）每一行都必須完整無缺",
-    len(_intact) == _H_T * _H_L,
-    f"完整行={len(_intact)}/{_H_T * _H_L}",
+    "併發 _log() 時每一行都必須完整無缺（煙霧測試，見上方說明）",
+    len(_intact) == _H_T * _H_L and not _merged,
+    f"完整行={len(_intact)}/{_H_T * _H_L} 黏行={len(_merged)}",
 )
 
 # ═══ 結果 ════════════════════════════════════════════════════════════════════
