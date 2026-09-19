@@ -288,7 +288,12 @@ SEARCH_PROCESS = None
 SEARCH_OUTPUT = []
 SEARCH_START_TIME = None
 SEARCH_LAST_OUTPUT_AT = None   # time.monotonic()：最後一次收到子程序輸出的時刻
-SEARCH_LOCK = threading.Lock()
+# 必須是 RLock 而非 Lock：_append_output() 本身會取這把鎖，而它會在
+# kill_stalled_search() 已持鎖的區塊內被呼叫（要記錄「判定卡死」那行）。
+# 用不可重入的 Lock 會讓 watchdog 執行緒在那一行自我死鎖 —— 而它不會拋例外，
+# 所以 except 攔不到、日誌一行都不會印，watchdog 與外部掃描偵測就此永久癱瘓、
+# 卡死的爬蟲永遠殺不掉、flock 永遠不放、之後每輪排程都靜默 SKIPPED。
+SEARCH_LOCK = threading.RLock()
 
 # 子程序沉默超過這個秒數就判定卡死並終止。爬蟲每跑完一個搜尋詞就會印進度，
 # 正常情況下不會安靜這麼久。Jora 走 tls_client（Go 共享庫），Go 層死鎖時
@@ -356,9 +361,16 @@ def _release_search_lock(owner=None):
     reader thread 會把新一輪搜尋的鎖放掉，等於門戶洞開。
     """
     global SEARCH_LOCK_FD, SEARCH_LOCK_OWNER
-    if owner is not None and SEARCH_LOCK_OWNER is not owner:
-        return
-    fd, SEARCH_LOCK_FD, SEARCH_LOCK_OWNER = SEARCH_LOCK_FD, None, None
+    # 「檢查 owner」與「清空」必須在同一個臨界區內。少了這道鎖，舊掃描的 reader
+    # thread 可能在通過 owner 檢查之後被排程器切換掉，等 start_search() 換上
+    # 新一輪的 fd 之後才醒來執行清空 —— 結果是把【新掃描的鎖】關掉，新掃描在
+    # 無鎖狀態下跑，而 run_scan.sh 的 flock 此刻可以成功取鎖，兩套爬蟲並發
+    # 各產一份結果檔（2026-08-13 事故的同一類別，也正是 owner guard 存在的理由）。
+    # flock/close 等 syscall 留在鎖外，需要原子化的只有「檢查＋換手」。
+    with SEARCH_LOCK:
+        if owner is not None and SEARCH_LOCK_OWNER is not owner:
+            return
+        fd, SEARCH_LOCK_FD, SEARCH_LOCK_OWNER = SEARCH_LOCK_FD, None, None
     if fd is None:
         return
     try:
@@ -566,6 +578,10 @@ def kill_stalled_external():
     看板自己啟動的掃描由 kill_stalled_search() 負責，這裡只處理鎖不在我們
     手上的情況。
     """
+    # 鎖在我們手上就沒有「外部掃描」這回事（互斥）。防禦性檢查：即使
+    # _EXTERNAL["active"] 因故沒被清掉，也絕不對著自己的掃描動手。
+    if _we_hold_scan_lock():
+        return None
     idle = _external_idle_seconds()
     if idle is None or idle <= SEARCH_STALL_TIMEOUT:
         return None
@@ -723,6 +739,16 @@ def _external_end():
 
 def _jobscan_watch_tick():
     if _we_hold_scan_lock():
+        # 鎖在我們手上 → 互斥保證此刻不可能有外部掃描在跑，所以必須把 active 收掉，
+        # 不能只是 return。否則「外部掃描結束後、下一個 tick 之前使用者按了重新搜尋」
+        # 會讓 _EXTERNAL 停在 active=True 且 last_read_at 凍結在舊掃描結束那一刻；
+        # 而看板自己的掃描動輒跑 19 分鐘 > SEARCH_STALL_TIMEOUT(900s)，watchdog
+        # 就會拿過期的 last_read_at 判定「外部掃描卡死」並動手 —— 依舊 state 的
+        # trigger 去 SIGKILL jobscan.service，或對著一個可能已被回收的 PID 送
+        # SIGKILL，殺掉無關的行程樹。
+        with SEARCH_LOCK:
+            _EXTERNAL["active"] = False
+            _EXTERNAL["last_read_at"] = None
         return                    # 自己的掃描，由 reader thread 與 watchdog 管
     held = _lock_held(JOBSCAN_LOCK)
     with SEARCH_LOCK:

@@ -50,11 +50,31 @@ write_state() {   # $1=phase(running|finished)  $2=exit_code 或空字串
 # fd 9 持有鎖，shell 活著鎖就活著。python 子程序會繼承這個 fd，
 # 所以即使 wrapper 被 SIGKILL，只要爬蟲還活著，鎖就不會鬆手。
 exec 9>"$LOCK"
-if ! flock -n 9; then
+
+# 取鎖前先重試，不是為了搶贏誰，而是為了不把【看板的探測】誤判成【有掃描在跑】。
+# 看板的 _lock_held() 用 LOCK_EX|LOCK_NB 探測、隨即 LOCK_UN —— 那個窗口只有微秒級，
+# 但若 timer 恰好在那一刻觸發，`flock -n` 就會失敗 → 整輪 SKIPPED → exit 0 →
+# 日誌一切正常，而這個時段【整整 12 小時不會再掃描】。單次機率很小，後果卻是一整輪
+# 資料的靜默缺口。真實掃描會持鎖約 19 分鐘，所以只要等幾秒就能乾淨區分兩者。
+#
+# 這不會削弱互斥：重試只改變「我們多有耐心」，flock 仍然只讓一個行程取得鎖。
+LOCK_WAIT="${JOBSCAN_LOCK_WAIT:-20}"
+LOCK_ACQUIRED=0
+_waited=0
+while :; do
+    if flock -n 9; then LOCK_ACQUIRED=1; break; fi
+    [ "$_waited" -ge "$LOCK_WAIT" ] && break
+    sleep 1
+    _waited=$((_waited + 1))
+done
+
+if [ "$LOCK_ACQUIRED" -ne 1 ]; then
     # 刻意不覆寫 search_state.json —— 裡面是【正在跑的那一輪】的狀態，蓋掉會讓看板錯亂。
-    echo "[jobscan] $RUN_ID SKIPPED: 另一個掃描正在執行（lock=$LOCK）"
+    echo "[jobscan] $RUN_ID SKIPPED: 另一個掃描正在執行（等待 ${LOCK_WAIT}s 後仍未取得，lock=$LOCK）"
     exit 0        # 不是失敗：資料最多舊 19 分鐘，重跑只是浪費爬取額度並增加被限速的風險
 fi
+# 等超過 1 秒才拿到 = 真的撞上了探測窗口。留痕，讓這個原本不可見的競態可被觀測。
+[ "$_waited" -ge 1 ] && echo "[jobscan] $RUN_ID 取鎖重試 ${_waited}s 後成功（撞到看板的鎖探測窗口）"
 
 STARTED_AT="$(date +%Y-%m-%dT%H:%M:%S)"
 # $? 以參數傳入而非在函式內讀取：local 會改寫 $?，在函式內讀會拿到錯誤的值。

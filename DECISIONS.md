@@ -273,7 +273,12 @@ Jora 貢獻 134/182 筆（73.6%），但**只有 32 個唯一職稱、24 間唯�
 > 現在由 `run_scan.sh` 的 flock 從結構上根絕（全機唯一入口，見 2026-09-19 條目）。
 > 但「由 dashboard 排程」這件事本身已被取代：dashboard 的內建排程器已停用（三道鎖）。
 > 同時 `deploy/jobscan-morning.service/.timer` 與 `morning_catchup.sh` 已於 2026-09-19
-> **`git rm`** —— 前者沒有 `TimeoutStartSec`，直接安裝會在 systemd 的 90 秒預設逾時被殺；
+> **`git rm`** —— 兩者都是被取代，不是因為逾時設定。前者缺 `TimeoutStartSec`，
+> 而 `Type=oneshot` 未設此值時 systemd 給的是**無限**（2026-09-19 實測：apt-daily /
+> fstrim / man-db / systemd-update-utmp 皆為 `TimeoutStartUSec=infinity`；系統的
+> `DefaultTimeoutStartUSec=1min30s` 不適用於 oneshot。本條目初稿誤寫為「90 秒預設」，
+> 已更正），所以它一旦卡死會永遠停在 `activating` 並吞掉之後所有觸發 —— 但這只是
+> 加分項，刪除的主因是它已被 `jobscan.timer` 取代；
 > 後者做的事已被 `Persistent=true` 取代，留著只會在有人加 cron 時重演本條目記載的並發事故。
 
 

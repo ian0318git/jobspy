@@ -154,15 +154,18 @@ All config lives at the top of `linkedin_job_search.py`:
 > **Note:** Google for Jobs was removed — it now serves a JS-required shell with no server-rendered
 > results, so it returned 0 jobs. PyPI's latest jobspy (1.1.82) has no upstream fix.
 
-Schedule config is managed via the Web UI or by editing `.job_board_schedule.json`:
+**排程不是這裡管的**（2026-09-19 起）。`.job_board_schedule.json` 已降級為唯讀的
+執行期狀態，真正的排程在 systemd timer：
 
-```json
-{
-  "enabled": true,
-  "mode": "times",
-  "times": ["06:00", "22:00"]
-}
-```
+| 檔案 | 角色 |
+|---|---|
+| `deploy/jobscan.timer` | 06:00 / 22:00 觸發掃描（**排程的單一真相來源**） |
+| `deploy/jobscan.service` | 被 timer 拉動，執行 `run_scan.sh` |
+| `deploy/jobboard-logrotate.timer` | 04:30 輪替日誌 |
+
+看板上的排程面板是**唯讀**的：強制 POST `{"enabled":true}` 會被拒絕並回 `warning`。
+要改時刻請編輯 `deploy/jobscan.timer` 的 `OnCalendar=`，再
+`systemctl --user daemon-reload && systemctl --user restart jobscan.timer`。
 
 ---
 
@@ -172,16 +175,22 @@ Schedule config is managed via the Web UI or by editing `.job_board_schedule.jso
 - **Signal layers**: Edit `SEMANTIC_DEPTH_LAYERS` to add/remove technical signals
 - **IT noise**: Edit `IT_NOISE_PATTERNS` if you're getting false positives from certain tech stacks
 - **Clearance rules**: Edit `SECURITY_CLEARANCE_PATTERNS` if your visa situation changes
-- **Schedule**: Use the Web UI toggle + time inputs, or edit `.job_board_schedule.json` directly
-- **Server IP**: Update the URL in `job_board.py` line 979 and the README if your IP changes
+- **Schedule**: 編輯 `deploy/jobscan.timer` 的 `OnCalendar=`（**不是** Web UI，也不是
+  `.job_board_schedule.json` —— 那兩個都已停用，見上一節）
+- **Bind address / 標籤**: 用環境變數 `JOB_BOARD_HOST`、`JOB_BOARD_PORT`、`JOB_BOARD_LABEL`
+  （`deploy/jobboard.service` 內可覆寫），不必改程式碼
 
 ---
 
 ## Troubleshooting
 
 **Scheduled search didn't run?**
-- The auto-scheduler only works while `job_board.py` is running. Check `ps aux | grep job_board`.
-- If it was running, check `job_board.log` for errors.
+- 排程**不再依賴看板是否活著**。先看 timer：`systemctl --user list-timers jobscan.timer --all`
+  （LAST 應是最近的 06:00 或 22:00）。
+- 再看掃描本身：`systemctl --user status jobscan.service` 與 `tail logs/cron_search.log`。
+- 若 `cron_search.log` 出現 `SKIPPED`，代表當下有另一個掃描持有 `logs/jobscan.lock`
+  （手動或看板觸發）—— 這是預期行為，不是故障。
+- 電腦休眠過 → `Persistent=true` 會在喚醒後補跑一次，這是改用 timer 的主因。
 
 **No results for a search term?**
 - JobSpy rate limits aggressively. Wait a few minutes between runs.

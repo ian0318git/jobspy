@@ -14,8 +14,14 @@ Environment=PYTHONUNBUFFERED=1
 # 走 run_scan.sh：flock 保證 timer / dashboard / 手動三條路徑共用同一把鎖，
 # 全機同時間只會有一個爬蟲。狀態檔與即時日誌也由它維護（看板據此顯示進度）。
 ExecStart=/home/ian/github-project/jobspy/run_scan.sh systemd-timer
-# 正常一輪約 19 分鐘，而 systemd 對 oneshot 的預設 TimeoutStartSec 是 90 秒
-# —— 不設的話每一次正常執行都會被殺掉。
+# 正常一輪約 19 分鐘。這裡設 5h **不是**在修正一個太短的預設值 ——
+# Type=oneshot 未設 TimeoutStartSec 時，systemd 給的是 **無限**（實測：
+# apt-daily / fstrim / man-db / systemd-update-utmp 皆為 TimeoutStartUSec=infinity。
+# 全機 DefaultTimeoutStartUSec 是 1min30s，但那不適用於 oneshot）。
+# 要設有限值的真正理由是：無限逾時下，一旦有一輪卡死就會永遠停在 activating，
+# 而 Type=oneshot 一次只允許一個 instance → 之後每一次 timer 觸發都被當成
+# 「已在跑」整批吞掉，22:00 再也不會執行，但 list-timers 仍顯示漂亮的 NEXT
+# —— 2026-09-17 那次 50 小時卡死就是同一種病。
 #
 # 為什麼是 5h 而不是像 alpha-validator 那樣設 0（無限）：
 # 理論最差 = 48 個搜尋詞 × SCRAPE_TIMEOUT 300 秒 = 14400s = 4 小時，是有界的，
