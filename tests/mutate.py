@@ -326,6 +326,21 @@ try:
         out = r.stdout + r.stderr
         passed = len(re.findall(r"\[PASS\]", out))
         failed = len(re.findall(r"\[FAIL\]", out))
+
+        # ⚠️ 測試檔【必須跑到底】才算數。第八輪實測：M4（拿掉 phase 閘門）會讓
+        # F4 那段走到真的 systemctl，被最底層那把「指令含 kill 就拋例外」的跳線
+        # 當場拋出 AssertionError → 整個測試檔崩潰 → `[FAIL]` 數是 **0**。
+        # 只看 `failed > 0` 的判定會把這記成「逃脫」——也就是說【最嚴重的變異
+        # 看起來最無害】，而且判定還會隨生產 unit 當下的狀態翻來翻去。
+        # 症狀是「PASS 數遠低於基準」：這裡用收尾標記判定，不看數字。
+        done = "✅ 全數通過" in out or "項失敗：" in out
+        if not done:
+            results.append((mid, full, f"{passed}P/{failed}F rc={r.returncode}",
+                            "測試檔未跑完（崩潰？）—— 這不是逃脫", "INCONCLUSIVE"))
+            print(f"{full:44s} ⚠️  測試檔【未跑完】({passed}P/{failed}F "
+                  f"rc={r.returncode}) —— INCONCLUSIVE，不是逃脫，請查因")
+            continue
+
         if failed > 0:
             verdict, kind = "✅ 被逮", "CAUGHT"
         else:

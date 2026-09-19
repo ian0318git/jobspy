@@ -67,8 +67,14 @@ _REAL_KILL_EXTERNAL = jb.kill_stalled_external
 #   1. 用 mock.patch.object(jb.subprocess, "run", ...) 攔下所有 systemctl 呼叫 ——
 #      systemd 分支的判斷依據是【生產 unit 的即時狀態】，這是唯一會漏出去的縫；
 #   2. 優先用 trigger="manual" 走 PID 路徑，並讓 pid 指向本測試自己生的誘餌行程。
-# 目前唯一的例外是 F7b：它【故意】要驗證 systemd 分支會開火，因此 subprocess.run
+# F7b 是相反的極端：它【故意】要驗證 systemd 分支會開火，因此 subprocess.run
 # 全程被 mock 掉，只檢查有沒有下達正確的指令，絕不接觸真的 unit。
+#
+# ⚠️ 2026-09-20 第八輪：上面這條鐵律在寫下它的同一輪就被違反了 —— F4 沒有攔
+# subprocess.run（F4b／F4c 都攔了）。這正是這段註解自己在抱怨的那件事：「聲稱的
+# 保護範圍與實際不符」。一個寫在註解裡的規則不會自己執行，所以要靠變異測試
+# （M4）與 tests/mutate.py 的「測試檔是否跑到底」判定來當第二道。兩者本輪都補了。
+# 教訓：規則要寫在【會被執行】的地方，註解只能解釋它，不能代替它。
 
 
 def _noop_kill_external(*_a, **_k):
@@ -463,14 +469,43 @@ wait_dead(wrapper)
 
 # F4：kill_stalled_external() 的兩道身分閘門。
 # 用真實的 state 檔內容，但 phase=finished —— 這正是審查重現誤殺時的情境。
+#
+# ⚠️ 2026-09-20 第八輪：這一段【原本沒有攔 subprocess.run】（F4b／F4c 都攔了，
+# 只有它漏掉）。它用 trigger="systemd-timer"，而 systemd 分支的判斷依據是
+# 【生產 unit 的即時狀態】—— 所以 phase 閘門一旦失效（變異 M4），這裡就會一路
+# 走到 `systemctl --user kill --signal=SIGKILL jobscan.service`。今天實際攔下它的
+# 是【最底層那把「指令含 kill 就拋例外」的跳線】，而不是設計。後果有兩個：
+#   (a) 若當下真有一輪生產掃描在跑（06:00／22:00 的窗口約 19 分鐘），就會殺掉它；
+#   (b) 更陰險的是即使沒殺成，跳線拋的例外會讓整個測試檔【當場崩潰】，而崩潰的
+#       行程 `[FAIL]` 數是 0 —— tests/mutate.py 於是把 M4 記成「逃脫」。
+#       今天 09:00 jobscan.service 正好是 activating，M4 就是這樣從「被逮」
+#       翻成「逃脫」的。也就是說：【同一個變異的判定取決於生產 unit 當下的狀態】，
+#       這種數字正是本專案已經被燒過三次的那一種。
+# 修法沿用 F4b 的兩層（見下方 F4b 的註解），這裡補的是第一層。
+class _FakeRunActivating:
+    returncode = 0
+    stdout = "activating\n"     # 假裝 unit 正在跑 —— 正是「殺了會很慘」的狀態
+
+
+f4_syscalls = []
+
+
+def _fake_run_f4(cmd, **kw):
+    f4_syscalls.append(cmd)
+    return _FakeRunActivating()
+
+
 with mock.patch.object(jb, "read_jobscan_state",
                        return_value={"phase": "finished", "pid": bystander.pid,
                                      "run_id": "stale_000000", "trigger": "systemd-timer"}):
     with mock.patch.object(jb, "_external_idle_seconds",
                            return_value=jb.SEARCH_STALL_TIMEOUT + 100):
         with mock.patch.object(jb, "_we_hold_scan_lock", return_value=False):
-            killed = _REAL_KILL_EXTERNAL()
+            with mock.patch.object(jb.subprocess, "run", side_effect=_fake_run_f4):
+                killed = _REAL_KILL_EXTERNAL()
 check("state 自稱 finished 時，即使沉默超時也不得動手", killed is None, f"回傳={killed!r}")
+check("（承上）phase=finished 時連 systemctl 都不該被呼叫（讀的也不該）",
+      f4_syscalls == [], f"實際呼叫={f4_syscalls}")
 # ⚠️ 不可以寫 `bystander.poll() is None`。SIGKILL 送出到子行程真的死掉之間有窗口，
 # `poll()` 若在窗口內呼叫會回 None —— 於是「該被殺」的變異體【假通過】。
 # 第六輪審查實測：M5 之下這一項 20 次裡有 2 次假通過，讓 `tests/mutate.py` 的
@@ -1458,6 +1493,18 @@ check(
     and jb._parse_timer_calendar("garbage without the marker") is None,
     f"空字串→{jb._parse_timer_calendar('')!r} "
     f"垃圾→{jb._parse_timer_calendar('garbage without the marker')!r}",
+)
+
+# 第八輪：`next_iso is None` 有兩種意思，banner 不可以一律印成「(無)」。
+# 實測（probe）：「timer 正在跑 service」時 systemd 會回 NextElapseUSecMonotonic=
+# infinity、list-timers NEXT="-" —— 而且服務一結束就恢復。這是正常的，一天兩次。
+_t_ok = jb._timer_next_text({"installed": True, "next_iso": "2026-09-20T22:00:00"})
+_t_run = jb._timer_next_text({"installed": True, "next_iso": None})
+_t_gone = jb._timer_next_text({"installed": False, "next_iso": None})
+check(
+    "banner 的『下次觸發』必須區分【沒裝】與【執行中還沒算】（第八輪）",
+    _t_ok == "2026-09-20T22:00:00" and _t_run != "（無）" and _t_gone == "（無）",
+    f"有值→{_t_ok!r} 執行中→{_t_run!r} 未安裝→{_t_gone!r}",
 )
 
 # m5：前端 `catch(e){console.error(e)}` 會把「請求被拒絕」變得與「存檔成功」

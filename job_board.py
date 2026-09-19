@@ -1306,6 +1306,28 @@ def get_timer_state():
     return result
 
 
+def _timer_next_text(t):
+    """啟動 banner 的「下次觸發」文字。抽成函式是為了可測（第八輪）。
+
+    ⚠️ `next_iso is None` 有【兩種完全不同的意思】，一律印成「(無)」是錯的：
+      (a) timer 沒裝／沒時段 → 真的沒有下一次。這是必須當成故障看的。
+      (b) timer 正在跑它的 service → systemd 還沒算下一次。
+          2026-09-20 本機實測（暫時性 probe，jwprobe.timer → sleep 20）：
+              服務執行中  NextElapseUSecMonotonic=infinity   list-timers NEXT="-"
+              服務結束後  NextElapseUSecMonotonic=0           list-timers NEXT=下一個 :00
+          也就是說這是【正常且會自己恢復】的狀態，一天發生兩次、各約 19 分鐘。
+          順帶一個陷阱：同一段時間 `TimersCalendar` 的 `next_elapse=` 會停在
+          【已經過去】的值（06:00 那行在 08:49 仍顯示 06:00），所以它【不能】
+          拿來當 next_iso 的退路 —— 那會把一個過去的時間標成「下次」。
+    這一則要修的理由是它跟本專案反覆在抓的幽靈排程【方向相反】：不是承諾一件
+    不會發生的事，而是否認一件會發生的事。啟動時剛好撞上掃描窗口的話，看板上
+    會留下「下次觸發: (無)」，而真相是 22:00 一定會跑。
+    """
+    if t.get("next_iso"):
+        return t["next_iso"]
+    return "（掃描執行中，systemd 尚未計算下一次）" if t.get("installed") else "（無）"
+
+
 SCHEDULE_CONFIG = load_schedule()
 SCHEDULE_STOP = threading.Event()
 
@@ -2467,7 +2489,7 @@ if __name__ == "__main__":
         _t = get_timer_state()
         _out(f"   Sched: 內建排程器 DISABLED，主權在 systemd timer "
              f"({'已安裝' if _t['installed'] else '⚠️ 未安裝'})")
-        _out(f"          下次觸發: {_t['next_iso'] or '(無)'}")
+        _out(f"          下次觸發: {_timer_next_text(_t)}")
     _out(f"   Scan : 外部掃描監看中（{JOBSCAN_LOCK}）")
     _out("=" * 60)
     try:
