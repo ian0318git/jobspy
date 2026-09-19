@@ -246,6 +246,10 @@ MUTATIONS = [
         "                    times = sorted(cfg.get(\"times\") or [\"06:00\", \"22:00\"])\n",
         "                    times = cfg.get(\"times\", [\"06:00\", \"22:00\"])\n",
         "M20")),
+    # 第三道鎖：這道是三道鎖裡唯一擋得住 curl／devtools 的，到第六輪為止沒有測試。
+    ("M21", "第三道鎖失效（停用中仍可用 API 重新武裝內建排程器）", lambda t: sub_once(
+        t, "                if want and not INTERNAL_SCHEDULER:\n",
+        "                if False:\n", "M21")),
 ]
 
 results = []

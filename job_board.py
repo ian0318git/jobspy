@@ -1248,8 +1248,8 @@ def _valid_times(value):
     重構把它變成了靜默失敗，這是絕不允許的方向。
 
     【保持原順序】不回傳排序後的結果：`times` 的順序是使用者在面板上看到的順序，
-    在這裡偷偷排序是使用者可見的行為改變。排序只在計算 next_run 時做
-    （`_compute_next_run` 內），那裡才是語意上需要它的地方。
+    在這裡偷偷排序是使用者可見的行為改變。排序只發生在【需要順序語意】的地方
+    —— `_compute_next_run()` 與 `scheduler_loop()` 裡算下一個時段的那兩處。
     """
     if not isinstance(value, list) or not value:
         return None

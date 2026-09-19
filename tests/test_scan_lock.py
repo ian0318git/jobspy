@@ -1176,6 +1176,24 @@ check(
     f"真bool→enabled={_k_bool_cfg['enabled']} warning={_k_bool_resp.get('warning')!r}",
 )
 
+# ── 第三道鎖：內建排程器停用時，`enabled` 不得被重新武裝 ──────────────────────
+# 這是三道鎖裡**唯一擋得住 curl／devtools 繞過前端**的那道，而它到第六輪為止
+# **從來沒有任何測試**。少了它，兩條觸發路徑同時存在＝2026-08-13 的並發事故
+# （同一小時兩個新檔）。這道鎖的存在理由是「前端唯讀」只是 UI 層的禮貌。
+_k_rearm_cfg, _k_rearm_resp = _post_schedule({"enabled": True}, internal=False,
+                                             enabled=False)
+# 反向控制：關閉必須【永遠】有效 —— 否則這道鎖會順手把「停用排程」也擋掉，
+# 而那是一件無害且必要的事。
+_k_off_cfg, _ = _post_schedule({"enabled": False}, internal=False, enabled=True)
+check(
+    "內建排程器停用時 enabled 不得被重新武裝（第三道鎖）；但關閉必須永遠有效",
+    _k_rearm_cfg["enabled"] is False and _k_rearm_resp.get("warning")
+    and _k_off_cfg["enabled"] is False,
+    f"重新武裝→enabled={_k_rearm_cfg['enabled']} "
+    f"warning={(_k_rearm_resp.get('warning') or '')[:40]!r} "
+    f"關閉→enabled={_k_off_cfg['enabled']}",
+)
+
 # ═══ 結果 ════════════════════════════════════════════════════════════════════
 print()
 if FAILURES:
