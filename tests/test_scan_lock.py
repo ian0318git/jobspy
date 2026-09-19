@@ -19,6 +19,7 @@ jobscan-watch 三個背景執行緒（既有設計，非本測試引入）。wat
 可觀測的不變式（過期 owner 絕不生效、併發猛敲後狀態仍正確、無 fd 洩漏），
 窗口本身是否關閉則以程式碼閱讀佐證（兩行已被 `with SEARCH_LOCK:` 包住）。
 """
+import ast
 import atexit
 import contextlib
 import io
@@ -28,6 +29,7 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import job_board as jb  # noqa: E402
@@ -753,8 +755,14 @@ print("=== H. 日誌整行一次 write（print() 的換行會被別的行吃掉�
 # 「不穩定的測試」，本專案已經吃過那個虧（比沒有測試更糟）。
 #
 # 改成斷言 race 的【成因】，這是決定性的：print() 一定是兩次 write()。
-# 只要 _out() 對每一行只呼叫一次 write()，黏行在結構上就不可能發生 ——
-# 因為 O_APPEND 下的單次 write() 具原子性。
+# 只要 _out() 對每一行只呼叫一次 write()，黏行在結構上就不可能發生。
+#
+# 措辭要精確：**不是** O_APPEND 本身給了原子性（它只保證 offset 設到檔尾）。
+# 不交錯來自 Linux 核心對同一 inode 的 write(2) 以 i_rwsem 序列化；POSIX 對一般
+# 檔案並沒有保證這件事（PIPE_BUF 的保證只適用 pipe/FIFO，且只到 4096 bytes）。
+# 另外，這個因果的**必要前提是 stdout 不緩衝**（unit 裡的 PYTHONUNBUFFERED=1）——
+# 第五輪審查用有緩衝的檔案實測，print 竟然是 0 黏行。完整數據見 job_board.py
+# 的 _out() 上方註解。
 
 
 class _WriteRecorder(io.TextIOBase):
@@ -781,11 +789,39 @@ check(
     f"write() 次數={len(_rec.calls)}  內容={_rec.calls!r}",
 )
 
-# 下面這一項是【一般性煙霧測試】，不是上面那個缺陷的守衛 ——
-# 已實測：M11（把 _out 退回 print）在這一項也會通過。留著是因為它驗證的是
-# 另一個性質（高併發下每一行都完整、沒有遺失或被截斷），那個性質上面那項沒涵蓋。
-_H_BUF = io.StringIO()
+# 下面這一項原本只是【一般性煙霧測試】：用 8 執行緒對 StringIO 猛寫、斷言沒有
+# 黏行 —— 而 M11（把 _out 退回 print）在它底下照樣通過，所以它守不住任何東西。
+#
+# 第五輪審查給了讓它復活的第三條路（不必刪、也不必只當煙霧測試）：**讓假 stdout
+# 的 write() 主動讓出 GIL**。StringIO 太快是問題的根源；`time.sleep(0)` 會強制
+# 排程器換手，print 的兩次 write() 就真的會交錯。審查實測（5 輪無重疊）：
+#
+#   假 stdout                     print(flush=True)      單次 write（現行）
+#   （不讓出 GIL）                0 黏行（測不出來）      0 黏行
+#   write() 內 sleep(0)           黏 67–88 / 320 行       0 / 320 行
+#
+# 但真正讓它成為【決定性】守衛的不是 sleep(0)，而是把斷言從「串接後再 split」
+# 改成「逐次檢查 write() 呼叫」：_out() 對每行只呼叫一次 write()，所以每一次
+# 呼叫都必須是「一整行、含結尾換行」。print 會產生兩個呼叫 —— 內容（無換行）
+# 與裸的 "\n" —— 兩個都不符合，當場失敗。sleep(0) 只是讓 race 真的發生，
+# 是加強而非機制。
 _H_T, _H_L = 8, 40
+_H_LINE = re.compile(r"^\[\d\d:\d\d:\d\d\] thread=\d+ line=\d+\n$")
+
+
+class _ConcurrentRecorder(io.TextIOBase):
+    """假的 stdout：記錄每一次 write() 呼叫，並在呼叫時讓出 GIL。"""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def write(self, s: str) -> int:      # type: ignore[override]
+        time.sleep(0)
+        self.calls.append(s)
+        return len(s)
+
+    def flush(self) -> None:
+        time.sleep(0)
 
 
 def _h_spam(tid: int) -> None:
@@ -793,23 +829,63 @@ def _h_spam(tid: int) -> None:
         jb._log(f"thread={tid} line={i}")
 
 
-with contextlib.redirect_stdout(_H_BUF):
+_rec2 = _ConcurrentRecorder()
+with contextlib.redirect_stdout(_rec2):
     _h_ts = [threading.Thread(target=_h_spam, args=(t,)) for t in range(_H_T)]
     for _t in _h_ts:
         _t.start()
     for _t in _h_ts:
         _t.join()
 
-_h_lines = _H_BUF.getvalue().splitlines()
-# 黏行的精確特徵：同一行出現兩個以上的時戳。背景 watchdog 若剛好也寫一行，
-# 那行只會有一個時戳、且不符合下面的完整樣式，不會造成偽陽性。
-_merged = [ln for ln in _h_lines if len(re.findall(r"\[\d\d:\d\d:\d\d\]", ln)) > 1]
-_intact = [ln for ln in _h_lines
-           if re.match(r"^\[\d\d:\d\d:\d\d\] thread=\d+ line=\d+$", ln)]
+# 只看本測試自己產生的 write()（背景 watchdog 可能插進來寫它自己的行）。
+# 黏行的精確特徵是「一次 write() 裡有兩個以上時戳」——那代表兩行被融合。
+_h_mine = [c for c in _rec2.calls if "thread=" in c]
+_h_whole = [c for c in _h_mine if _H_LINE.match(c)]
+_h_glued = [c for c in _h_mine if len(re.findall(r"\[\d\d:\d\d:\d\d\]", c)) > 1]
 check(
-    "併發 _log() 時每一行都必須完整無缺（煙霧測試，見上方說明）",
-    len(_intact) == _H_T * _H_L and not _merged,
-    f"完整行={len(_intact)}/{_H_T * _H_L} 黏行={len(_merged)}",
+    "併發下每一次 write() 都必須是【一整行含換行】（print 會拆成兩次，當場失敗）",
+    len(_h_whole) == _H_T * _H_L and not _h_glued,
+    f"write() 呼叫={len(_h_mine)}  完整行={len(_h_whole)}/{_H_T * _H_L}  黏行={len(_h_glued)}",
+)
+
+# ═══ I. 靜態不變式：模組裡不得有 live 的 print() ═══════════════════════════════
+# H 區只觀測 _log() 這一條路徑。第五輪審查指出具體的失敗情境：有人在 scheduler
+# 或 watchdog 執行緒加一行 print("[timer] ...", flush=True) —— H 區全部照過，
+# 而審查實測該寫法在生產設定下黏 139/2400 行。模組級的不變式不能只活在註解裡。
+#
+# 用 AST 而不是 grep，因為 grep 分不出「程式碼」與「註解／docstring」——
+# job_board.py 的 _out() 上方就有一大段「print 為什麼不能用」的說明，
+# grep 會把它們全部算成違規（偽陽性），然後就會有人把這個測試關掉。
+_jb_src = Path(jb.__file__).read_text(encoding="utf-8")
+_jb_ast = ast.parse(_jb_src)
+
+_out_node = next((n for n in ast.walk(_jb_ast)
+                  if isinstance(n, ast.FunctionDef) and n.name == "_out"), None)
+# _out() 自己的 sys.stdout.write 是唯一合法的直接寫入點。
+_out_span = (_out_node.lineno, _out_node.end_lineno) if _out_node else (0, 0)
+
+
+def _is_direct_stdout_write(node: ast.AST) -> bool:
+    f = getattr(node, "func", None)
+    return (isinstance(f, ast.Attribute) and f.attr == "write"
+            and isinstance(f.value, ast.Attribute)
+            and f.value.attr in ("stdout", "stderr")
+            and isinstance(f.value.value, ast.Name)
+            and f.value.value.id == "sys")
+
+
+_stdout_calls = [
+    n.lineno for n in ast.walk(_jb_ast) if isinstance(n, ast.Call)
+    and (isinstance(n.func, ast.Name) and n.func.id == "print"
+         or _is_direct_stdout_write(n))
+]
+_violations = [ln for ln in _stdout_calls
+               if not (_out_span[0] <= ln <= _out_span[1])]
+check(
+    "job_board.py 不得有 live 的 print()／直接 sys.stdout.write（一律走 _out）",
+    _out_node is not None and not _violations,
+    f"違規行={_violations}" if _violations else
+    f"_out 位於 {_out_span}，其餘 {len(_stdout_calls)} 處皆在 _out 內",
 )
 
 # ═══ 結果 ════════════════════════════════════════════════════════════════════

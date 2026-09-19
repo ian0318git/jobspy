@@ -671,12 +671,34 @@ def _external_idle_seconds():
 # （23:05 那次啟動正常、23:39 那次黏住 —— 是間歇性的 race，不是每次都會中。）
 # 這正好抵銷 _log() 加時戳的目的：加時戳就是為了對齊，黏行反而更難追。
 #
-# 【真正有效的是「整行一次 write()」】—— O_APPEND 下的單次 write() 具原子性，
-# 所以一行只要一次 write()，黏行在結構上就不可能發生。這是被變異測試逼出來的
-# 結論，不是推理：M12（保留鎖、改用 print 的兩次 write）會被逮捕，而
-# M13（拿掉鎖、保留單次 write）**逃脫** —— 也就是說下面這把鎖【不是】load-bearing，
-# 目前沒有任何測試能證明少了它會出問題。留著是 defence in depth（而且成本在這種
-# 日誌量下可忽略），但**不要以為它是那個修正**。詳見 DECISIONS.md 第四輪條目。
+# ⚠️【必要前提：stdout 必須不緩衝】—— 少了這句，上面的因果就不成立。
+# 第五輪審查用【有緩衝】的檔案實測：print 在 3200+2400 行、8 執行緒下 0 黏行，
+# 一度以為診斷錯了。真正讓它現形的是 unit 裡的 `Environment=PYTHONUNBUFFERED=1`
+# （deploy/jobboard.service、jobscan.service 都有）—— 不緩衝才會把 print 的
+# 兩次 write 變成兩次真正的 write(2) syscall，交錯才是必然。同條件下的對照：
+#
+#   PYTHONUNBUFFERED=1、O_APPEND 檔案、8 執行緒   print        單次 write
+#     短行 (~120B)                              139/2400 黏   0/4800 黏
+#     12 KB 行                                  314/2043 黏   0/4800 黏
+#
+# **若有人拿掉 PYTHONUNBUFFERED，或把日誌改成 `StandardOutput=journal`（socket／
+# pipe），這個註解描述的因果就不再成立，而沒有任何測試會提醒。** 見下方。
+#
+# 【真正有效的是「整行一次 write()」】。措辭要精確：**不是** O_APPEND 本身給了
+# 原子性 —— O_APPEND 只保證「offset 設到檔尾且中間沒有其他修改介入」。不交錯來
+# 自 Linux 核心對同一 inode 的 write(2) 以 i_rwsem 序列化；**POSIX 對一般檔案並
+# 沒有保證這件事**（`PIPE_BUF` 的原子性保證只適用 pipe/FIFO，且只到 4096 bytes）。
+# 這是被變異測試逼出來的結論，不是推理：M12（保留鎖、改用 print 的兩次 write）
+# 會被逮捕，而 M13（拿掉鎖、保留單次 write）**逃脫** —— 也就是說下面這把鎖
+# 【不是】load-bearing，目前沒有任何測試能證明少了它會出問題。
+#
+# ⚠️ 這個「鎖不是 load-bearing」的結論**限縮在今天的部署前提**：日誌目標是
+# **本地檔案**、且行長遠小於 PIPE_BUF（實測 job_board.log 最長行 203 bytes、
+# cron_search.log 353 bytes）。若改成 pipe/journal 且行長超過 4096，鎖就會變成
+# load-bearing —— 第五輪審查**未能實測重現**那個情境（四種實作在真實 pipe 下
+# 都 0 黏行），所以那是理論風險、不是已知事實。留著鎖是 defence in depth
+# （成本在這種日誌量下可忽略），但**不要以為它是那個修正**。
+# 詳見 DECISIONS.md 第四、五輪條目。
 _LOG_LOCK = threading.Lock()
 
 
@@ -686,6 +708,7 @@ def _out(line: str = "") -> None:
     整行一次 write() 是機制本身（見上方說明）；鎖只是額外的序列化。
     【不要】在這個模組裡用 print() 輸出會與背景執行緒競爭的訊息
     （watchdog / jobscan 監看 / 掃描生命週期）—— 一律走這裡。
+    `tests/test_scan_lock.py` 的 I 區有一條 AST 掃描會讓違規當場 FAIL。
     """
     with _LOG_LOCK:
         sys.stdout.write(f"{line}\n")
