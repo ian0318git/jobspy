@@ -118,14 +118,14 @@ tail -f logs/cron_search.log
 
 ## 測試覆蓋（誠實聲明）
 
-**這個專案的自動化測試只有一支**：`tests/test_scan_lock.py`（56 項檢查）。
+**這個專案的自動化測試只有一支**：`tests/test_scan_lock.py`（58 項檢查）。
 其餘全部是手動驗證 —— 上面各節的「驗證」指令就是手動程序。
 
 ```bash
 cd /home/ian/github-project/jobspy
 .venv/bin/python tests/test_scan_lock.py     # 通過時印「✅ 全數通過」且 exit 0
 
-# 要引用「幾項」時用這個量，不要憑印象寫 —— 這個數字已經腐化過四次（28→39→53→55→56）：
+# 要引用「幾項」時用這個量，不要憑印象寫 —— 這個數字已經腐化過五次（28→39→53→55→56→58）：
 .venv/bin/python tests/test_scan_lock.py | grep -c '\[PASS\]'
 ```
 
@@ -141,6 +141,7 @@ cd /home/ian/github-project/jobspy
 | G | 4 | `errors="replace"` 與 TOCTOU 重檢的回歸保護（第四輪退回） |
 | H | 3 | 日誌每行必須**一次** `write()` 寫出（第五輪退回，見下） |
 | I | 1 | `job_board.py` 不得有 live 的 `print()`（第五輪退回） |
+| J | 2 | 啟動時的排程主權轉移：兩個方向都要正確（見「回復到舊制」一節） |
 
 > **H 區的 `PYTHONUNBUFFERED` 前提**：黏行的成因（`print` 拆成兩次 `write()`）
 > 只有 stdout **不緩衝**時才會顯現 —— 第五輪審查用有緩衝的檔案實測，`print`
@@ -180,13 +181,18 @@ cd /home/ian/github-project/jobspy
 變異，代表那個修正沒有被測試覆蓋。**
 
 > ⚠️ **這個工具不會碰生產目錄。** 第五輪審查抓到：舊版直接改寫 repo 裡的
-> `job_board.py`，13 個變異每個會在磁碟上存在 5–25 秒，而 `jobboard.service` 是
-> `Restart=always` + `MemoryMax=512M` —— 若這段窗口內被 OOM 殺掉而重啟，
+> `job_board.py`，當時的 13 個變異每個會在磁碟上存在 5–25 秒，而 `jobboard.service`
+> 是 `Restart=always` + `MemoryMax=512M` —— 若這段窗口內被 OOM 殺掉而重啟，
 > **新行程載入的就是那個變異**（清單裡有 M5／M6／M8，其中 M8 是停滯偵測整個
 > no-op）。現在改用 `git archive HEAD` 解到 `/tmp` 的隔離副本，生產檔案從頭到尾
 > 不被寫入，結束時以 sha256 驗證。
 
-四個踩過的坑，寫在這裡免得重蹈：
+> **變異表的數字是可重現的。** 這句話在 2026-09-20 之前是**假的** —— J 區有一項
+> 會間歇性失敗（見下方第五個坑），同一份程式碼連跑兩次會得到不同的 P/F。
+> 修掉之後連跑兩次逐項相同。**若你看到數字漂移，先當成有東西不穩定，不要當成
+> 「本來就會這樣」。**
+
+五個踩過的坑，寫在這裡免得重蹈：
 
 - **假變異**：改到註解的變異**不可能改變行為**，所以永遠不會 FAIL、永遠「逃脫」。
   看到「逃脫」先懷疑變異本身。
@@ -204,6 +210,20 @@ cd /home/ian/github-project/jobspy
   照理三項該響卻只有兩項。
   **變異測試不只驗證修正，也驗證了驗證本身。** 光看「測試通過」永遠不夠 ——
   唯一能區分的動作是把修正改回去，看它會不會響。
+- **⚠️ 綠燈也可能是運氣 —— 要連跑很多次才算數**：J 區（用子行程驗證啟動時的排程
+  轉移）20 次裡只有 14 次全綠。我第一次跑了 3 次都過就往下走了。
+  根因不是斷言，是**子行程的死法**：`python -c "import job_board"` 會啟動三個
+  daemon 執行緒，而 `-c` 一結束主執行緒就進入 interpreter finalization，那些
+  執行緒還在寫 stdout → `Fatal Python error: could not acquire lock for
+  <_io.BufferedWriter name='<stdout>'> at interpreter shutdown` → **SIGABRT**。
+  實測 forward 25 次中 3 次、reverse 25 次中 2 次。
+  **修法是子行程結尾用 `os._exit(0)` 跳過 finalization。**
+  > 這**不是**生產缺陷，已查證：`systemctl stop` 送 SIGTERM 時 Python 沒裝 handler
+  > （`signal.getsignal(SIGTERM)` 回 `0` = `SIG_DFL`），核心直接終止、不跑
+  > finalization，所以 journal 從 2026-09-19 至今 0 筆 ABRT。只有在「直譯器
+  > **正常結束**」時才會踩到。
+  > **但任何這裡新寫的測試只要用子行程 import `job_board`，就必須這樣收尾**，
+  > 否則你會得到一個隨機紅的測試，而隨機紅的測試最後會被人加 `|| true` 繞過。
 
 ### ⚠️ 未涵蓋（不要以為有測試就安全）
 
@@ -219,6 +239,12 @@ cd /home/ian/github-project/jobspy
   而 stray holder 持鎖時 state 停在上一輪的 `finished` → phase 閘門直接 return →
   **沒有任何機制會放掉那把鎖**。已知、未修，理由與解法見 `../DECISIONS.md`
   第四輪條目的「已知限制」。
+- **排程器「跑完之後」算下一次的那段沒被測到（已知、未修）**：`scheduler_loop()`
+  跑完一輪後用 `times[0]`（**未排序**）算下一個時段，而 UI 儲存那條用
+  `sorted(times)`。若 `times` 被存成 `["22:00","06:00"]` 且當天時段都已過，
+  排程器會算出「今天 22:00」而不是「明天 06:00」。**只有在內建排程器啟用時
+  才會走到**（目前主權在 timer），所以擱著；已記在 `job_board.py` 的
+  `_compute_next_run()` docstring 與 `../DECISIONS.md` 的已知限制。
 - **systemd 本身的行為**：`Persistent=true` 補跑、`Type=oneshot` 的逾時、
   `copytruncate` 輪替，都是實測記錄在 `../DECISIONS.md`，但**沒有回歸測試**
   —— 升級 systemd 或改 unit 後必須重測。
@@ -233,6 +259,26 @@ systemctl --user disable --now jobscan.timer jobboard-logrotate.timer
 systemctl --user edit jobboard.service    # 加：Environment=JOB_BOARD_INTERNAL_SCHEDULER=1
 systemctl --user restart jobboard.service
 ```
+
+**這份程序在 2026-09-20 之前是虛構的**，而且失敗得無聲無息：閘門打開後執行緒
+確實啟動（log 有 `Scheduler thread started`），但
+
+| 欄位 | 當時的結果 | 後果 |
+|---|---|---|
+| `schedule.enabled` | 停在 `false`（先前被啟動時壓平過） | 排程器**永遠不觸發** |
+| `schedule.managed_by` | 仍是 `"systemd-timer"` | 前端 `SCHEDULE_READONLY=true` → 面板唯讀，**無法從 UI 重新啟用** |
+| `schedule.next_run` | 沒算 | 面板顯示「下次執行：—」長達數小時 |
+
+也就是說：照著上面做完，你會得到一個**再也不會掃描、而畫面顯示排程由一個剛剛被
+停用的 timer 管理**的系統，只能手改 `.job_board_schedule.json` 才救得回來。
+現在啟動時會自動把 `managed_by` 設回 `internal`、`enabled` 還原、`next_run` 算出來，
+並在日誌印一行 `[scheduler] Internal scheduler ENABLED`。**J 區兩項檢查守著這件事，
+M14／M15 兩個變異確認它們真的會響。**
+
+> 為什麼選「自動啟用」而不是「把面板改成可編輯、讓使用者自己按」：設定這個環境
+> 變數的語意就是「我要舊制」，而舊制＝排程會運作。留成一個需要人再按一次才能動
+> 的狀態，等於把同一個坑換個位置。並發由 `run_scan.sh` 的 `flock` 吸收
+> （兩條路徑同時觸發只會有一個真的跑）。
 
 注意：內建排程器仍有那個**硬性 6 小時補跑視窗**，所以回復等於接受
 「12:30 之後才喚醒 → 整天不掃描」這個原始問題。

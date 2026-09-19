@@ -2,6 +2,96 @@
 
 重要決策紀錄 — 依專案工作流程要求更新。
 
+## 2026-09-20 — `deploy/README.md` 記載的復原程序是虛構的；以及一個隨機紅的測試
+
+第六輪施工。兩件事都是同一個形狀：**文件或綠燈讓你以為某件事成立，而它不成立。**
+
+### 1. 「回復到舊制」是靜默失敗（不是文件過期，是文件寫的事情沒發生）
+
+`deploy/README.md` 的「回復到舊制」一節寫著：停掉兩個 timer、在 `jobboard.service`
+加 `Environment=JOB_BOARD_INTERNAL_SCHEDULER=1`、重啟。這是這次遷移規劃時**刻意
+保留**的退路（「停用但保留」），也是風險表最後一列的復原方案。
+
+實測（2026-09-20）發現照做之後：
+
+| 欄位 | 結果 | 後果 |
+|---|---|---|
+| `schedule.enabled` | 停在 `false` | 排程器執行緒啟動了，但**永遠不觸發** |
+| `schedule.managed_by` | 仍是 `"systemd-timer"` | 前端 `SCHEDULE_READONLY=true` → 面板唯讀，**UI 也救不回來** |
+| `schedule.next_run` | 沒算 | 面板「下次執行：—」 |
+
+log 只印了 `[scheduler] Scheduler thread started` —— 看起來完全正常。
+使用者得到的是「再也不會掃描，而畫面顯示排程由一個剛剛被停用的 timer 管理」，
+只能手改 `.job_board_schedule.json`。**那份復原計畫等於是虛構的**，而它之所以
+沒被發現，是因為它從來沒被走過。
+
+修法：啟動時把 `managed_by` 設回 `internal`、`enabled` 還原、`next_run` 算出來，
+並印一行 `[scheduler] Internal scheduler ENABLED`。
+
+刻意選「自動啟用」而不是「把面板改成可編輯、讓使用者自己按」：設定這個環境變數
+的語意就是「我要舊制」，而舊制＝排程會運作。留成一個需要人再按一次才能動的狀態，
+等於把同一個坑換個位置。並發由 `run_scan.sh` 的 `flock` 吸收。
+
+**這裡的教訓與第三輪的 `kill_stalled_external` 完全一樣**：一個從來沒被走過的路徑，
+「程式碼還在」不等於「功能還在」。差別是這次連測試都沒有，只有一份文件在保證它。
+
+### 2. 順帶修掉的 drift：`next_run` 的兩份複製品
+
+`next_run` 原本在兩個地方各自計算（UI 儲存、啟動回復舊制），而**排程器跑完那條
+是第三份**。實際上已經 drift：UI 那條用 `sorted(times)`，排程器那條用 `times[0]`
+（未排序）。`times` 若被存成 `["22:00","06:00"]` 且當天時段都已過，排程器會把
+下一次算成「今天 22:00」（已過）而不是「明天 06:00」。
+
+抽成 `_compute_next_run()` 之後 UI 與啟動兩條共用（都沿用 `sorted()`）。
+**排程器迴圈那條刻意不改** —— 它要用「跑完的當下」而不是「現在」來算，語意不同；
+那個 `times[0]` 的排序問題仍待處理，記在 `job_board.py` 的 docstring 與本檔的
+已知限制。重構前先取了四個 POST 案例的基準輸出，重構後逐字比對相同。
+
+### 3. MAJOR（自己踩到）：J 區的兩個檢查有 ~10% 機率隨機失敗
+
+新加的 J 區（子行程驗證啟動時的排程主權轉移）在 **20 次基線裡只有 14 次全綠**。
+我第一次跑 3 次都過就往下走了 —— 那 3 次是運氣。
+
+根因不是斷言，是**子行程的死法**：`python -c "import job_board"` 會在模組層啟動
+watchdog / jobscan 監看 / 排程器三個 daemon 執行緒，而 `-c` 一結束主執行緒就進入
+interpreter finalization，那些執行緒還在寫 stdout：
+
+```
+Fatal Python error: could not acquire lock for
+<_io.BufferedWriter name='<stdout>'> at interpreter shutdown,
+possibly due to daemon threads
+Python runtime state: finalizing
+```
+
+→ SIGABRT（rc = -6）。實測 forward 25 次中 3 次、reverse 25 次中 2 次。
+斷言本身一直是對的，是**子行程的死法**讓 `returncode != 0` 那條分支被走進去。
+
+修法：子行程結尾 `os._exit(0)` 跳過 finalization。不削弱這一區 —— 排程檔是
+import 期間同步寫完的，斷言讀磁碟內容；`save_schedule()` 若沒被呼叫，讀回來的
+就是 seed 本身，兩項都會 FAIL（M14/M15 已驗證）。
+
+**這不是生產缺陷，已查證**：`systemctl stop` 送 SIGTERM 時 Python 沒裝 handler
+（實測 `signal.getsignal(SIGTERM)` 回 `0` = `SIG_DFL`），核心直接終止、不跑
+finalization。journal 從 2026-09-19 至今 0 筆 ABRT/core-dump，七次重啟全乾淨。
+只有在「直譯器**正常結束**」時才會踩到 —— 也就是這個測試寫法本身。
+
+**連帶影響**：這件事讓「變異表的數字可重現」這句話一度變成假的（同一份程式碼
+連跑兩次得到不同的 P/F）。修掉之後連跑兩次逐項相同。
+
+> ⚠️ **這已經是這個專案第四次「綠燈不代表有效」**：
+> 第三輪 `kill_stalled_external` no-op 後 39/39 全過、第四輪 `errors="replace"`
+> 拿掉也全過、第五輪 H 區沒逮到它自己要保護的修正、I 區 AST 掃描把 `_out` 整段
+> 豁免導致根本沒開火。這次是第五種形狀：**測試會響，但隨機不響**。
+> 前四次的解法是「把修正改回去看它會不會響」；這次那個方法不夠 ——
+> **要連跑很多次**。單次綠燈的資訊量比想像中低。
+
+### 已知限制（本輪新增）
+
+- **排程器跑完後算 `next_run` 那段仍用未排序的 `times[0]`**（見第 2 點）。
+  只在內建排程器啟用時才會走到，目前主權在 timer，所以擱著。**沒有測試覆蓋。**
+- **任何新寫的子行程測試若 import `job_board`，都必須以 `os._exit()` 收尾**，
+  否則會得到隨機紅的測試。已寫進 `deploy/README.md` 的踩坑清單。
+
 ## 2026-09-20 — 變異工具在生產主機上、以及三個「有修正沒守衛」的補強（第五輪審查）
 
 第五輪 Senior Reviewer 對 `46a8fff` 判定 **`[REVIEW_PASSED]`**，附 1 個 MAJOR 與
@@ -282,30 +372,39 @@ H 區第一版用 8 執行緒 × 40 行對 `StringIO` 猛寫，斷言沒有黏�
 **不是** 這個缺陷的守衛（M11 也會通過它）。繼續宣稱它有保護作用，
 就是同一種錯用小包裝再犯一次。
 
-### 第五輪變異測試結果（`tests/mutate.py`，13 個變異，12 被逮、1 已知逃脫）
+### 變異測試結果（`tests/mutate.py`，15 個變異，14 被逮、1 已知逃脫）
 
 變異工具從 `/tmp` 搬進版控（`tests/mutate.py`），**上面每一個「被逮」的宣稱
 都可以用一行指令重跑**。
 
+數字為 2026-09-20 第六輪的實跑快照（測試 58 項，**連跑兩次逐項相同**）。
+
 | 變異 | 內容 | 結果 |
 |---|---|---|
-| M1 | 孤兒回收判準改回 `proc is not None` | 55P / 1F ✅ |
-| M2 | 拿掉 `_read_search_output` 的 try/finally | 55P / 1F ✅ |
-| M3 | 拿掉 `Popen(errors="replace")` | 55P / 1F ✅ |
-| M4 | 拿掉 `kill_stalled_external` 的 phase 閘門 | 54P / 2F ✅ |
-| M5 | 拿掉 cmdline 身分檢查 | 55P / 1F ✅ |
-| M6 | 拿掉 systemd 分支的 ActiveState 前置檢查 | 54P / 2F ✅ |
-| M7 | 拿掉 `_external_begin` 身分閘門 | 54P / 2F ✅ |
-| M8 | `kill_stalled_external` 整個 no-op | 51P / 5F ✅ |
-| M9 | 拿掉 TOCTOU 重檢 | 55P / 1F ✅ |
-| M10 | `_pid_is_our_scan` 退回子字串比對 | 55P / 1F ✅ |
-| M11 | `_out` 退回 `print()`（修正前行為、無鎖） | 53P / 3F ✅ |
-| M12 | 保留鎖但用 `print()`（兩次 write） | 53P / 3F ✅ |
-| M13 | 拿掉鎖、保留單次 write | 56P / 0F ⚠️ **已知逃脫** |
+| M1 | 孤兒回收判準改回 `proc is not None` | 57P / 1F ✅ |
+| M2 | 拿掉 `_read_search_output` 的 try/finally | 57P / 1F ✅ |
+| M3 | 拿掉 `Popen(errors="replace")` | 57P / 1F ✅ |
+| M4 | 拿掉 `kill_stalled_external` 的 phase 閘門 | 56P / 2F ✅ |
+| M5 | 拿掉 cmdline 身分檢查 | 57P / 1F ✅ |
+| M6 | 拿掉 systemd 分支的 ActiveState 前置檢查 | 56P / 2F ✅ |
+| M7 | 拿掉 `_external_begin` 身分閘門 | 56P / 2F ✅ |
+| M8 | `kill_stalled_external` 整個 no-op | 53P / 5F ✅ |
+| M9 | 拿掉 TOCTOU 重檢 | 57P / 1F ✅ |
+| M10 | `_pid_is_our_scan` 退回子字串比對 | 57P / 1F ✅ |
+| M11 | `_out` 退回 `print()`（修正前行為、無鎖） | 55P / 3F ✅ |
+| M12 | 保留鎖但用 `print()`（兩次 write） | 55P / 3F ✅ |
+| M13 | 拿掉鎖、保留單次 write | 58P / 0F ⚠️ **已知逃脫** |
+| M14 | 回復舊制的分支整個不執行（`else:` → `elif False:`） | 57P / 1F ✅ |
+| M15 | 回復舊制時不算 `next_run` | 57P / 1F ✅ |
 
 > ⚠️ **這張表的 PASS/FAIL 數會隨測試項數變動**（測試從 55 加到 56 之後，
 > M1 就從 54P/1F 變成 55P/1F）。**權威來源是 `tests/mutate.py` 的實跑輸出**，
 > 這張表只是某一次的快照；會變的數字不是重點，**判定欄（被逮／逃脫）才是**。
+>
+> ⚠️ **但「數字會變」不等於「數字可以漂移」。** 2026-09-20 發現 J 區有一項
+> 隨機失敗（見本檔最上方條目），同一份程式碼連跑兩次得到不同的 P/F ——
+> 那時候「這張表只是快照」這句話變成了掩蓋不穩定的藉口。
+> **同一個 HEAD 連跑兩次必須逐項相同；不同就是有東西不穩定，要去查。**
 > 要重跑：
 >
 > ```bash
