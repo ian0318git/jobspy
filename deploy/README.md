@@ -49,6 +49,46 @@ curl -s http://127.0.0.1:5000/api/search/status | python3 -m json.tool
 
 ---
 
+## 實機驗證記錄：休眠喚醒後的自動補跑（2026-09-20）
+
+這一節記的是**原始需求「電腦晚上會休眠，醒來要自己補跑」在生產環境的實際達成**，
+不是 lab 條件。全部是既成事實的觀測，沒有為了驗證去動任何設定。
+
+**時序**（來源：journal、`search_state.json`、`cron_search.log`、stamp mtime）
+
+| 時刻 | 事件 | 證據 |
+|---|---|---|
+| 04:30（機器睡著） | `jobboard-logrotate.timer` 的時段被錯過 | — |
+| 06:00（機器睡著） | `jobscan.timer` 的時段被錯過 | — |
+| 08:48:59 | **VM 跟著宿主機喚醒**，realtime 跳動 | `systemd-resolved: Clock change detected. Flushing caches.`（連續兩筆） |
+| 08:48:59 | `jobscan.timer` **補跑 06:00 那一輪** | `stamp-jobscan.timer` mtime = `08:48:59.518` |
+| 08:49:01 | `jobboard-logrotate.timer` **補跑 04:30 那一輪** | `stamp-jobboard-logrotate.timer` mtime = `08:49:01.851` |
+| 08:49:02 | 日誌輪替（copy + truncate）完成 | `logrotate[283396]: truncating .../job_board.log` |
+| 08:49:03 | `run_scan.sh` 開始，state 寫入 `phase=running` | `search_state.json` |
+| 08:49:07 | 看板偵測到外部掃描 | `job_board.log`（**輪替後的新檔**） |
+| 09:07:55 | 掃描結束，`exit_code=0`（歷時 18 分 52 秒） | `search_state.json` |
+| 09:07:58 | 看板**自動切換**到新結果檔（40 筆） | `job_board.log`：`已自動切換到 kanban_jobs_20260920_0849.json（40 筆）` |
+| 09:07:55 後 | NEXT 恢復為 `Sun 2026-09-20 22:00:00 AEST` | `list-timers` |
+
+**這一輪同時把三個原本「只有 lab 證據」的路徑變成生產證據：**
+
+1. **`Persistent=true` 的休眠補跑**（Stage 5）。原本的 lab 做法是刪 stamp + drop-in 造假
+   一個已過的時刻；這次是 VM 真的睡過 06:00、真的在 08:48:59 醒來、真的補跑。
+   這也是整個遷移要解決的那一件事。
+2. **`logrotate` 由 timer 觸發**（Stage 7 唯一未證的那條路）。原本 `list-timers` 的
+   LAST 是 `-`（只有手動 `logrotate -f` 的證據）；現在是真的 timer→service。
+   而且它與掃描在**同一秒**發生，正好把「輪替會不會打斷掃描」也一起答了：不會。
+3. **`copytruncate` 之後 dashboard 仍寫進新檔**（Stage 7 的「最關鍵」判準）。
+   `job_board.log` 在 08:49:02 被截斷，08:49:07 的寫入落在**新檔**；
+   輪替前後的 inode 分別是 408086 / 397974（`copytruncate` 不是 rename），無 NUL 空洞。
+
+**仍未證的一條**：機器**醒著**時的正常排程觸發（例如 22:00 到點那一刻，機器沒睡）。
+上面補跑的那一輪走的是 `Persistent` 的補跑路徑，不是「時間到就觸發」那條。
+兩者在 systemd 裡是同一個 `timer_enter_waiting()` 算出來的 elapse，差異只在
+「錯過的要不要補」，但**這是推論，不是觀測**。下一次機器醒著的 22:00 會自動補上這個證據。
+
+---
+
 ## ⚠️ 兩個絕對不要改的地方
 
 ### 1. `jobscan.timer` / `jobboard-logrotate.timer` 不要加 `Requires=<對應的>.service`
@@ -75,6 +115,14 @@ alpha 靠 `wrapper.sh` 的 `.done` marker 把那次拉動變成 1 秒 no-op，**
 實測證據（2026-09-19 Stage 7）：輪替後 inode 不變、新寫入落在新檔、舊檔大小未成長、
 無 NUL 空洞。
 
+**`copytruncate` 的一個已知副作用（2026-09-20 實際踩到，不是缺陷，但要知道）**：
+`cp` 與 `truncate` 之間寫進去的那一行會被截掉 —— 但它已經被 `cp` 抄進輪替檔了，
+所以**那一行不會消失，只是跑到輪替檔裡去**。實例：08:49:02 輪替、08:49:03 那一輪
+開跑，`run_scan.sh` 的 `START` 行正好落在窗口內，於是它出現在
+`logs/cron_search.log-2026-09-20` 的**最後一行**，而新的 `logs/cron_search.log`
+從標題橫幅開始。追事故時若比對兩個檔卻只看到半條線索，原因在這裡。
+（逐字稿本身不受影響：`run_scan.sh` 另外 `tee` 到 `logs/search_current.log`。）
+
 ### 3.（順帶）不要為了「跟 alpha 對齊」把 logrotate 改回 crontab
 
 alpha 用 `0 0 * * *` cron。這台 VM 跟著宿主機 suspend，**cron 錯過就是永遠錯過**，
@@ -99,6 +147,69 @@ systemctl --user restart jobscan.timer
 LC_ALL=C systemctl --user list-timers jobscan.timer --all   # LAST 應變成剛剛
 ```
 
+---
+
+## ⚠️ `list-timers` 的 NEXT 顯示 `-` 是正常的（不要當成排程壞掉）
+
+**症狀**：`systemctl --user list-timers jobscan.timer` 的 `NEXT` 欄是 `-`。
+一天會看到兩次，每次約 19 分鐘 —— 也就是**每一輪掃描正在跑的時候**。
+
+**這是 systemd 的正常表示法**：timer 的那次 elapse 已經被消費掉了，下一次還沒算出來
+（也不需要喚醒）。**服務一結束就會自己恢復。**
+
+> ⚠️ **觸發條件不是「service 正在跑」，而是「timer 已經把那次 elapse 交出去、
+> 下一次還沒算」。** 這兩者不一樣，而差別在實測時咬過我一次：手動
+> `systemctl --user start <unit>.service` 拉起的服務，`NEXT` 是**正常有值**的，
+> 因為 timer 的那次 elapse 還在。生產的 `jobscan.timer` 是**自己**觸發 service 的，
+> 所以才會看到 `-`。**用「service 在跑」去解釋它，會解釋錯。**
+
+2026-09-20 的量測（`NEXT` ／ `NextElapseUSecMonotonic` ／ `list-timers --output=json` 的 `next`）：
+
+| 狀態 | `NEXT` | `NextElapseUSecMonotonic` | JSON `next` |
+|---|---|---|---|
+| timer **未**觸發、service **手動**拉起（running） | `Sun 09:14:00 AEST` | 有值 | `1789859640000000`（int） |
+| **timer 已觸發**、其 service 仍在跑 | **`-`** | **`infinity`** | **`None`（null）** |
+| service 結束後 | 下一個 `:00` | `0` | 下一次的值 |
+| **生產的 `jobscan.timer`**（08:49:02→09:07:55） | `-` | `infinity` | — |
+
+probe 的可重跑指令（自己建、自己收，不碰 jobspy 的 unit）：
+
+```bash
+systemd-run --user --unit=jwprobe2 --on-calendar='*-*-* *:*:00' /bin/sleep 30
+# 手動 start 它的 service → NEXT 仍然有值（timer 的 elapse 還在）
+systemctl --user start jwprobe2.service
+# 等 :00 到、timer 自己觸發 → 此時 NEXT 才是 "-"、JSON 的 next 才是 null
+systemctl --user list-timers jwprobe2.timer --all --output=json --no-pager
+systemctl --user stop jwprobe2.service jwprobe2.timer
+systemctl --user reset-failed jwprobe2.service jwprobe2.timer
+```
+
+**那個 `None` 很重要，不要漏掉**：`get_timer_state()` 走的就是
+`list-timers --output=json` 的 `u.get("next") or None`。量到的是 **`null`**，
+不是 `0`（會變成 `1970-01-01`）也不是 `INT64_MAX`（會變成幾億年後）——
+所以 `next_iso` 就是 `None`，啟動 banner 的 `_timer_next_text()` **真的會走到那個分支，
+不是死碼**。若哪天 systemd 改回傳 `0` 或 `INT64_MAX`，那個修正會**靜默失效**
+（畫面會顯示一個假的下次觸發時間），重測時請先看這一格。
+
+**同一個時間點還有一個陷阱**：`TimersCalendar` 的 `next_elapse=` 會**停在已經過去的
+值**，所以它**不能**拿來當 `next` 的退路。實測（同一輪掃描）：
+
+```
+執行中：{ OnCalendar=*-*-* 06:00:00 Australia/Melbourne ; next_elapse=Sun 2026-09-20 06:00:00 AEST }  ← 08:49 時已是過去
+結束後：{ OnCalendar=*-*-* 06:00:00 Australia/Melbourne ; next_elapse=Mon 2026-09-21 06:00:00 AEST }  ← 正確
+```
+
+拿它來填 `next` 會把一個**過去的時間**標成「下次觸發」——那比空著更糟，因為它看起來
+像一個答案。所以 `get_timer_state()` 在這種情況下就是回 `next_iso: null`，
+前端據此**省略**「下次 …」那一段（不是顯示錯誤的值），啟動 banner 則明說
+「掃描執行中，systemd 尚未計算下一次」。
+
+> 這一段值得記下來的原因是它跟本專案反覆在抓的**幽靈排程方向相反**：不是承諾一件
+> 不會發生的事，而是**否認一件會發生的事**。原本 banner 一律印「下次觸發: (無)」，
+> 若啟動時剛好撞上掃描窗口，看板上就會留下一句讀起來像「排程壞了」的話。
+
+---
+
 ## 手動操作
 
 ```bash
@@ -118,15 +229,18 @@ tail -f logs/cron_search.log
 
 ## 測試覆蓋（誠實聲明）
 
-**這個專案的自動化測試只有一支**：`tests/test_scan_lock.py`（81 項檢查）。
+**這個專案的自動化測試只有一支**：`tests/test_scan_lock.py`（83 項檢查）。
 其餘全部是手動驗證 —— 上面各節的「驗證」指令就是手動程序。
 
 ```bash
 cd /home/ian/github-project/jobspy
 .venv/bin/python tests/test_scan_lock.py     # 通過時印「✅ 全數通過」且 exit 0
 
-# 要引用「幾項」時用這個量，不要憑印象寫 —— 這個數字已經腐化過七次
-# （28→39→53→55→56→58→65→81）。第 65→81 那次是第七輪退回：L 區 9 項 + M 區 7 項。
+# 要引用「幾項」時用這個量，不要憑印象寫 —— 這個數字已經腐化過八次
+# （28→39→53→55→56→58→65→81→83）。
+#   65→81 是第七輪退回：L 區 9 項 + M 區 7 項。
+#   81→83 是第八輪自查：F 區 +1（F4 補回漏掉的 subprocess.run 攔截）、
+#           M 區 +1（banner 的「下次觸發」不得把「執行中」印成「(無)」）。
 .venv/bin/python tests/test_scan_lock.py | grep -c '\[PASS\]'
 ```
 
@@ -137,7 +251,7 @@ cd /home/ian/github-project/jobspy
 | C | 5 | 看板持鎖時不得留下凍結的 `active` 狀態 |
 | D | 6 | Popen 失敗時必須把鎖還回去（MAJOR-3） |
 | E | 5 | 孤兒鎖自癒 |
-| F | 17 | 孤兒鎖盲區、誤殺無關行程、幻影掃描、假成功、`cmdline` 身分驗證（第三輪退回） |
+| F | 18 | 孤兒鎖盲區、誤殺無關行程、幻影掃描、假成功、`cmdline` 身分驗證（第三輪退回）；F4 的 `subprocess.run` 攔截（第八輪自查） |
 | F7 | 7 | 殺戮路徑的**正向**覆蓋：必須開火、且目標真的死掉（第四輪退回） |
 | G | 4 | `errors="replace"` 與 TOCTOU 重檢的回歸保護（第四輪退回） |
 | H | 2 | 日誌每行必須**一次** `write()` 寫出（第五輪退回，見下） |
@@ -145,7 +259,7 @@ cd /home/ian/github-project/jobspy
 | J | 2 | 啟動時的排程主權轉移：兩個方向都要正確（見「回復到舊制」一節） |
 | K | 7 | `api_schedule` 的輸入驗證：幽靈排程（`times: []`）、非物件主體、`enabled` 的字串陷阱、第三道鎖（不得重新武裝）（第六輪退回） |
 | L | 9 | **跨午夜的掃描被靜默跳過**（MAJOR-1）、`post-run` 的 `next_run` 必須等於 `_compute_next_run`、`interval_hours` 的 `inf`、非 ASCII 的「數字」（第七輪退回） |
-| M | 7 | 損壞排程檔的**靜默降級**、`save_schedule` 的原子性、`ok` 的語意、`TimerCalendar` 解析（第七輪退回） |
+| M | 8 | 損壞排程檔的**靜默降級**、`save_schedule` 的原子性、`ok` 的語意、`TimerCalendar` 解析（第七輪退回）；banner 的「下次觸發」必須區分「沒裝」與「執行中還沒算」（第八輪） |
 
 > ⚠️ **H 那一格是錯的，而且錯了兩輪。** 第七輪審查 MAJOR-2：原本寫 `| H | 3 |`，
 > 全表加總 66，與權威的 65 不符。實際拆開是 H=2、I=1、J=2 —— 因為 J 區的兩項
@@ -166,6 +280,22 @@ cd /home/ian/github-project/jobspy
 - **跳線（tripwire）**：`jb.subprocess.run` 被包了一層，任何 argv 含 `"kill"` 的呼叫
   當場拋 `AssertionError`。合法用途（F7b）本來就會 mock 掉 `subprocess.run`，
   所以**根本走不到跳線** —— 它只在寫錯時響，不需要 opt-in 開關。
+
+  > ⚠️ **2026-09-20 第八輪：這句話當時是錯的，而且差一點釀成事故。** F4 是
+  > `_REAL_KILL_EXTERNAL()` 的呼叫點中**唯一沒有** mock `subprocess.run` 的
+  > （F4b／F4c 都攔了），而它上方的註解正好寫著「任何直接呼叫的地方都必須攔下
+  > 所有 systemctl 呼叫」。實際攔下它的是**這把跳線** —— 也就是說，那道「只在
+  > 寫錯時響」的最後防線，真的響了。當時生產的 `jobscan.service` 正好在
+  > `activating`（06:00 補跑那一輪），再往下就是對它送出真的 `SIGKILL`。
+  >
+  > 更陰險的是後果的第二層：跳線拋的例外會讓**整個測試檔當場崩潰**，而崩潰的
+  > 行程 `[FAIL]` 數是 **0** —— `tests/mutate.py` 只看 `failed > 0`，於是把變異
+  > M4 記成「逃脫」。同一輪稍早的表格裡 M4 還是「被逮」。**同一個變異的判定
+  > 取決於生產 unit 當下的狀態**，而且**最嚴重的變異看起來最無害**。
+  >
+  > 兩邊都補了：F4 補上攔截與斷言；`tests/mutate.py` 在判定前先確認測試檔
+  > **印出了收尾標記**（跑到底），否則記為 `INCONCLUSIVE` 而不是「逃脫」。
+  > **教訓：寫在註解裡的規則不會自己執行。**
 - **第二道跳線：`subprocess.Popen`**（第六輪審查的 MAJOR M2）。排程器啟動爬蟲走的是
   `subprocess.Popen([sys.executable, "-u", "linkedin_job_search.py"])`，
   **完全繞過只擋 `subprocess.run` 的那道**。也就是說第六輪之前的隔離不是護欄，
@@ -193,11 +323,28 @@ cd /home/ian/github-project/jobspy
 .venv/bin/python tests/mutate.py     # 需乾淨的工作區；在 /tmp 隔離副本裡跑
 ```
 
-目前 **21 個變異、19 個被逮、2 個已知逃脫**（M13、M20；`mutate.py` 的
-`EXPECTED_ESCAPES` 把「已理解的逃脫」與「沒被發現的覆蓋缺口」分開回報，只有後者
-會讓退出碼變 1。M20 的用意正是**讓一個覆蓋缺口變成機器看得見的事實**，而不是
-文件裡的一句話）。**若你新增修正卻找不到會失敗的變異，代表那個修正沒有被測試
+目前 **27 個變異、26 個被逮、1 個已知逃脫**（`EXPECTED_ESCAPES = {"M13"}`；
+`mutate.py` 把「已理解的逃脫」與「沒被發現的覆蓋缺口」分開回報，只有後者
+會讓退出碼變 1）。**若你新增修正卻找不到會失敗的變異，代表那個修正沒有被測試
 覆蓋** —— 那就把那個變異加進來、列進 `EXPECTED_ESCAPES`，讓缺口誠實地站出來。
+
+> ⚠️ **但「列進 `EXPECTED_ESCAPES`」比它看起來危險得多。** 這裡曾經躺著第二個
+> 豁免 `M20`，理由寫著「要 `INTERNAL_SCHEDULER=1` 且跑完一輪 19 分鐘的真掃描才會
+> 走到，**結構上測不到**」。第七輪審查員證明那句話不成立 —— 帳務邏輯可以抽成純
+> 函式，而**那段「測不到」的程式碼裡就藏著 MAJOR-1**（跨午夜掃描會靜默吃掉隔天
+> 早上那一輪）。豁免清單把一個 MAJOR 藏在「已知且已理解」的標籤底下。
+> **「測不到」通常只是「還沒抽出來」的另一種說法。**
+>
+> 剩下的 M13 是真逃脫，性質不同：它只拿掉 `_out()` 的 `threading.Lock`，
+> 留下「整行一次 write」，所以剩下的是一個**競態**（兩條執行緒在同一行中間插隊），
+> 在單一行程的測試裡是機率性的。它的觀測方式是人工的（連續跑 N 次、檢查有沒有
+> `[scheduler][jobscan]` 這種黏行），**不是自動測試** —— 這一條是真的測不到，
+> 而且已經理解。差別在於：M20 是「還沒試著測」，M13 是「試過了，測不到」。
+>
+> 第八輪還抓到自己一個更隱蔽的版本：**測試檔崩潰時 `[FAIL]` 數是 0**，
+> 於是 `failed > 0` 的判定會把「最嚴重的變異」記成「逃脫」。現在要求測試檔
+> 必須印出收尾標記才算數，否則記 `INCONCLUSIVE` 並讓退出碼非 0。詳見下方
+> 「測試『崩潰』與測試『失敗』在變異表上長得一樣」一節。
 
 > ⚠️ **這個工具不會碰生產目錄。** 第五輪審查抓到：舊版直接改寫 repo 裡的
 > `job_board.py`，當時的 13 個變異每個會在磁碟上存在 5–25 秒，而 `jobboard.service`
@@ -258,24 +405,33 @@ cd /home/ian/github-project/jobspy
   >
   > 四個獨立量測（每次都有 A/B/C 三組，N 分別是 60、60、20、200）：
   >
-  > | 組態 | 第一次 60 | 第二次 60 | 20 | **200** | 合計 |
-  > |---|---|---|---|---|---|
-  > | A ＝ 現在的子行程**拿掉** `os._exit(0)`（保留 `flush()`）、管線 | 0 | 0 | 1 | **2** | **3/340 ≈ 0.9%** |
-  > | B ＝ `d80fb93` 的原始版（沒有 flush、沒有 `os._exit(0)`）、管線 | 15 | 7 | 3 | **23** | **48/340 ≈ 14%** |
-  > | C ＝ 同 B，但 stdout 導到**檔案** | 3 | 6 | 2 | **22** | **33/340 ≈ 10%** |
+  > | 組態 | 第一次 60 | 第二次 60 | 20 | **200** | 合計 | Wilson 95% CI |
+  > |---|---|---|---|---|---|---|
+  > | A ＝ 現在的子行程**拿掉** `os._exit(0)`（保留 `flush()`）、管線 | 0 | 0 | 1 | **2** | **3/340 = 0.9%** | **[0.3%, 2.6%]** |
+  > | B ＝ `d80fb93` 的原始版（沒有 flush、沒有 `os._exit(0)`）、管線 | 15 | 7 | 3 | **23** | **48/340 = 14.1%** | **[10.8%, 18.2%]** |
+  > | C ＝ 同 B，但 stdout 導到**檔案**（我測） | 3 | 6 | 2 | **22** | **33/340 = 9.7%** | **[7.0%, 13.3%]** |
+  > | C ＝ 同上（**第七輪審查員另測**） | — | — | — | 36/200 | **36/200 = 18.0%** | **[13.3%, 23.9%]** |
   >
-  > **可以下的結論**：
+  > **可以下的結論**（第七輪 MAJOR-3 修正後的版本）：
   > - **`flush()` 不足以讓它消失。** A 不是 0 —— 我曾經發佈「A = 0/60，
   >   所以 flush 就夠了」，那句話在 N=20 那次就出現 1 次 ABRT。
   >   ≈1% 看起來很小，但一輪測試會 spawn 這個子行程好幾次 —— **隨機紅會留下來**，
   >   而隨機紅的測試最後會被人加 `|| true` 繞過。
   >   **真正讓它結構上不可能的是 `os._exit(0)`：它根本不進 finalization，
   >   也就不需要去搶那個鎖。兩個都留著是對的。**
+  > - **C 不該有一個數字，只有一個範圍：≈ 7%~24%。** 我測 33/340（9.7%），
+  >   審查員測 36/200（18.0%）—— 這兩個**互相矛盾**（z=2.79，p=0.0053），
+  >   也就是說 C 的比率**不是那個組態的性質，而是當下環境的性質**
+  >   （負載、排程時機、直譯器 build……我沒有定位出是哪一項，只能誠實說它會變）。
+  >   **這一格是我第七輪被退回的三個 MAJOR 之一。**
   > - **B 的比率約一成，不是 25%。** 兩次 60 次的量測差了兩倍以上（15 vs 7），
   >   所以「25%」這種點估計不該被引用。
-  > - **「管線比檔案更容易踩到」不成立。** 我原本根據 15/60 vs 3/60 下了這個結論，
-  >   但 N=200 那兩組是 23 vs 22 —— 管線與檔案在這個尺度上分不出來。
-  >   **兩組 60 次的樣本差異，小於量測本身的run-to-run 變異。**
+  > - **「管線比檔案更容易踩到」不成立**，而且**反過來也不成立**：
+  >   B vs C 我測的那組是 z=−1.78、p=0.076 —— **等於沒有證據**。
+  >   我原本把 B 與 C 列成兩列不同數字，那個排序是讀者自己會補上的結論，
+  >   而它從來沒被支持過。
+  > - **只有「A 遠小於 B 與 C」站得住**：三個對照全部 p<0.0001。
+  >   差別在機制，不在樣本 —— A 不進 finalization，所以它不需要搶那把鎖。
   >
   > **這不是生產缺陷，但理由要說對。** 原本只寫了「SIGTERM 是 `SIG_DFL`、不跑
   > finalization」，那只涵蓋 `systemctl stop` 那條路。生產**還有**正常結束的路徑
@@ -301,6 +457,23 @@ cd /home/ian/github-project/jobspy
   的輔助函式一律不讓例外冒出去（`_startup_schedule` 的排程檔讀取同理）。
   **看到某個變異逃脫，先確認測試是「跑完之後有 FAIL」還是「根本沒跑完」。**
 
+  > **⚠️ 第八輪：上面那句提醒是給「人」看的，而人不會每次都在看。**
+  > 同一個坑再踩一次，這次的變異是 **M4**（拿掉 phase 閘門），而它**是清單裡
+  > 最嚴重的一個** —— 它會讓 F4 走到真的 `systemctl --user kill --signal=SIGKILL
+  > jobscan.service`。測試檔被最底層的跳線擋下、當場崩潰、`[FAIL]` 數 **0** →
+  > 記成「逃脫」。**最嚴重的變異看起來最無害。**
+  >
+  > 而且它還會**隨生產 unit 當下的狀態翻來翻去**：09:00 時 `jobscan.service`
+  > 正好在 `activating`（06:00 的補跑），M4 就是在那個窗口從「被逮」翻成「逃脫」的。
+  >
+  > 所以判定不能靠提醒，要靠機械：**`mutate.py` 現在要求測試檔印出收尾標記**
+  > （`✅ 全數通過` 或 `項失敗：`）。沒印＝沒跑到底 → 記 **`INCONCLUSIVE`**，
+  > 明確標示「這不是逃脫」，並讓退出碼非 0。同時 F4 補上了它漏掉的
+  > `subprocess.run` 攔截（它是七個 `_REAL_KILL_EXTERNAL()` 呼叫點裡唯一沒攔的）。
+  >
+  > **教訓：寫在註解裡的規則不會自己執行。** 那句鐵律註解寫得完全正確，
+  > 而且就寫在違反它的那段程式碼上方 —— 差別在於它一直是「文字」而不是「判定」。
+
 ### ⚠️ 未涵蓋（不要以為有測試就安全）
 
 - **`linkedin_job_search.py` 有同一個兩次 syscall 的結構**（56 個 `print`，
@@ -320,16 +493,23 @@ cd /home/ian/github-project/jobspy
   而 stray holder 持鎖時 state 停在上一輪的 `finished` → phase 閘門直接 return →
   **沒有任何機制會放掉那把鎖**。已知、未修，理由與解法見 `../DECISIONS.md`
   第四輪條目的「已知限制」。
-- **排程器「跑完之後」算下一次的那段：已修，但結構上測不到（＝沒有回歸保護）**。
+- **排程器「跑完之後」記帳的那段：已修，第七輪起有了回歸保護**。
   第六輪修掉了：`scheduler_loop()` 跑完一輪後原本用 `times[0]`（**未排序**）算下
   一個時段，而 UI 儲存那條用 `sorted(times)` —— 兩條路徑對同一個 cfg 有不同解讀。
   現在兩邊都是 `sorted(cfg.get("times") or [...])`，連 `or`（而非 `get(k, default)`）
   也對齊了，所以舊版寫進檔案的空清單 `[]` 在兩邊都會退回預設時段。
-  **但這段程式碼要 `JOB_BOARD_INTERNAL_SCHEDULER=1` 而且得先跑完一輪 19 分鐘的
-  真掃描才會執行**，測試兩個前提都不成立。變異 `M20` 就是這一段，它**保證逃脫**，
-  列在 `EXPECTED_ESCAPES` 裡是刻意的：讓這個缺口是機器看得見的事實，而不是
-  文件裡的一句安慰。**改到這段時請手動驗證**（開閘門、把 `times` 存成
-  `["22:00","06:00"]`、確認跑完後 `next_run` 是隔天的 06:00）。
+
+  > **⚠️ 這裡原本寫著「變異 M20 就是這一段，它保證逃脫，列在 `EXPECTED_ESCAPES`
+  > 是刻意的」。第七輪審查員推翻了那個理由，而且那段程式碼裡就藏著 MAJOR-1
+  > —— 跨午夜的掃描會把隔天早上 06:00 記成已觸發，靜默跳過。**
+  > 修法是**不要推導**：due 判定 `break` 的當下就知道是哪一天的哪個時段，把它
+  > 傳進模組層級純函式 `_record_run()` 即可。抽出之後 L 區測得到它，M20 也重新
+  > 設計成「日期那一半」的變異，**現在是被逮的**（`81P/2F`）。
+  > **「測不到」通常只是「還沒抽出來」的另一種說法。**
+  >
+  > 那段程式碼仍然只有在 `JOB_BOARD_INTERNAL_SCHEDULER=1` 時才會執行，但**帳務
+  > 邏輯本身已經是純函式，測得到**。改到排程器時仍建議手動走一次：開閘門、
+  > 把 `times` 存成 `["22:00","06:00"]`、確認跑完後 `next_run` 是隔天的 06:00。
 - **systemd 本身的行為**：`Persistent=true` 補跑、`Type=oneshot` 的逾時、
   `copytruncate` 輪替，都是實測記錄在 `../DECISIONS.md`，但**沒有回歸測試**
   —— 升級 systemd 或改 unit 後必須重測。
