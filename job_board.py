@@ -409,7 +409,8 @@ def start_search():
                 text=True, bufsize=1, cwd=SCRIPT_DIR,
             )
         except Exception as e:
-            # 鎖【已經在我們手上了】（上面 :402 的 _acquire_search_lock），Popen 失敗
+            # 鎖【已經在我們手上了】（本函式開頭呼叫的 _acquire_search_lock()；刻意
+            # 不寫行號 —— 行號會隨每次編輯飄移，讀者照著找會找到無關的程式碼），Popen 失敗
             # 若不還回去，這個 fd 會一直開到行程結束，而且沒有任何機制救得回來：
             #   kill_stalled_search()   → SEARCH_PROCESS is None，直接 return
             #   kill_stalled_external() → _we_hold_scan_lock() 早退（鎖確實在我們手上）

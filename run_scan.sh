@@ -59,6 +59,21 @@ exec 9>"$LOCK"
 #
 # 這不會削弱互斥：重試只改變「我們多有耐心」，flock 仍然只讓一個行程取得鎖。
 LOCK_WAIT="${JOBSCAN_LOCK_WAIT:-20}"
+# LOCK_WAIT 必須是非負整數。`[ "$_waited" -ge "$LOCK_WAIT" ]` 對非整數回傳 2
+# （錯誤，不是「成立」），而這裡沒有 set -e，所以下面的 break 永遠不會執行 ——
+# 迴圈永不結束：每小時 3600 行 "integer expression expected" 灌進 cron_search.log，
+# 而 SKIPPED 那句永遠印不出來，只能等 systemd 在 5 小時後開槍。這正是本案要根除的
+# 「日誌看起來正常、實際靜默停擺」，所以壞輸入退回預設值。
+if ! [[ "$LOCK_WAIT" =~ ^[0-9]+$ ]]; then
+    echo "[jobscan] $RUN_ID WARN: JOBSCAN_LOCK_WAIT='$LOCK_WAIT' 不是非負整數，改用預設值 20" >&2
+    LOCK_WAIT=20
+elif [ "$LOCK_WAIT" -gt "$HARD_TIMEOUT" ]; then
+    # 等待超過自己的硬逾時沒有意義 —— systemd 會先開槍，SKIPPED 永遠印不出來，
+    # 使用者只會看到一個 failed 的 unit 而不知道原因是「另一個掃描在跑」。夾到硬逾時，
+    # 保證我們一定比 systemd 早收工，且一定會留下 SKIPPED 的痕跡。
+    echo "[jobscan] $RUN_ID WARN: JOBSCAN_LOCK_WAIT=${LOCK_WAIT}s 超過硬逾時 ${HARD_TIMEOUT}s，夾至 ${HARD_TIMEOUT}s" >&2
+    LOCK_WAIT="$HARD_TIMEOUT"
+fi
 LOCK_ACQUIRED=0
 _waited=0
 while :; do
