@@ -23,12 +23,15 @@ import ast
 import atexit
 import contextlib
 import io
+import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -894,6 +897,89 @@ check(
     f"違規行={_violations}" if _violations else
     f"_out 位於 {_out_span}；print 呼叫 0 處、_out 外的直接寫入 {len(_stray_writes)} 處",
 )
+
+# ═══ J. 排程主權的啟動狀態轉移（含「回復舊制」那條路）═══════════════════════════
+# 2026-09-20 實測發現「回復舊制」是【靜默失敗】：設了 JOB_BOARD_INTERNAL_SCHEDULER=1
+# 之後執行緒確實啟動（log 有 "Scheduler thread started"），但
+#   * schedule.enabled 停在 false（先前被壓平過）→ 永遠不觸發
+#   * managed_by 仍是 "systemd-timer" → 前端 SCHEDULE_READONLY=true
+#     → 面板唯讀，使用者【無法從 UI 重新啟用】
+# 結果：照 deploy/README.md 的復原程序操作，會得到一個「再也不會掃描、而畫面顯示
+# 排程由一個剛剛被停用的 timer 管理」的系統。那份復原計畫等於是虛構的。
+#
+# 這條路徑只在【啟動時】跑一次，所以用子行程測：兩個方向各啟動一次，看它把排程檔
+# 寫成什麼。子行程同樣裝跳線 —— 它是真的 import job_board，會啟動背景 watchdog。
+# （雖然 lock 指向暫存檔、jobscan.service 現在也是 inactive，但這個專案已經吃過
+# 一次「測試對生產 unit 送真的 SIGKILL」的虧，第四輪 MAJOR。）
+_J_TMP = tempfile.mkdtemp(prefix="jobspy-sched-")
+_J_TRIPWIRE = (
+    "import subprocess\n"
+    "_real = subprocess.run\n"
+    "def _guard(*a, **k):\n"
+    "    cmd = a[0] if a else k.get('args')\n"
+    "    if isinstance(cmd, (list, tuple)) and 'kill' in cmd:\n"
+    "        raise AssertionError('tripwire: %r' % (cmd,))\n"
+    "    return _real(*a, **k)\n"
+    "subprocess.run = _guard\n"
+    "import job_board\n"
+)
+
+
+def _startup_schedule(seed: dict, internal: bool) -> dict:
+    """在子行程 import job_board，回傳它寫出的排程檔內容。
+
+    seed 的 mode 用 interval + 極長的 interval_hours，讓「是否逾期」與牆上時鐘
+    無關 —— 測排程狀態轉移不該因為剛好跑在 06:00 就變成另一回事（更糟的是：
+    一旦判定逾期，排程器會呼叫 start_search() 真的去啟動爬蟲）。
+    """
+    path = os.path.join(_J_TMP, f"sched-{time.time_ns()}.json")
+    with open(path, "w") as f:
+        json.dump(seed, f)
+    env = dict(os.environ,
+               JOB_BOARD_SCHEDULE_FILE=path,
+               JOBSCAN_LOCK=os.path.join(_J_TMP, "jobscan.lock"),
+               JOBSCAN_LIVE=os.path.join(_J_TMP, "live.log"),
+               JOBSCAN_STATE=os.path.join(_J_TMP, "state.json"))
+    env.pop("JOB_BOARD_INTERNAL_SCHEDULER", None)
+    if internal:
+        env["JOB_BOARD_INTERNAL_SCHEDULER"] = "1"
+    r = subprocess.run([sys.executable, "-c", _J_TRIPWIRE], env=env,
+                       capture_output=True, text=True, timeout=120)
+    if r.returncode != 0:
+        return {"__error__": (r.stderr or r.stdout)[-400:]}
+    with open(path) as f:
+        return json.load(f)
+
+
+def _seed(enabled: bool, managed_by: str) -> dict:
+    return {"enabled": enabled, "mode": "interval", "interval_hours": 100000,
+            "times": ["06:00", "22:00"], "last_run": datetime.now().isoformat(),
+            "next_run": None, "last_run_date": None, "_fired_today": {},
+            "managed_by": managed_by}
+
+
+# 正式路徑：主權在 systemd，內建排程器必須被壓平（seed 故意寫成相反的值，
+# 否則這一項是空轉的 —— 它得證明程式碼真的【改了】什麼）。
+_fwd = _startup_schedule(_seed(enabled=True, managed_by="internal"), internal=False)
+check(
+    "啟動時（無 INTERNAL_SCHEDULER）必須把 enabled 壓平、managed_by 設為 systemd-timer",
+    _fwd.get("enabled") is False and _fwd.get("managed_by") == "systemd-timer"
+    and _fwd.get("next_run") is None,
+    f"enabled={_fwd.get('enabled')} managed_by={_fwd.get('managed_by')} "
+    f"next_run={_fwd.get('next_run')} {_fwd.get('__error__', '')}",
+)
+
+# 回復舊制：兩個欄位都必須被還原，否則使用者得到一個不會掃描卻看似正常的系統。
+_rev = _startup_schedule(_seed(enabled=False, managed_by="systemd-timer"), internal=True)
+check(
+    "回復舊制（INTERNAL_SCHEDULER=1）必須把 enabled 還原、managed_by 設回 internal，"
+    "且 next_run 不得為 None",
+    _rev.get("enabled") is True and _rev.get("managed_by") == "internal"
+    and _rev.get("next_run") is not None,
+    f"enabled={_rev.get('enabled')} managed_by={_rev.get('managed_by')} "
+    f"next_run={_rev.get('next_run')} {_rev.get('__error__', '')}",
+)
+shutil.rmtree(_J_TMP, ignore_errors=True)
 
 # ═══ 結果 ════════════════════════════════════════════════════════════════════
 print()

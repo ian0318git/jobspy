@@ -52,7 +52,12 @@ BOARD_TITLE = f"Embedded Job Board ({LABEL})" if LABEL else "Embedded Job Board"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 os.chdir(SCRIPT_DIR)
 
-SCHEDULE_FILE = os.path.join(SCRIPT_DIR, ".job_board_schedule.json")
+# JOB_BOARD_SCHEDULE_FILE 是測試鉤子，沿用 run_scan.sh 的 JOBSCAN_LOCK/LIVE/STATE
+# 慣例：讓測試能驗證啟動時的排程狀態轉移（尤其是「回復舊制」那條路），
+# 而不必去動生產的 .job_board_schedule.json —— 那個檔案一被測試寫壞，
+# 使用者的排程設定就沒了。
+SCHEDULE_FILE = (os.environ.get("JOB_BOARD_SCHEDULE_FILE")
+                 or os.path.join(SCRIPT_DIR, ".job_board_schedule.json"))
 STATUS_FILE   = os.path.join(SCRIPT_DIR, ".job_statuses.json")
 
 # 看板結果檔實際存放的子目錄。爬蟲寫在這裡，但前端只知道 basename —— 這個落差
@@ -1230,6 +1235,33 @@ def get_timer_state():
 SCHEDULE_CONFIG = load_schedule()
 SCHEDULE_STOP = threading.Event()
 
+
+def _compute_next_run(cfg):
+    """算出 cfg 的下一次執行時間字串；未啟用時回 None。
+
+    抽出來是因為有兩個地方需要同一套計算（啟動時回復舊制、UI 儲存排程），
+    而原本這兩段是各自複製的。實際上已經 drift 過：UI 那條用 `sorted(times)`，
+    排程器跑完那條用 `times[0]`（未排序）—— times 若被存成 `["22:00","06:00"]`
+    且當日時段都已過，排程器會把下一次算成 22:00（今天，已過）而不是 06:00
+    （明天）。UI 那條是對的，這裡沿用 sorted()。
+
+    排程器迴圈（跑完之後那段）刻意【不】改用這個函式：它要用「跑完的當下」
+    （now2）而不是「現在」來算，語意不同。那個 times[0] 的排序問題仍待處理，
+    記在 DECISIONS.md 的已知限制裡。
+    """
+    if not cfg.get("enabled"):
+        return None
+    times = sorted(cfg.get("times") or ["06:00", "22:00"])
+    if cfg.get("mode") == "times":
+        now = datetime.now()
+        future = [t for t in times if t > now.strftime("%H:%M")]
+        if future:
+            return f"{now.strftime('%Y-%m-%d')} {future[0]}"
+        return f"{(now + timedelta(days=1)).strftime('%Y-%m-%d')} {times[0]}"
+    last = cfg.get("last_run")
+    base = datetime.fromisoformat(last) if last else datetime.now()
+    return (base + timedelta(hours=cfg.get("interval_hours", 6))).isoformat()
+
 # 排程主權移交 systemd 後，內建排程器的 enabled 必須壓平：留著 true 會讓 UI
 # 顯示成「已啟用」但實際上不會動作，而哪天閘門被打開就會直接雙軌觸發。
 # 只在真的需要變更時才寫檔，避免每次啟動都無謂地改動檔案。
@@ -1253,6 +1285,41 @@ if not INTERNAL_SCHEDULER:
         save_schedule(SCHEDULE_CONFIG)
         _out("[scheduler] Internal scheduler disabled; schedule.enabled cleared "
               "(systemd timer owns the schedule)")
+else:
+    # 回復到舊制（JOB_BOARD_INTERNAL_SCHEDULER=1）。這條路【必須真的能走】——
+    # 它是 deploy/README.md 記載的復原程序，壞掉的話那份計畫就是虛構的。
+    #
+    # 2026-09-20 實測發現它原本是【靜默失敗】：閘門打開後執行緒確實啟動
+    # （log 有 "Scheduler thread started"），但 ——
+    #   * schedule.enabled 停在 false（先前被上面壓平過），→ 永遠不觸發
+    #   * managed_by 仍是 "systemd-timer" → 前端 SCHEDULE_READONLY=true
+    #     → 面板唯讀，使用者【無法從 UI 重新啟用】
+    # 結果：照文件回復之後再也不會掃描，而畫面顯示排程由一個剛剛被停用的 timer
+    # 管理，只能手改 .job_board_schedule.json 才救得回來 —— 正是本專案一直在
+    # 消滅的那種失敗（沒有錯誤訊息、看起來一切正常）。
+    #
+    # 修法刻意選「自動啟用」而不是「把面板改成可編輯、讓使用者自己按」：
+    # 設定這個環境變數的語意就是「我要舊制」，而舊制＝排程會運作。留成一個
+    # 需要人再按一次才能動的狀態，等於把同一個坑換個位置。
+    # 並發風險由 run_scan.sh 的 flock 吸收（兩條路徑同時觸發只會有一個真的跑）。
+    _sched_changed = False
+    if SCHEDULE_CONFIG.get("managed_by") == "systemd-timer":
+        SCHEDULE_CONFIG["managed_by"] = "internal"
+        _sched_changed = True
+    if not SCHEDULE_CONFIG.get("enabled"):
+        SCHEDULE_CONFIG["enabled"] = True
+        _sched_changed = True
+    # next_run 必須一起算出來。少了它，面板會顯示「下次執行：—」長達數小時
+    # （要等下 06:00 真的跑完，排程器迴圈才會補上）—— 使用者剛回復舊制、
+    # 正想確認它會不會動，卻看到一片空白。
+    _next = _compute_next_run(SCHEDULE_CONFIG)
+    if SCHEDULE_CONFIG.get("next_run") != _next:
+        SCHEDULE_CONFIG["next_run"] = _next
+        _sched_changed = True
+    if _sched_changed:
+        save_schedule(SCHEDULE_CONFIG)
+        _out("[scheduler] Internal scheduler ENABLED (JOB_BOARD_INTERNAL_SCHEDULER=1); "
+              "排程主權已交回內建排程器，managed_by 重設為 internal、enabled 已恢復")
 
 # start_search() 失敗後的退避秒數。失敗幾乎都代表已經有一個搜尋在跑（或剛卡死、
 # 還沒被 watchdog 清掉），此時每 30 秒重試一次對恢復毫無幫助，只會讓 log 以
@@ -1502,26 +1569,9 @@ def api_schedule():
             SCHEDULE_CONFIG["times"] = new_times
             if changed:
                 SCHEDULE_CONFIG.pop("_fired_today", None)  # reset tracking on time change
-        if SCHEDULE_CONFIG["enabled"]:
-            if SCHEDULE_CONFIG.get("mode") == "times":
-                times = SCHEDULE_CONFIG.get("times", ["06:00", "22:00"])
-                now = datetime.now()
-                now_str = now.strftime("%H:%M")
-                future = [t for t in sorted(times) if t > now_str]
-                if future:
-                    next_t = future[0]
-                    next_date = now.strftime("%Y-%m-%d")
-                else:
-                    # All times passed -> next run is tomorrow's first slot
-                    next_t = sorted(times)[0]
-                    next_date = (now + timedelta(days=1)).strftime("%Y-%m-%d")
-                SCHEDULE_CONFIG["next_run"] = f"{next_date} {next_t}"
-            else:
-                last = SCHEDULE_CONFIG.get("last_run")
-                base = datetime.fromisoformat(last) if last else datetime.now()
-                SCHEDULE_CONFIG["next_run"] = (base + timedelta(hours=SCHEDULE_CONFIG["interval_hours"])).isoformat()
-        else:
-            SCHEDULE_CONFIG["next_run"] = None
+        # 原本這裡是 13 行內聯計算，與啟動回復舊制那段是同一套邏輯的複製品
+        # （而且已經 drift）。現在共用 _compute_next_run()。
+        SCHEDULE_CONFIG["next_run"] = _compute_next_run(SCHEDULE_CONFIG)
         save_schedule(SCHEDULE_CONFIG)
         resp = {"ok": True, "schedule": SCHEDULE_CONFIG}
         if refused:

@@ -174,7 +174,7 @@ cd /home/ian/github-project/jobspy
 .venv/bin/python tests/mutate.py     # 需乾淨的工作區；在 /tmp 隔離副本裡跑
 ```
 
-目前 **13 個變異、12 個被逮、1 個已知逃脫**（M13，理由見 `../DECISIONS.md`
+目前 **15 個變異、14 個被逮、1 個已知逃脫**（M13，理由見 `../DECISIONS.md`
 第四輪條目；`mutate.py` 的 `EXPECTED_ESCAPES` 把「已理解的逃脫」與「沒被發現的
 覆蓋缺口」分開回報，只有後者會讓退出碼變 1）。**若你新增修正卻找不到會失敗的
 變異，代表那個修正沒有被測試覆蓋。**

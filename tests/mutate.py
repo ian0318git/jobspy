@@ -19,7 +19,7 @@ INCONCLUSIVE／套用失敗。
 ## ⚠️ 為什麼在 /tmp 的隔離副本裡跑，而不是在原目錄（2026-09-20 第五輪 MAJOR-1）
 
 原本的作法是直接改寫 repo 裡的 `job_board.py`、跑完再用 `git checkout` 還原。
-第五輪審查指出這在**生產主機**上是危險的：13 個變異每個會在磁碟上存在 5–25 秒
+第五輪審查指出這在**生產主機**上是危險的：15 個變異每個會在磁碟上存在 5–25 秒
 （整輪約 2 分鐘），而 `jobboard.service` 是 `Restart=always` + `MemoryMax=512M`
 （unit 註解本身就預期會被 OOM 殺掉）。若這段窗口內看板被殺掉而重啟，新行程載入
 的**就是那個變異** —— 而變異清單裡正好有 M5（身分檢查）、M6（ActiveState 前置
@@ -191,6 +191,18 @@ MUTATIONS = [
         t,
         '    with _LOG_LOCK:\n        sys.stdout.write(f"{line}\\n")\n        sys.stdout.flush()\n',
         '    sys.stdout.write(f"{line}\\n")\n    sys.stdout.flush()\n', "M13")),
+
+    # ── 回復舊制的啟動轉移（J 區）──────────────────────────────────────────
+    # 2026-09-20 實測發現這條路是靜默失敗：照 deploy/README.md 的復原程序做完，
+    # 系統不會再掃描，而畫面顯示排程由一個剛被停用的 timer 管理。
+    ("M14", "回復舊制的分支整個不執行（if → elif False）", lambda t: sub_once(
+        t, "else:\n    # 回復到舊制（JOB_BOARD_INTERNAL_SCHEDULER=1）。這條路",
+        "elif False:\n    # 回復到舊制（JOB_BOARD_INTERNAL_SCHEDULER=1）。這條路", "M14")),
+    # 只拿掉 next_run 的計算。回復之後 enabled 會是 true，但面板顯示「下次執行：—」
+    # 長達數小時（要等下一個時段真的跑完，排程器迴圈才會補上）。
+    ("M15", "回復舊制時不算 next_run", lambda t: sub_once(
+        t, '        SCHEDULE_CONFIG["next_run"] = _next\n',
+        "        pass\n", "M15")),
 ]
 
 results = []
