@@ -20,7 +20,10 @@ jobscan-watch 三個背景執行緒（既有設計，非本測試引入）。wat
 窗口本身是否關閉則以程式碼閱讀佐證（兩行已被 `with SEARCH_LOCK:` 包住）。
 """
 import atexit
+import contextlib
+import io
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -734,6 +737,48 @@ wait_dead(victim2)
 # 收工前清場。失敗路徑【最需要】這一行：變異測試刻意製造的情境就是「應該被殺的
 # 誘餌活著」。上面 atexit 是備援，這裡是正常路徑的保證。
 reap_all_spawned()
+
+# ═══ H. 併發日誌：整行必須一次寫出 ════════════════════════════════════════════
+print("=== H. 併發日誌：print() 的換行會被吃掉 ===")
+
+# 2026-09-19 在生產的 job_board.log 實際看到兩行黏在一起：
+#   [23:39:24] [watchdog] Watchdog thread started[23:39:24] [jobscan] ... started=====
+# 成因是 print() 分成兩次 write()（內容、換行），多執行緒在 O_APPEND 下交錯。
+# 這正好抵銷 _log() 加時戳的目的（加時戳就是為了對齊）。修法是整行一次寫。
+# 23:05 那次正常、23:39 那次黏住 —— 是間歇性 race，所以這裡用高併發把它逼出來。
+_H_BUF = io.StringIO()
+_H_T, _H_L = 8, 40
+
+
+def _h_spam(tid: int) -> None:
+    for i in range(_H_L):
+        jb._log(f"thread={tid} line={i}")
+
+
+with contextlib.redirect_stdout(_H_BUF):
+    _h_ts = [threading.Thread(target=_h_spam, args=(t,)) for t in range(_H_T)]
+    for _t in _h_ts:
+        _t.start()
+    for _t in _h_ts:
+        _t.join()
+
+_h_lines = _H_BUF.getvalue().splitlines()
+_re_ts = re.compile(r"\[\d\d:\d\d:\d\d\]")
+# 黏行的精確特徵：同一行出現兩個以上的時戳。背景 watchdog 若剛好也寫一行，
+# 那行只會有一個時戳、且不符合下面的完整樣式，不會造成偽陽性。
+_merged = [ln for ln in _h_lines if len(_re_ts.findall(ln)) > 1]
+_intact = [ln for ln in _h_lines
+           if re.match(r"^\[\d\d:\d\d:\d\d\] thread=\d+ line=\d+$", ln)]
+check(
+    "併發 _log() 不得把兩行黏成一行（整行必須一次 write）",
+    not _merged,
+    f"黏行數={len(_merged)}" + (f"  例：{_merged[0][:80]!r}" if _merged else ""),
+)
+check(
+    "（承上）每一行都必須完整無缺",
+    len(_intact) == _H_T * _H_L,
+    f"完整行={len(_intact)}/{_H_T * _H_L}",
+)
 
 # ═══ 結果 ════════════════════════════════════════════════════════════════════
 print()

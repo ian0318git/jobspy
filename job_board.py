@@ -224,10 +224,10 @@ def try_load_jobs(path):
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except (json.JSONDecodeError, OSError, ValueError) as e:
-        print(f"[jobs] 無法解析 {path}: {e}", flush=True)
+        _out(f"[jobs] 無法解析 {path}: {e}")
         return None
     if not isinstance(data, list):
-        print(f"[jobs] {path} 最外層不是陣列，忽略", flush=True)
+        _out(f"[jobs] {path} 最外層不是陣列，忽略")
         return None
     return merge_statuses(data)
 
@@ -346,7 +346,7 @@ def _acquire_search_lock():
         os.makedirs(LOG_DIR, exist_ok=True)
         fd = os.open(JOBSCAN_LOCK, os.O_RDWR | os.O_CREAT, 0o644)
     except OSError as e:
-        print(f"[search] 無法開啟掃描鎖 {JOBSCAN_LOCK}: {e}", flush=True)
+        _out(f"[search] 無法開啟掃描鎖 {JOBSCAN_LOCK}: {e}")
         return None
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -428,7 +428,7 @@ def start_search():
             # [ -f "$SCRIPT" ] 檢查，這裡沒有），或 VM 在 suspend/resume 後 fork/exec
             # 失敗（EAGAIN/ENOMEM）—— 這台正是會 suspend 的 VM。
             _release_search_lock()
-            print(f"[search] 無法啟動爬蟲 {script}: {e}", flush=True)
+            _out(f"[search] 無法啟動爬蟲 {script}: {e}")
             return False, f"無法啟動爬蟲：{e}"
         # 到這裡才動狀態。上面任何一步失敗時，這些欄位都必須維持原樣，否則 UI 會
         # 顯示一個根本沒開始的掃描，而 stall 偵測會拿著假的起始時間。
@@ -560,10 +560,9 @@ def reap_orphan_search_lock():
         fd = SEARCH_LOCK_FD
     who = ("沒有任何子程序在跑" if proc is None
            else f"子程序 pid {proc.pid} 已結束但 SEARCH_PROCESS 未清空")
-    print(
+    _out(
         f"[watchdog] 掃描鎖 fd={fd} 已被持有超過 {ORPHAN_LOCK_GRACE}s，"
-        f"{who} —— 判定為洩漏，主動釋放以免全機排程永久停擺",
-        flush=True,
+        f"{who} —— 判定為洩漏，主動釋放以免全機排程永久停擺"
     )
     _release_search_lock()
     return fd
@@ -663,6 +662,34 @@ def _external_idle_seconds():
         return time.monotonic() - _EXTERNAL["last_read_at"]
 
 
+# 日誌輸出的序列化鎖，搭配「整行一次 write()」。兩個都必要。
+#
+# 為什麼不能直接用 print()：`print()` 是**兩次** write() —— 先寫內容、再寫換行。
+# stdout 在 systemd 的 `StandardOutput=append:` 下是 O_APPEND 的檔案，兩個執行緒
+# 交錯時換行就會被吞掉、兩行黏成一行。2026-09-19 在 job_board.log 實際觀察到：
+#
+#   [23:39:24] [watchdog] Watchdog thread started[23:39:24] [jobscan] External scan watcher started======
+#
+# （23:05 那次啟動正常、23:39 那次黏住 —— 是間歇性的 race，不是每次都會中。）
+# 這正好抵銷 _log() 加時戳的目的：加時戳就是為了對齊，黏行反而更難追。
+#
+# 單次 write() 在 O_APPEND 下具原子性，所以「整行一次寫」就夠；鎖則是為了讓
+# 緩衝與沖刷也落在同一段臨界區內（TextIOWrapper 會緩衝，write() 之後還要 flush()
+# 才真的落到 fd；中間被插隊的話仍然會亂）。
+_LOG_LOCK = threading.Lock()
+
+
+def _out(line: str = "") -> None:
+    """整行一次寫出並立刻沖刷，且與其他 _log()/_out() 互斥。
+
+    【不要】在這個模組裡用 print() 輸出會與背景執行緒競爭的訊息
+    （watchdog / jobscan 監看 / 掃描生命週期）—— 一律走這裡。
+    """
+    with _LOG_LOCK:
+        sys.stdout.write(f"{line}\n")
+        sys.stdout.flush()
+
+
 def _log(msg):
     """掃描／看門狗生命週期訊息的統一輸出：前面帶時戳。
 
@@ -670,8 +697,10 @@ def _log(msg):
     而沒有時戳就無從對齊。2026-09-19 審查指出，規劃階段的「≤15 秒換檔」判準在
     當時的日誌格式下**根本不可量測** —— 只能改用 API 輪詢另外量。job_board.log 裡
     Flask 的存取日誌本來就帶時戳，只有我們自己的 print 沒有，事故追查時看不出順序。
+
+    輸出必須走 _out()，不能直接用 print() —— 理由見 _out() 的說明。
     """
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+    _out(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
 
 def _pid_is_our_scan(pid):
@@ -1168,7 +1197,7 @@ def get_timer_state():
                         u["last"] / 1_000_000).strftime("%Y-%m-%dT%H:%M:%S")
                 break
     except (OSError, subprocess.SubprocessError, ValueError) as e:
-        print(f"[timer] 查詢 jobscan.timer 失敗: {e}", flush=True)
+        _out(f"[timer] 查詢 jobscan.timer 失敗: {e}")
     _TIMER_CACHE["at"], _TIMER_CACHE["value"] = now, result
     return result
 
@@ -1197,8 +1226,8 @@ if not INTERNAL_SCHEDULER:
         _sched_changed = True
     if _sched_changed:
         save_schedule(SCHEDULE_CONFIG)
-        print("[scheduler] Internal scheduler disabled; schedule.enabled cleared "
-              "(systemd timer owns the schedule)", flush=True)
+        _out("[scheduler] Internal scheduler disabled; schedule.enabled cleared "
+              "(systemd timer owns the schedule)")
 
 # start_search() 失敗後的退避秒數。失敗幾乎都代表已經有一個搜尋在跑（或剛卡死、
 # 還沒被 watchdog 清掉），此時每 30 秒重試一次對恢復毫無幫助，只會讓 log 以
@@ -1217,11 +1246,11 @@ def scheduler_loop():
     """
     global _scheduler_retry_at
     if not INTERNAL_SCHEDULER:
-        print("[scheduler] Internal scheduler DISABLED "
-              "(deploy/jobscan.timer owns the schedule). "
-              "Set JOB_BOARD_INTERNAL_SCHEDULER=1 to re-enable.", flush=True)
+        _out("[scheduler] Internal scheduler DISABLED "
+             "(deploy/jobscan.timer owns the schedule). "
+             "Set JOB_BOARD_INTERNAL_SCHEDULER=1 to re-enable.")
         return
-    print("[scheduler] Scheduler thread started", flush=True)
+    _out("[scheduler] Scheduler thread started")
     while not SCHEDULE_STOP.is_set():
         try:
             cfg = load_schedule()
@@ -1256,14 +1285,13 @@ def scheduler_loop():
                         due = True
 
                 if due and time.monotonic() >= _scheduler_retry_at:
-                    print(f"[scheduler] Triggering search at {now.strftime('%Y-%m-%d %H:%M')}", flush=True)
+                    _out(f"[scheduler] Triggering search at {now.strftime('%Y-%m-%d %H:%M')}")
                     ok, msg = start_search()
                     if not ok:
                         _scheduler_retry_at = time.monotonic() + SCHEDULER_RETRY_BACKOFF
-                        print(
+                        _out(
                             f"[scheduler] Cannot start search ({msg}); "
-                            f"backing off {SCHEDULER_RETRY_BACKOFF // 60} min",
-                            flush=True,
+                            f"backing off {SCHEDULER_RETRY_BACKOFF // 60} min"
                         )
                     if ok:
                         while True:
@@ -1309,7 +1337,7 @@ def scheduler_loop():
                             cfg["next_run"] = (now2 + timedelta(hours=cfg.get("interval_hours", 6))).isoformat()
                         save_schedule(cfg)
         except Exception as e:
-            print(f"[scheduler] Error: {e}", flush=True)
+            _out(f"[scheduler] Error: {e}")
         SCHEDULE_STOP.wait(30)
 
 
@@ -2148,23 +2176,24 @@ init();
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # flush=True 是必要的：stdout 進到 systemd 的 append: 日誌時是 block-buffered，
-    # 不強制沖刷的話啟動訊息會卡在緩衝區裡，出問題時翻日誌什麼都看不到。
-    print("=" * 60, flush=True)
-    print(f"🔍 {BOARD_TITLE}", flush=True)
-    print(f"   Data : {DATA_FILE or '(no kanban JSON)'}", flush=True)
-    print(f"   Bind : {HOST}:{PORT}", flush=True)
+    # 一律走 _out()，不用 print()：banner 是主執行緒印的，但 watchdog 與 jobscan
+    # 監看執行緒在同一時間也會 _log()，交錯時 print() 的換行會被吞掉、整行黏起來
+    # （2026-09-19 實際踩到）。_out() 順便負責 flush —— stdout 進到 systemd 的
+    # append: 日誌時是 block-buffered，不沖刷的話啟動訊息會卡在緩衝區裡。
+    _out("=" * 60)
+    _out(f"🔍 {BOARD_TITLE}")
+    _out(f"   Data : {DATA_FILE or '(no kanban JSON)'}")
+    _out(f"   Bind : {HOST}:{PORT}")
     if INTERNAL_SCHEDULER:
-        print(f"   Sched: 內建排程器 ON "
-              f"({'每 ' + str(SCHEDULE_CONFIG.get('interval_hours', 6)) + ' 小時' if SCHEDULE_CONFIG.get('mode') == 'interval' else '每日 ' + ' / '.join(SCHEDULE_CONFIG.get('times') or [])})",
-              flush=True)
+        _out(f"   Sched: 內建排程器 ON "
+             f"({'每 ' + str(SCHEDULE_CONFIG.get('interval_hours', 6)) + ' 小時' if SCHEDULE_CONFIG.get('mode') == 'interval' else '每日 ' + ' / '.join(SCHEDULE_CONFIG.get('times') or [])})")
     else:
         _t = get_timer_state()
-        print(f"   Sched: 內建排程器 DISABLED，主權在 systemd timer "
-              f"({'已安裝' if _t['installed'] else '⚠️ 未安裝'})", flush=True)
-        print(f"          下次觸發: {_t['next_iso'] or '(無)'}", flush=True)
-    print(f"   Scan : 外部掃描監看中（{JOBSCAN_LOCK}）", flush=True)
-    print("=" * 60, flush=True)
+        _out(f"   Sched: 內建排程器 DISABLED，主權在 systemd timer "
+             f"({'已安裝' if _t['installed'] else '⚠️ 未安裝'})")
+        _out(f"          下次觸發: {_t['next_iso'] or '(無)'}")
+    _out(f"   Scan : 外部掃描監看中（{JOBSCAN_LOCK}）")
+    _out("=" * 60)
     try:
         app.run(host=HOST, port=PORT, debug=False)
     finally:
