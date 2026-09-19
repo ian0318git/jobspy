@@ -28,6 +28,7 @@ import json
 import glob
 import fcntl
 import os
+import signal
 import sys
 import subprocess
 import threading
@@ -53,6 +54,15 @@ os.chdir(SCRIPT_DIR)
 
 SCHEDULE_FILE = os.path.join(SCRIPT_DIR, ".job_board_schedule.json")
 STATUS_FILE   = os.path.join(SCRIPT_DIR, ".job_statuses.json")
+
+# 看板結果檔實際存放的子目錄。爬蟲寫在這裡，但前端只知道 basename —— 這個落差
+# 就是 2026-09-19「用 ?file= 指定檔案會把看板清空」的原因，見 _resolve_kanban_path()。
+KANBAN_DIR = "search_results"
+KANBAN_PREFIX = "kanban_jobs_"
+
+# 資料超過這個秒數沒更新就示警。排程是 06:00 與 22:00，最長的正常間隔是 16 小時，
+# 取 20 小時可在「至少漏掉一個時段」時才亮燈，避免正常運作下誤報。
+DATA_STALE_SECONDS = 20 * 3600
 
 # ── Scheduler ownership ──────────────────────────────────────────────────────
 # 2026-09-19：搜尋排程的主權已移交 systemd（deploy/jobscan.timer）。原因是內建
@@ -102,13 +112,13 @@ TIER_ORDER = list(TIER_COLORS.keys())
 def list_kanban_files():
     """Return all kanban JSON files sorted newest-first with metadata."""
     files = []
-    for subdir in ["search_results", ""]:
-        pattern = os.path.join(SCRIPT_DIR, subdir, "kanban_jobs_*.json")
+    for subdir in [KANBAN_DIR, ""]:
+        pattern = os.path.join(SCRIPT_DIR, subdir, f"{KANBAN_PREFIX}*.json")
         for f in glob.glob(pattern):
             name = os.path.relpath(f, SCRIPT_DIR)
             mtime = datetime.fromtimestamp(os.path.getmtime(f))
             # Parse timestamp from filename like kanban_jobs_20260629_1435.json
-            ts_match = os.path.basename(f).replace("kanban_jobs_", "").replace(".json", "")
+            ts_match = os.path.basename(f).replace(KANBAN_PREFIX, "").replace(".json", "")
             try:
                 file_ts = datetime.strptime(ts_match, "%Y%m%d_%H%M")
                 ts_display = file_ts.strftime("%m/%d %H:%M")
@@ -169,28 +179,101 @@ def find_latest_kanban():
     return os.path.join(SCRIPT_DIR, files[0]["path"])
 
 
+def _safe_kanban_basename(file_path):
+    """把外部可控的檔名驗證成純 basename；不合法回 None。
+
+    這是安全邊界。`/api/jobs?file=` 是外部輸入，未經驗證就丟進 os.path.join
+    可以用 "../../" 讀到 SCRIPT_DIR 以外的任意 .json。只接受兩種形式：純檔名，
+    或 search_results/ 前綴（相容既有連結），且必須符合 kanban_jobs_*.json。
+    """
+    if not file_path or not isinstance(file_path, str):
+        return None
+    base = os.path.basename(file_path)
+    if file_path not in (base, f"{KANBAN_DIR}/{base}"):
+        return None
+    if not (base.startswith(KANBAN_PREFIX) and base.endswith(".json")):
+        return None
+    return base
+
+
+def _resolve_kanban_path(file_path):
+    """把檔名解析成實際存在的看板檔絕對路徑；找不到回 None。
+
+    前端送的是 basename，但檔案實際在 search_results/ 底下。舊版只做
+    os.path.join(SCRIPT_DIR, basename) → 找不到 → 回 ([], None) →
+    CURRENT_FILE 變 None → 之後任何 PATCH 都 500。2026-09-19 10:58 的 log
+    就是這樣：使用者從下拉選單選了檔案，看板直接變 0 筆。
+    """
+    base = _safe_kanban_basename(file_path)
+    if base is None:
+        return None
+    for sub in (KANBAN_DIR, ""):
+        cand = os.path.join(SCRIPT_DIR, sub, base)
+        if os.path.exists(cand):
+            return cand
+    return None
+
+
+def try_load_jobs(path):
+    """讀看板 JSON。成功回傳套用過 status 的 list；失敗回 None。
+
+    刻意區分「讀不到」與「空清單」：呼叫端據此決定要不要動畫面上的資料。
+    用壞資料蓋掉好資料，比暫時顯示舊資料糟得多。
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError, ValueError) as e:
+        print(f"[jobs] 無法解析 {path}: {e}", flush=True)
+        return None
+    if not isinstance(data, list):
+        print(f"[jobs] {path} 最外層不是陣列，忽略", flush=True)
+        return None
+    return merge_statuses(data)
+
+
 def load_jobs(file_path=None):
     """Load jobs from a specific kanban file, or the latest if None.
-    Merges cross-file statuses from .job_statuses.json."""
+    Merges cross-file statuses from .job_statuses.json.
+
+    失敗時回傳 ([], None)。需要區分失敗原因的呼叫端（例如 api_jobs 要回 404
+    而不是清空畫面）請改用 _resolve_kanban_path() + try_load_jobs()。
+    """
     if file_path:
-        full_path = os.path.join(SCRIPT_DIR, file_path)
-        if not os.path.exists(full_path):
-            return [], None
+        full_path = _resolve_kanban_path(file_path)
     else:
         full_path = find_latest_kanban()
-    if not full_path or not os.path.exists(full_path):
+    if not full_path:
         return [], None
-    with open(full_path, "r", encoding="utf-8") as f:
-        jobs = json.load(f)
-    jobs = merge_statuses(jobs)
+    jobs = try_load_jobs(full_path)
+    if jobs is None:
+        return [], None
     return jobs, os.path.basename(full_path)
 
 
 def save_jobs_to_kanban(jobs, filename):
-    """Save job list back to the current kanban JSON file."""
-    path = os.path.join(SCRIPT_DIR, filename)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(jobs, f, indent=2, ensure_ascii=False)
+    """原子寫回看板檔（先寫 .tmp 再 os.replace）。
+
+    非原子寫入時，正好在讀同一個檔的人（瀏覽器按 Reload、或掃描剛結束要
+    自動換檔）會讀到寫到一半的 JSON 而解析失敗。os.replace 在同一檔案系統上
+    是原子的，讀者只會看到舊版或新版。
+    """
+    base = _safe_kanban_basename(filename)
+    if base is None:
+        raise ValueError(f"save_jobs_to_kanban: 不合法的檔名 {filename!r}")
+    path = _resolve_kanban_path(base) or os.path.join(SCRIPT_DIR, KANBAN_DIR, base)
+    tmp = f"{path}.tmp.{os.getpid()}"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(jobs, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError:
+        # 暫存檔留著會累積，而且下一次同名寫入會覆蓋它，所以失敗時清掉。
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 CURRENT_FILE = None  # tracks which file is loaded; set by first load
@@ -290,7 +373,7 @@ def _release_search_lock(owner=None):
 
 def start_search():
     global SEARCH_PROCESS, SEARCH_OUTPUT, SEARCH_START_TIME, SEARCH_LAST_OUTPUT_AT
-    global SEARCH_LOCK_OWNER
+    global SEARCH_LOCK_OWNER, _LAST_SCAN_SOURCE
     with SEARCH_LOCK:
         if SEARCH_PROCESS and SEARCH_PROCESS.poll() is None:
             return False, "A search is already running"
@@ -304,6 +387,7 @@ def start_search():
         SEARCH_OUTPUT = []
         SEARCH_START_TIME = datetime.now().isoformat()
         SEARCH_LAST_OUTPUT_AT = time.monotonic()
+        _LAST_SCAN_SOURCE = "own"
         script = os.path.join(SCRIPT_DIR, "linkedin_job_search.py")
         SEARCH_PROCESS = subprocess.Popen(
             [sys.executable, "-u", script],
@@ -382,30 +466,384 @@ def kill_stalled_search():
     return pid
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# External scan observation
+#
+# 由 systemd timer 或手動 ./run_search.sh 啟動的爬蟲，對看板而言 SEARCH_PROCESS
+# 是 None —— 光看行程內狀態會誤判成「沒在跑」，跑完也不會換檔，UI 直接退步。
+#
+# 解法：把 logs/jobscan.lock 當成全機唯一的掃描狀態來源。鎖由誰持有是唯一可信
+# 的事實，因為 run_scan.sh 與看板用的是同一把鎖；再搭配 run_scan.sh 維護的
+# search_state.json（身分）與 search_current.log（逐字輸出）補齊細節。
+# ═══════════════════════════════════════════════════════════════════════════════
+_EXTERNAL = {
+    "active": False,        # 目前觀察到外部掃描正在跑
+    "gen": 0,               # 跟讀世代；每次重新開始跟讀就 +1，用來丟棄過期的讀取
+    "run_id": None,
+    "trigger": None,        # systemd-timer / manual
+    "started_at": None,
+    "lines": [],            # 跟讀 search_current.log 累積的輸出
+    "pending": "",          # 尚未成行的尾段（檔案正在被寫入）
+    "offset": 0,
+    "last_read_at": 0.0,    # time.monotonic()；沉默偵測用
+    "pre_run_file": None,   # 掃描開始時使用者在看的檔（用來尊重他的選檔）
+    "finished": None,       # 最近一次外部掃描的結果
+}
+
+# 最近一次掃描是看板自己觸發的還是外部的。閒置時要顯示哪一份逐字稿取決於此，
+# 否則外部掃描跑完後畫面會跳回更早那次本機掃描的舊內容。
+_LAST_SCAN_SOURCE = "own"
+
+
+def read_jobscan_state():
+    """讀 logs/search_state.json（run_scan.sh 以暫存檔 + mv 原子維護）。
+
+    讀不到或格式不對一律回 None —— 這是輔助資訊，不該讓看板崩掉。
+    """
+    try:
+        with open(JOBSCAN_STATE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _we_hold_scan_lock():
+    """掃描鎖是否由本行程持有（＝正在跑的掃描是看板自己啟動的）。"""
+    with SEARCH_LOCK:
+        return SEARCH_LOCK_FD is not None
+
+
+def _child_pids(pid):
+    """讀 /proc/<pid>/task/<pid>/children 取得直接子行程；失敗回空清單。"""
+    try:
+        with open(f"/proc/{pid}/task/{pid}/children") as f:
+            return [int(x) for x in f.read().split()]
+    except (OSError, ValueError):
+        return []
+
+
+def _kill_tree(pid, sig=signal.SIGKILL, depth=0):
+    """由下往上終止 pid 及其子孫，回傳實際送出訊號的 PID 清單。
+
+    只殺 wrapper 不夠：run_scan.sh 的 python 子程序繼承了 fd 9（掃描鎖），
+    殺掉 wrapper 只會留下一個孤兒繼續持有鎖，之後所有掃描永遠被擋住。
+    刻意不用 os.killpg()：手動執行時 wrapper 的 pgid 就是使用者終端機的
+    pgid，killpg 會連使用者的 shell 一起殺掉。
+    """
+    if depth > 10:
+        return []
+    killed = []
+    for child in _child_pids(pid):
+        killed.extend(_kill_tree(child, sig, depth + 1))
+    try:
+        os.kill(pid, sig)
+        killed.append(pid)
+    except OSError:
+        pass
+    return killed
+
+
+def _external_note(text):
+    """把一行診斷訊息寫進外部掃描的逐字稿（前端讀的是這一份）。"""
+    with SEARCH_LOCK:
+        _EXTERNAL["lines"].append((datetime.now().strftime("%H:%M:%S"), text))
+        if len(_EXTERNAL["lines"]) > OUTPUT_KEEP:
+            del _EXTERNAL["lines"][:-OUTPUT_KEEP]
+
+
+def _external_idle_seconds():
+    """外部掃描已沉默的秒數；沒在跟讀時回 None。"""
+    with SEARCH_LOCK:
+        if not _EXTERNAL["active"] or not _EXTERNAL["last_read_at"]:
+            return None
+        return time.monotonic() - _EXTERNAL["last_read_at"]
+
+
+def kill_stalled_external():
+    """終止卡死的外部掃描。回傳被終止對象的說明；未達門檻或無對象回 None。
+
+    看板自己啟動的掃描由 kill_stalled_search() 負責，這裡只處理鎖不在我們
+    手上的情況。
+    """
+    idle = _external_idle_seconds()
+    if idle is None or idle <= SEARCH_STALL_TIMEOUT:
+        return None
+    state = read_jobscan_state() or {}
+    run_id, trigger, pid = state.get("run_id"), state.get("trigger"), state.get("pid")
+    target = None
+    if trigger == "systemd-timer":
+        # 交給 systemd：只有它知道完整的 cgroup，能一次收掉 wrapper 與爬蟲。
+        try:
+            r = subprocess.run(
+                ["systemctl", "--user", "kill", "--signal=SIGKILL", "jobscan.service"],
+                capture_output=True, text=True, timeout=10,
+                env={**os.environ, "LC_ALL": "C"},
+            )
+            if r.returncode == 0:
+                target = f"jobscan.service (run_id={run_id})"
+        except (OSError, subprocess.SubprocessError) as e:
+            print(f"[watchdog] systemctl kill 失敗: {e}", flush=True)
+    if target is None and isinstance(pid, int) and pid > 1 and pid != os.getpid():
+        killed = _kill_tree(pid)
+        if killed:
+            target = f"PID {', '.join(str(p) for p in killed)} (run_id={run_id})"
+    if target is None:
+        return None
+    _external_note(f"🛑 外部掃描已 {idle / 60:.1f} 分鐘無輸出，判定卡死，終止 {target}")
+    return target
+
+
+def _reset_external_follow(state):
+    """（重新）開始跟讀一次外部掃描。回傳 (run_id, trigger)。"""
+    global _LAST_SCAN_SOURCE
+    with SEARCH_LOCK:
+        _EXTERNAL.update({
+            "active": True,
+            "gen": _EXTERNAL["gen"] + 1,
+            "run_id": state.get("run_id"),
+            "trigger": state.get("trigger") or "manual",
+            "started_at": state.get("started_at"),
+            "lines": [],
+            "pending": "",
+            "offset": 0,
+            "last_read_at": time.monotonic(),
+            # 掃描結束若換檔，會把使用者從他正在看的檔案上踢走。先記下來。
+            "pre_run_file": CURRENT_FILE,
+        })
+        _LAST_SCAN_SOURCE = "external"
+        return _EXTERNAL["run_id"], _EXTERNAL["trigger"]
+
+
+def _external_begin():
+    rid, trig = _reset_external_follow(read_jobscan_state() or {})
+    print(f"[jobscan] 偵測到外部掃描 run_id={rid} trigger={trig}", flush=True)
+
+
+def _follow_live_log():
+    """把 search_current.log 自上次讀取處起的新內容收進 _EXTERNAL['lines']。"""
+    try:
+        size = os.path.getsize(JOBSCAN_LIVE)
+    except OSError:
+        return
+    with SEARCH_LOCK:
+        off, gen = _EXTERNAL["offset"], _EXTERNAL["gen"]
+        if size < off:
+            # run_scan.sh 每輪開頭會 : > "$LIVE" 截斷，logrotate copytruncate
+            # 也會。截斷後必須從 0 重讀，否則會卡在愈來愈大的 offset 上永遠
+            # 讀不到東西（主控台停更但 running 仍為 true）。
+            off = 0
+            _EXTERNAL["offset"] = 0
+            _EXTERNAL["pending"] = ""
+            _EXTERNAL["lines"] = []
+        if size == off:
+            return
+        pending = _EXTERNAL["pending"]
+    try:
+        with open(JOBSCAN_LIVE, "r", encoding="utf-8", errors="replace") as f:
+            f.seek(off)
+            chunk = f.read()
+            new_off = f.tell()
+    except OSError:
+        return
+    parts = (pending + chunk).split("\n")
+    tail = parts.pop()            # 最後一段通常是半行，留到下次
+    now, stamp = time.monotonic(), datetime.now().strftime("%H:%M:%S")
+    with SEARCH_LOCK:
+        if _EXTERNAL["gen"] != gen:
+            return                # 期間已開始新的一輪，這批資料屬於舊的
+        for line in parts:
+            if line:
+                _EXTERNAL["lines"].append((stamp, line))
+        if len(_EXTERNAL["lines"]) > OUTPUT_KEEP:
+            del _EXTERNAL["lines"][:-OUTPUT_KEEP]
+        _EXTERNAL["pending"] = tail
+        _EXTERNAL["offset"] = new_off
+        if chunk:
+            _EXTERNAL["last_read_at"] = now
+
+
+def maybe_adopt_new_results(pre_run_file):
+    """掃描結束後自動切換到最新結果檔 —— 但只在不會打斷使用者時。"""
+    global JOBS, DATA_FILE, CURRENT_FILE
+    latest = find_latest_kanban()
+    if not latest:
+        print("[jobscan] 沒有可用的結果檔，維持現況", flush=True)
+        return False
+    latest_name = os.path.basename(latest)
+    with SEARCH_LOCK:
+        viewed = CURRENT_FILE
+    # 使用者在掃描期間自己換過檔 → 尊重他的選擇，不要把他拉走
+    if pre_run_file and viewed != pre_run_file:
+        print(f"[jobscan] 使用者已切換到 {viewed}，不自動換檔", flush=True)
+        return False
+    if viewed == latest_name:
+        return False
+    jobs = try_load_jobs(latest)
+    if jobs is None:
+        print(f"[jobscan] 新結果檔 {latest_name} 無法解析，保留現有畫面", flush=True)
+        return False
+    if not jobs:
+        # 空結果（例如整輪被擋）蓋掉目前有 40 筆的看板，比不換更糟。
+        print(f"[jobscan] 新結果檔 {latest_name} 是空的，保留現有畫面", flush=True)
+        return False
+    JOBS, DATA_FILE = jobs, latest_name
+    CURRENT_FILE = latest_name
+    print(f"[jobscan] 已自動切換到 {latest_name}（{len(jobs)} 筆）", flush=True)
+    return True
+
+
+def _external_end():
+    """外部掃描結束：記錄結果，並在適當條件下自動切換到新結果檔。"""
+    with SEARCH_LOCK:
+        run_id, pre = _EXTERNAL["run_id"], _EXTERNAL["pre_run_file"]
+        _EXTERNAL["active"] = False
+        _EXTERNAL["pre_run_file"] = None
+    state = read_jobscan_state() or {}
+    exit_code = state.get("exit_code")
+    if state.get("phase") == "finished" and state.get("run_id") == run_id:
+        with SEARCH_LOCK:
+            _EXTERNAL["finished"] = {
+                "run_id": run_id,
+                "trigger": state.get("trigger"),
+                "exit_code": exit_code,
+                "finished_at": state.get("finished_at"),
+            }
+        print(f"[jobscan] 外部掃描結束 run_id={run_id} exit={exit_code}", flush=True)
+    else:
+        # 鎖放掉了但 state 沒收尾 —— 可能是 wrapper 被 SIGKILL（EXIT trap 不會
+        # 執行），或這一輪根本沒走到 finish()。誠實記錄，不要假裝成功。
+        print(f"[jobscan] 外部掃描結束但 state 未收尾 "
+              f"(phase={state.get('phase')} run_id={state.get('run_id')} "
+              f"預期={run_id})，不自動換檔", flush=True)
+        return
+    if exit_code == 0:
+        maybe_adopt_new_results(pre)
+
+
+def _jobscan_watch_tick():
+    if _we_hold_scan_lock():
+        return                    # 自己的掃描，由 reader thread 與 watchdog 管
+    held = _lock_held(JOBSCAN_LOCK)
+    with SEARCH_LOCK:
+        was_active = _EXTERNAL["active"]
+    if held is True:
+        if not was_active:
+            _external_begin()
+        _external_pump()
+    elif held is False:
+        if was_active:
+            _external_end()
+    # held is None：無法判斷（例如 logs/ 權限問題）→ 維持現狀，不要誤判結束
+
+
+def _external_pump():
+    """跟讀中的每個 tick：補上姍姍來遲的 state，並讀取新的日誌內容。
+
+    run_scan.sh 是「先取鎖、才寫 state」，中間有極短的視窗我們會先看到鎖。
+    那時 state 還是上一輪的內容，所以在這裡補認這一輪的身分。
+    """
+    state = read_jobscan_state() or {}
+    with SEARCH_LOCK:
+        cur = _EXTERNAL["run_id"]
+    new_id = state.get("run_id")
+    if state.get("phase") == "running" and new_id and new_id != cur:
+        rid, trig = _reset_external_follow(state)
+        print(f"[jobscan] 外部掃描身分確認為 run_id={rid} trigger={trig}", flush=True)
+    _follow_live_log()
+
+
+def _jobscan_watch_loop():
+    """背景執行緒：每 5 秒檢查是否有外部掃描，並跟讀它的輸出。"""
+    print("[jobscan] External scan watcher started", flush=True)
+    while not SCHEDULE_STOP.is_set():
+        try:
+            _jobscan_watch_tick()
+        except Exception as e:
+            print(f"[jobscan] watcher error: {e}", flush=True)
+        SCHEDULE_STOP.wait(5)
+
+
 def watchdog_loop():
-    """背景執行緒：定期檢查搜尋子程序是否卡死。"""
+    """背景執行緒：定期檢查搜尋子程序（自家的與外部的）是否卡死。"""
     print("[watchdog] Watchdog thread started", flush=True)
     while not SCHEDULE_STOP.is_set():
         try:
             pid = kill_stalled_search()
             if pid is not None:
                 print(f"[watchdog] Terminated stalled search PID {pid}", flush=True)
+            target = kill_stalled_external()
+            if target is not None:
+                print(f"[watchdog] Terminated stalled external scan: {target}", flush=True)
         except Exception as e:
             print(f"[watchdog] Error: {e}", flush=True)
         SCHEDULE_STOP.wait(60)
 
 
-def get_search_status():
+def _data_age_seconds():
+    """目前載入的看板檔離上次更新的秒數；無法判斷回 None。"""
     with SEARCH_LOCK:
-        running = SEARCH_PROCESS is not None and SEARCH_PROCESS.poll() is None
-        exit_code = SEARCH_PROCESS.poll() if SEARCH_PROCESS else None
-        return {
-            "running": running,
-            "exit_code": exit_code,
-            "start_time": SEARCH_START_TIME,
-            "output_lines": len(SEARCH_OUTPUT),
-            "output": SEARCH_OUTPUT[-80:],
+        name = CURRENT_FILE
+    path = _resolve_kanban_path(name) if name else None
+    if not path:
+        return None
+    try:
+        return time.time() - os.path.getmtime(path)
+    except OSError:
+        return None
+
+
+def get_search_status():
+    """合併「看板自己啟動的掃描」與「外部掃描」兩種狀態。
+
+    前端只認 running/run_id/output 這幾個欄位，所以 UI 觸發與 timer 觸發在主控台
+    上幾乎沒有差別；external / trigger 只是讓標題能講清楚是誰在跑。
+    """
+    global _LAST_SCAN_SOURCE
+    with SEARCH_LOCK:
+        own_running = SEARCH_PROCESS is not None and SEARCH_PROCESS.poll() is None
+        own_exit = SEARCH_PROCESS.poll() if SEARCH_PROCESS else None
+        own_start = SEARCH_START_TIME
+        own_out, own_lines = list(SEARCH_OUTPUT[-80:]), len(SEARCH_OUTPUT)
+        ext_active = _EXTERNAL["active"]
+        ext_out, ext_lines = list(_EXTERNAL["lines"][-80:]), len(_EXTERNAL["lines"])
+        ext_id, ext_trigger = _EXTERNAL["run_id"], _EXTERNAL["trigger"]
+        ext_start, ext_finished = _EXTERNAL["started_at"], _EXTERNAL["finished"]
+        ext_last = _EXTERNAL["last_read_at"]
+        source = _LAST_SCAN_SOURCE
+    ext_idle = (time.monotonic() - ext_last) if ext_last else None
+
+    if own_running:
+        status = {
+            "running": True, "external": False, "trigger": "dashboard",
+            "run_id": f"local:{own_start}", "exit_code": None,
+            "start_time": own_start, "output": own_out,
+            "output_lines": own_lines, "stalled": False,
         }
+    elif ext_active:
+        status = {
+            "running": True, "external": True, "trigger": ext_trigger,
+            "run_id": ext_id or f"external:{ext_start}", "exit_code": None,
+            "start_time": ext_start, "output": ext_out,
+            "output_lines": ext_lines,
+            "stalled": bool(ext_idle and ext_idle > SEARCH_STALL_TIMEOUT),
+        }
+    else:
+        # 閒置時仍要回報「最近一次是哪一輪」，否則前端的換檔偵測會失去依據。
+        last = ext_finished if source == "external" else None
+        status = {
+            "running": False, "external": False, "trigger": None,
+            "run_id": (last or {}).get("run_id") or (f"local:{own_start}" if own_start else None),
+            "exit_code": (last or {}).get("exit_code") if last else own_exit,
+            "start_time": own_start if not last else (last or {}).get("finished_at"),
+            "output": ext_out if last else own_out,
+            "output_lines": ext_lines if last else own_lines,
+            "stalled": False,
+        }
+    status["last_finished"] = ext_finished
+    status["timer"] = get_timer_state()
+    status["data_age_seconds"] = _data_age_seconds()
+    return status
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -459,7 +897,8 @@ def get_timer_state():
     now = time.monotonic()
     if _TIMER_CACHE["value"] is not None and now - _TIMER_CACHE["at"] < 30:
         return _TIMER_CACHE["value"]
-    result = {"installed": False, "next": None, "last": None, "next_iso": None}
+    result = {"installed": False, "next": None, "last": None,
+              "next_iso": None, "last_iso": None}
     try:
         proc = subprocess.run(
             ["systemctl", "--user", "list-timers", "jobscan.timer", "--all",
@@ -475,9 +914,14 @@ def get_timer_state():
                 nxt = u.get("next") or None
                 result["next"] = nxt
                 result["last"] = u.get("last") or None
+                # ISO 8601（含 'T'）而非 "YYYY-MM-DD HH:MM:SS"：後者讓瀏覽器自己
+                # 猜，Safari 會直接回 Invalid Date。
                 if nxt:
                     result["next_iso"] = datetime.fromtimestamp(
-                        nxt / 1_000_000).strftime("%Y-%m-%d %H:%M:%S")
+                        nxt / 1_000_000).strftime("%Y-%m-%dT%H:%M:%S")
+                if u.get("last"):
+                    result["last_iso"] = datetime.fromtimestamp(
+                        u["last"] / 1_000_000).strftime("%Y-%m-%dT%H:%M:%S")
                 break
     except (OSError, subprocess.SubprocessError, ValueError) as e:
         print(f"[timer] 查詢 jobscan.timer 失敗: {e}", flush=True)
@@ -631,6 +1075,11 @@ _scheduler_thread.start()
 _watchdog_thread = threading.Thread(target=watchdog_loop, daemon=True)
 _watchdog_thread.start()
 
+# 外部掃描監看：systemd timer 或手動啟動的爬蟲不會經過 SEARCH_PROCESS，看板得
+# 靠鎖與日誌自己「看見」它們，否則 UI 會回報「沒在跑」且跑完不換檔。
+_jobscan_watch_thread = threading.Thread(target=_jobscan_watch_loop, daemon=True)
+_jobscan_watch_thread.start()
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Routes
@@ -653,7 +1102,15 @@ def api_jobs():
     global JOBS, DATA_FILE, CURRENT_FILE
     file_param = request.args.get("file")
     if file_param:
-        JOBS, DATA_FILE = load_jobs(file_param)
+        # 找不到檔案時回 404 且【不動】JOBS —— 舊版會把 JOBS 換成 []，一次打錯
+        # 參數就把整個看板清空，而且 CURRENT_FILE 變 None 之後 PATCH 全 500。
+        path = _resolve_kanban_path(file_param)
+        if path is None:
+            return jsonify({"error": f"Unknown kanban file: {file_param}"}), 404
+        jobs = try_load_jobs(path)
+        if jobs is None:
+            return jsonify({"error": f"Cannot parse kanban file: {file_param}"}), 500
+        JOBS, DATA_FILE = jobs, os.path.basename(path)
         CURRENT_FILE = DATA_FILE
     return jsonify({
         "data_file": CURRENT_FILE or DATA_FILE,
@@ -677,7 +1134,15 @@ def api_update_job(job_index):
     JOBS[job_index]["status"] = new_status
     JOBS[job_index]["notes"] = new_notes
     # Persist to BOTH the kanban file AND the global status store
-    save_jobs_to_kanban(JOBS, CURRENT_FILE or DATA_FILE)
+    target = CURRENT_FILE or DATA_FILE
+    if not target:
+        # 沒有載入任何檔案時 os.path.join(dir, None) 會直接 TypeError → 500。
+        # 明確回 409，前端才知道是「沒有目標檔案」而不是伺服器壞了。
+        return jsonify({"error": "No kanban file loaded"}), 409
+    try:
+        save_jobs_to_kanban(JOBS, target)
+    except (ValueError, OSError) as e:
+        return jsonify({"error": f"Failed to save: {e}"}), 500
     url = JOBS[job_index].get("url", "")
     if url:
         save_global_status(url, new_status, new_notes)
@@ -687,7 +1152,15 @@ def api_update_job(job_index):
 @app.route("/api/reload")
 def api_reload():
     global JOBS, DATA_FILE, CURRENT_FILE
-    JOBS, DATA_FILE = load_jobs(CURRENT_FILE)
+    # 先試目前檢視中的檔案；它若已被輪替掉（例如 logrotate 或手動清理），
+    # 退回最新的一檔，而不是把畫面清空。
+    path = _resolve_kanban_path(CURRENT_FILE) or find_latest_kanban()
+    if path is None:
+        return jsonify({"ok": False, "error": "No kanban file available"}), 404
+    jobs = try_load_jobs(path)
+    if jobs is None:
+        return jsonify({"ok": False, "error": f"Cannot parse {os.path.basename(path)}"}), 500
+    JOBS, DATA_FILE = jobs, os.path.basename(path)
     CURRENT_FILE = DATA_FILE
     return jsonify({"ok": True, "data_file": CURRENT_FILE, "count": len(JOBS)})
 
@@ -959,6 +1432,7 @@ body{
       📂 <select id="file-selector" onchange="switchFile(this.value)"><option>Loading...</option></select>
       <span id="job-count" style="font-size:0.75rem;color:#64748b;">—</span>
       <span id="sched-badge" style="display:none;margin-left:8px;font-size:0.75rem;color:#fbbf24;">⏰ Auto</span>
+      <span id="scan-chip" style="display:none;margin-left:8px;font-size:0.75rem;padding:2px 8px;border-radius:9999px;border:1px solid transparent;"></span>
     </div>
   </div>
   <div class="btn-row">
@@ -981,6 +1455,12 @@ body{
 <!-- Schedule -->
 <div class="panel" id="sched-panel">
   <div class="panel-title">⏰ Auto-Search Schedule</div>
+  <div id="sched-note" style="display:none;font-size:0.75rem;color:#94a3b8;margin-bottom:12px;line-height:1.6;">
+    排程由 <b>systemd timer</b> 負責：每日 <b>06:00</b> 與 <b>22:00</b>（Melbourne 時間）。
+    休眠或關機期間錯過的時段，會在機器恢復後自動補跑一次。<br>
+    此面板僅供檢視。要改時間請編輯 <code>deploy/jobscan.timer</code>，再
+    <code>systemctl --user daemon-reload &amp;&amp; systemctl --user restart jobscan.timer</code>。
+  </div>
   <div class="schedule-row">
     <label class="toggle">
       <input type="checkbox" id="sched-enabled" onchange="updateSchedule()"><span class="slider"></span>
@@ -1027,7 +1507,11 @@ body{
 // State
 // ═══════════════════════════════════════════════════════════════════════════
 let JOBS=[], CURRENT_FILE='', STATUSES=[], TIER_COLORS={}, TIER_ORDER=[];
-let activeStatus='All', searchPollTimer=null, FILES=[];
+let activeStatus='All', searchPollTimer=null, pollIntervalMs=0, FILES=[];
+// 換檔偵測：掃描從「在跑」變成「結束」時才重載一次，而不是每次輪詢都重載。
+let sawRunning=false, runIdSeen=null, lastHandledRunId=null, consoleRunId=null;
+// 排程主權在 systemd 時，面板只供檢視。
+let SCHEDULE_READONLY=false;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Init
@@ -1036,6 +1520,10 @@ async function init(){
   await loadFileList();
   await loadData();
   loadSchedule();
+  // 一開始就輪詢：掃描可能是 systemd timer 啟動的，頁面若只在按下 Re-Search
+  // 之後才開始輪詢，就會完全看不見那種掃描。
+  ensurePolling(5000);
+  pollSearchStatus();
 }
 
 async function loadFileList(){
@@ -1049,7 +1537,14 @@ async function loadFileList(){
 async function loadData(filePath){
   let url='/api/jobs';
   if(filePath) url+='?file='+encodeURIComponent(filePath);
-  const r=await fetch(url), d=await r.json();
+  const r=await fetch(url);
+  if(!r.ok){
+    // 伺服器對不存在的檔案刻意回 404 且【不動】JOBS。這裡必須跟著放棄更新，
+    // 否則 d.jobs 是 undefined，renderAll() 會直接把整個畫面炸掉。
+    console.error('loadData failed:',r.status,await r.text());
+    return;
+  }
+  const d=await r.json();
   JOBS=d.jobs; CURRENT_FILE=d.current_file||d.data_file; STATUSES=d.statuses;
   TIER_COLORS=d.tier_colors; TIER_ORDER=d.tier_order;
   document.getElementById('job-count').textContent=JOBS.length+' jobs';
@@ -1226,13 +1721,30 @@ async function triggerSearch(){
   try{
     const r=await fetch('/api/search',{method:'POST'}), d=await r.json();
     if(!d.ok){cel.textContent+='⚠️ '+d.message+'\n';btn.disabled=false;btn.innerHTML='🔍 Re-Search';return;}
-    cel.textContent+='✅ '+d.message+'\n'; startPolling();
+    cel.textContent+='✅ '+d.message+'\n'; ensurePolling(2000); pollSearchStatus();
   }catch(e){cel.textContent+='❌ Error: '+e+'\n';btn.disabled=false;btn.innerHTML='🔍 Re-Search';}
 }
 
-function startPolling(){
+// 掃描中縮短輪詢間隔、閒置時放長。刻意不在同一輪裡反覆重設 timer，
+// 否則每次輪詢都會多打一次 API。
+function ensurePolling(ms){
+  if(searchPollTimer && pollIntervalMs===ms) return;
   if(searchPollTimer) clearInterval(searchPollTimer);
-  searchPollTimer=setInterval(pollSearchStatus,1500); pollSearchStatus();
+  pollIntervalMs=ms;
+  searchPollTimer=setInterval(pollSearchStatus,ms);
+}
+
+function fmtAge(secs){
+  if(secs==null) return '未知';
+  if(secs<3600) return Math.floor(secs/60)+' 分鐘';
+  return (secs/3600).toFixed(1)+' 小時';
+}
+
+function setChip(text,color,border){
+  const c=document.getElementById('scan-chip');
+  if(!text){c.style.display='none';return;}
+  c.style.display='inline'; c.textContent=text;
+  c.style.color=color; c.style.borderColor=border; c.style.background=border+'22';
 }
 
 async function pollSearchStatus(){
@@ -1241,23 +1753,52 @@ async function pollSearchStatus(){
     const cel=document.getElementById('search-console'), panel=document.getElementById('search-panel');
     const icon=document.getElementById('search-status-icon'), txt=document.getElementById('search-status-text');
     const elapsed=document.getElementById('search-elapsed'), btn=document.getElementById('btn-search');
+    // 新的一輪掃描 → 主控台從頭開始，不要把上一輪的逐字稿接在後面。
+    if(s.run_id!==consoleRunId){
+      consoleRunId=s.run_id;
+      if(s.running) cel.textContent='';
+    }
     if(s.output&&s.output.length>0){
       const cur=cel.textContent.split('\n').filter(Boolean);
       s.output.forEach(l=>{if(!cur.includes(l[1])) cel.textContent+=`[${l[0]}] ${l[1]}\n`;});
       cel.scrollTop=cel.scrollHeight;
     }
+    // timer 未安裝／資料過舊：這兩件事都不會讓 UI 自己壞掉，但都是排程靜默
+    // 失敗的徵兆，所以在標題列直接講出來，不必事後翻 journal。
+    const t=s.timer||{};
+    if(!s.running&&t.installed===false){
+      setChip('⚠️ jobscan.timer 未安裝','#f87171','#f87171');
+    }else if(!s.running&&s.data_age_seconds>20*3600){
+      setChip(`⚠️ 資料已 ${fmtAge(s.data_age_seconds)} 未更新`,'#fbbf24','#fbbf24');
+    }else if(s.running){
+      setChip(s.external?`⏳ 外部掃描中（${s.trigger||'系統'}）`:'⏳ 掃描中','#38bdf8','#38bdf8');
+    }else{
+      setChip(null);
+    }
     if(s.running){
-      icon.textContent='⏳'; txt.textContent='Search running...';
+      icon.textContent='⏳';
+      txt.textContent=s.external?`External scan running (${s.trigger||'system'})...`:'Search running...';
+      if(s.stalled) txt.textContent+=' — 疑似卡死';
       if(s.start_time){const secs=Math.floor((Date.now()-new Date(s.start_time).getTime())/1000);elapsed.textContent=`(${Math.floor(secs/60)}m ${secs%60}s)`;}
       btn.disabled=true; btn.innerHTML='<span class="spinner"></span> Running...'; panel.classList.add('open');
+      sawRunning=true; if(s.run_id) runIdSeen=s.run_id;
+      ensurePolling(2000);
     }else{
-      if(searchPollTimer){clearInterval(searchPollTimer);searchPollTimer=null;}
+      // 只有「剛從在跑變成結束」才重載，而不是每次輪詢都重載。
+      if(sawRunning&&runIdSeen&&runIdSeen!==lastHandledRunId){
+        lastHandledRunId=runIdSeen; sawRunning=false;
+        // 走 /api/reload 而非 loadData()：伺服器可能因為「使用者自己換過檔」
+        // 而刻意沒有自動換檔，重載目前檢視中的檔案才不會把使用者拉走。
+        await reloadCurrent();
+      }
+      sawRunning=false;
+      ensurePolling(5000);
       if(s.exit_code===0){
         icon.textContent='✅'; txt.textContent='Search completed!';
-        cel.textContent+='\n✅ Search finished. Reloading...\n';
-        await loadFileList();
-        await loadData();
-        cel.textContent+='✅ Data reloaded!\n';
+        if(s.output&&s.output.length>0) cel.textContent+='\n✅ Search finished.\n';
+        // 換檔已經由上面的 transition 區塊用 reloadCurrent() 做掉了。這裡刻意
+        // 不再呼叫 loadData()（它會載入「最新」檔），否則會蓋掉使用者自己選的
+        // 檔案，也讓伺服器端「尊重使用者選檔」的判斷形同虛設。
       }else if(s.exit_code!==null){
         icon.textContent='❌'; txt.textContent='Search failed (exit '+s.exit_code+')';
       }
@@ -1271,28 +1812,46 @@ async function pollSearchStatus(){
 // ═══════════════════════════════════════════════════════════════════════════
 function toggleSchedPanel(){document.getElementById('sched-panel').classList.toggle('open');}
 
-function onSchedModeChange(){
+function syncSchedVisibility(){
   const mode=document.getElementById('sched-mode').value;
   document.getElementById('sched-times-group').style.display=mode==='times'?'':'none';
   document.getElementById('sched-interval-group').style.display=mode==='interval'?'':'none';
-  updateSchedule();
+}
+
+function onSchedModeChange(){
+  syncSchedVisibility();
+  // 唯讀時同步切換欄位顯示，但不要 POST —— 排程主權在 systemd。
+  if(!SCHEDULE_READONLY) updateSchedule();
+}
+
+function applySchedReadonly(){
+  document.getElementById('sched-note').style.display=SCHEDULE_READONLY?'':'none';
+  ['sched-enabled','sched-mode','sched-interval','sched-time1','sched-time2'].forEach(id=>{
+    const el=document.getElementById(id);
+    el.disabled=SCHEDULE_READONLY;
+    el.style.opacity=SCHEDULE_READONLY?'0.5':'';
+    el.style.pointerEvents=SCHEDULE_READONLY?'none':'';
+  });
 }
 
 async function loadSchedule(){
   try{
     const r=await fetch('/api/schedule'), s=await r.json();
-    document.getElementById('sched-enabled').checked=s.enabled;
+    SCHEDULE_READONLY=s.managed_by==='systemd-timer';
+    document.getElementById('sched-enabled').checked=!!s.enabled;
     document.getElementById('sched-mode').value=s.mode||'times';
     document.getElementById('sched-interval').value=s.interval_hours||6;
     const times=s.times||['06:00','22:00'];
     document.getElementById('sched-time1').value=times[0]||'06:00';
     document.getElementById('sched-time2').value=times[1]||'22:00';
-    onSchedModeChange();
+    syncSchedVisibility();
+    applySchedReadonly();
     updateSchedDisplay(s);
   }catch(e){console.error(e);}
 }
 
 async function updateSchedule(){
+  if(SCHEDULE_READONLY) return;   // 排程主權在 systemd，面板唯讀
   const mode=document.getElementById('sched-mode').value;
   const enabled=document.getElementById('sched-enabled').checked;
   const interval_hours=parseInt(document.getElementById('sched-interval').value);
@@ -1308,6 +1867,19 @@ async function updateSchedule(){
 function updateSchedDisplay(s){
   const badge=document.getElementById('sched-badge'), info=document.getElementById('sched-info');
   const nr=document.getElementById('sched-next-run');
+  const fmt=iso=>new Date(iso).toLocaleString('en-AU',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
+  if(SCHEDULE_READONLY){
+    badge.style.display='inline'; badge.textContent='⏰ systemd';
+    const t=s.timer||{};
+    let txt='每日 06:00 / 22:00（Melbourne）';
+    if(t.installed===false) txt+=' · ⚠️ timer 未安裝，排程不會執行';
+    else if(s.next_run) txt+=' · 下次 '+fmt(s.next_run);
+    if(t.last_iso) txt+=' · 上次 '+fmt(t.last_iso);
+    info.textContent=txt;
+    nr.textContent='';
+    return;
+  }
+  badge.textContent='⏰ Auto';
   if(s.enabled){
     badge.style.display='inline';
     const mode=s.mode||'times';
@@ -1332,13 +1904,23 @@ init();
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    print("=" * 60)
-    print(f"🔍 {BOARD_TITLE}")
-    print(f"   Data : {DATA_FILE or '(no kanban JSON)'}")
-    print(f"   Bind : {HOST}:{PORT}")
-    print(f"   Sched: {'ON' if SCHEDULE_CONFIG.get('enabled') else 'OFF'} "
-          f"(every {SCHEDULE_CONFIG.get('interval_hours', 6)}h)")
-    print("=" * 60)
+    # flush=True 是必要的：stdout 進到 systemd 的 append: 日誌時是 block-buffered，
+    # 不強制沖刷的話啟動訊息會卡在緩衝區裡，出問題時翻日誌什麼都看不到。
+    print("=" * 60, flush=True)
+    print(f"🔍 {BOARD_TITLE}", flush=True)
+    print(f"   Data : {DATA_FILE or '(no kanban JSON)'}", flush=True)
+    print(f"   Bind : {HOST}:{PORT}", flush=True)
+    if INTERNAL_SCHEDULER:
+        print(f"   Sched: 內建排程器 ON "
+              f"({'每 ' + str(SCHEDULE_CONFIG.get('interval_hours', 6)) + ' 小時' if SCHEDULE_CONFIG.get('mode') == 'interval' else '每日 ' + ' / '.join(SCHEDULE_CONFIG.get('times') or [])})",
+              flush=True)
+    else:
+        _t = get_timer_state()
+        print(f"   Sched: 內建排程器 DISABLED，主權在 systemd timer "
+              f"({'已安裝' if _t['installed'] else '⚠️ 未安裝'})", flush=True)
+        print(f"          下次觸發: {_t['next_iso'] or '(無)'}", flush=True)
+    print(f"   Scan : 外部掃描監看中（{JOBSCAN_LOCK}）", flush=True)
+    print("=" * 60, flush=True)
     try:
         app.run(host=HOST, port=PORT, debug=False)
     finally:
