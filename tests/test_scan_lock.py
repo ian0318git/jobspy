@@ -279,6 +279,160 @@ jb.SEARCH_PROCESS = None
 jb._release_search_lock()
 check("清理：鎖已釋放", jb.SEARCH_LOCK_FD is None)
 
+# ═══ F. 第三輪審查退回項（2026-09-19）════════════════════════════════════════
+print("=== F. 第三輪退回：孤兒鎖盲區 / 誤殺無關行程 / 幻影掃描 ===")
+
+# F1：兩邊都不管的盲區 —— 子行程已死、但 SEARCH_PROCESS 仍指向它。
+# 修正前 kill_stalled_search() 看 poll() 不為 None 而放棄、reap_orphan_search_lock()
+# 看 SEARCH_PROCESS 不為 None 而放棄，於是鎖永遠不放、timer 每輪 SKIPPED + exit 0。
+fd = jb._acquire_search_lock()
+dead = subprocess.Popen(["true"])
+dead.wait()                                     # 已結束，poll() 回 0（不是 None）
+jb.SEARCH_PROCESS = dead
+jb.SEARCH_LOCK_HELD_SINCE = time.monotonic() - (jb.ORPHAN_LOCK_GRACE + 10)
+check(
+    "子行程已死時必須回收（修正前這個盲區兩邊都不管）",
+    jb.reap_orphan_search_lock() == fd and jb.SEARCH_LOCK_FD is None,
+    f"SEARCH_LOCK_FD={jb.SEARCH_LOCK_FD}",
+)
+jb.SEARCH_PROCESS = None
+
+# F2：對照組 —— 子程序還活著就絕不能回收（那是有主的鎖，誤放 = 兩套爬蟲並發，
+# 正是 2026-08-13 事故的成因）。
+fd = jb._acquire_search_lock()
+alive = subprocess.Popen(["sleep", "600"])
+jb.SEARCH_PROCESS = alive
+jb.SEARCH_LOCK_HELD_SINCE = time.monotonic() - (jb.ORPHAN_LOCK_GRACE + 10)
+check("子程序還活著時不得回收（即使超過寬限值）", jb.reap_orphan_search_lock() is None)
+alive.kill()
+alive.wait()
+jb.SEARCH_PROCESS = None
+jb._release_search_lock()
+
+# F3：PID 身分驗證 —— state 檔是上一輪留下的，裡面的 pid 可能已被回收給別的行程。
+bystander = subprocess.Popen(["sleep", "600"])
+check(
+    "_pid_is_our_scan() 必須認出無關行程",
+    jb._pid_is_our_scan(bystander.pid) is False,
+    f"pid={bystander.pid} cmdline=sleep 600",
+)
+# 誘餌必須真的活得下來。GNU sleep 對非數字參數會直接報錯退出，所以
+# `sleep 600 linkedin_job_search.py` 當場 exit 1（第一版就是這樣寫的，害這項檢查
+# 時好時壞 —— 不穩定的測試比沒有測試更糟）。用 `exec -a` 改 argv[0]，
+# 做出一個 cmdline 含標記、而且持續存在的行程。
+decoy = subprocess.Popen(["bash", "-c", "exec -a linkedin_job_search.py sleep 600"])
+time.sleep(0.5)          # 等 exec 完成，cmdline 才是最終內容
+check("cmdline 含爬蟲名者才判定為我們的掃描",
+      jb._pid_is_our_scan(decoy.pid) is True,
+      f"cmdline={open(f'/proc/{decoy.pid}/cmdline','rb').read().decode('utf-8','replace')!r}")
+check("不存在的 pid 必須回 False（不確定就不動手）", jb._pid_is_our_scan(999999) is False)
+decoy.kill()
+decoy.wait()
+
+# F4：kill_stalled_external() 的兩道身分閘門。
+# 用真實的 state 檔內容，但 phase=finished —— 這正是審查重現誤殺時的情境。
+with mock.patch.object(jb, "read_jobscan_state",
+                       return_value={"phase": "finished", "pid": bystander.pid,
+                                     "run_id": "stale_000000", "trigger": "systemd-timer"}):
+    with mock.patch.object(jb, "_external_idle_seconds",
+                           return_value=jb.SEARCH_STALL_TIMEOUT + 100):
+        with mock.patch.object(jb, "_we_hold_scan_lock", return_value=False):
+            killed = _REAL_KILL_EXTERNAL()
+check("state 自稱 finished 時，即使沉默超時也不得動手", killed is None, f"回傳={killed!r}")
+check("旁觀者必須還活著（WTERMSIG=9 的事故不得重演）",
+      bystander.poll() is None, f"poll={bystander.poll()}")
+
+# F4c：phase 閘門必須獨立於 cmdline 檢查而存在 —— 這一項是 mutant 實驗揪出來的。
+# 真正的危險情境不是「pid 被回收」（那由 cmdline 檢查擋），而是
+# 「state 停在 finished、但 jobscan.service 此刻真的有一輪新掃描在跑」：
+# 少了 phase 閘門，看板會拿著上一輪的殘骸去 SIGKILL 這一輪【合法】的掃描。
+# 把假的 systemctl 攔下來，驗證「連查詢都不該發生」。
+syscalls = []
+
+
+class _FakeRun:
+    returncode = 0
+    stdout = "activating\n"     # 假裝 unit 正在跑 —— 正是「殺了會很慘」的狀態
+
+
+def _fake_run(cmd, **kw):
+    syscalls.append(cmd)
+    return _FakeRun()
+
+
+with mock.patch.object(jb, "read_jobscan_state",
+                       return_value={"phase": "finished", "pid": 999999,
+                                     "run_id": "stale_000000", "trigger": "systemd-timer"}):
+    with mock.patch.object(jb, "_external_idle_seconds",
+                           return_value=jb.SEARCH_STALL_TIMEOUT + 100):
+        with mock.patch.object(jb, "_we_hold_scan_lock", return_value=False):
+            with mock.patch.object(jb.subprocess, "run", side_effect=_fake_run):
+                gated = _REAL_KILL_EXTERNAL()
+check("phase=finished 時連 systemctl 查詢都不該發生（新掃描可能正在跑）",
+      syscalls == [], f"實際呼叫={syscalls}")
+check("且必須回 None，不得宣稱殺了東西（對 inactive unit 的假成功）",
+      gated is None, f"回傳={gated!r}")
+
+# 第二道閘門：phase 自稱 running，但 pid 的 cmdline 不是我們的掃描 → 仍須拒絕。
+with mock.patch.object(jb, "read_jobscan_state",
+                       return_value={"phase": "running", "pid": bystander.pid,
+                                     "run_id": "recycled", "trigger": "systemd-timer"}):
+    with mock.patch.object(jb, "_external_idle_seconds",
+                           return_value=jb.SEARCH_STALL_TIMEOUT + 100):
+        with mock.patch.object(jb, "_we_hold_scan_lock", return_value=False):
+            killed2 = _REAL_KILL_EXTERNAL()
+check("phase=running 但 cmdline 不符時仍須拒絕", killed2 is None, f"回傳={killed2!r}")
+check("旁觀者仍未被殺", bystander.poll() is None)
+bystander.kill()
+bystander.wait()
+
+# F5：幻影外部掃描 —— 不得採用「已結束那一輪」的 state 身分。
+with mock.patch.object(jb, "read_jobscan_state",
+                       return_value={"phase": "finished", "run_id": "20260919_220000",
+                                     "trigger": "systemd-timer", "pid": 162966}):
+    jb._external_begin()
+check(
+    "不得沿用已結束那輪的 run_id（否則日誌會冒出根本不存在的掃描）",
+    jb._EXTERNAL["run_id"] is None,
+    f"run_id={jb._EXTERNAL['run_id']!r}",
+)
+check("來源不明時應標示為 unknown 而非沿用舊 trigger",
+      jb._EXTERNAL["trigger"] == "unknown", f"trigger={jb._EXTERNAL['trigger']!r}")
+with jb.SEARCH_LOCK:
+    jb._EXTERNAL["active"] = False
+    jb._EXTERNAL["last_read_at"] = None
+
+# F6：reader thread 的解碼失敗不得帶走掃描鎖。
+# 這是 F1 盲區最可能的觸發源：爬蟲輸出的是抓回來的網頁文字，errors= 若為 strict，
+# 讀到無法解碼的位元組就拋 UnicodeDecodeError。修正前該例外會讓執行緒當場死亡、
+# 永遠走不到 _release_search_lock()。
+class _BoomStream:
+    def __iter__(self):
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+
+class _FakeProc:
+    pid = 0
+    def __init__(self):
+        self.stdout = _BoomStream()
+    def wait(self, timeout=None):
+        return 0
+    def poll(self):
+        return 0
+
+
+fd = jb._acquire_search_lock()
+fake = _FakeProc()
+jb.SEARCH_LOCK_OWNER = fake        # 讓 _release_search_lock(fake) 的 owner 檢查通過
+raised = False
+try:
+    jb._read_search_output(fake)
+except UnicodeDecodeError:
+    raised = True
+check("讀取端拋出 UnicodeDecodeError 時仍必須釋放掃描鎖（try/finally）",
+      raised and jb.SEARCH_LOCK_FD is None,
+      f"有拋出={raised} SEARCH_LOCK_FD={jb.SEARCH_LOCK_FD}")
+
 # ═══ 結果 ════════════════════════════════════════════════════════════════════
 print()
 if FAILURES:

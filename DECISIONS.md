@@ -2,6 +2,109 @@
 
 重要決策紀錄 — 依專案工作流程要求更新。
 
+## 2026-09-19 — 掃描鎖的兩個 MAJOR：孤兒鎖盲區、誤殺無關行程與假成功（第三輪審查）
+
+第三輪 Senior Reviewer 對 `8853e68` 判定 `[REVIEW_REJECTED]`，獨立重跑變異實驗後
+抓到兩個新 MAJOR 與數個 MINOR。**兩個 MAJOR 都是第二輪修正自己引入或沒關掉的**，
+這點值得記下來：修正的旁邊就是下一個缺陷的所在地。
+
+### MAJOR-A — 孤兒鎖盲區：`SEARCH_PROCESS` 非 None 但子程序已死 → 鎖永遠不放
+
+第二輪的 `reap_orphan_search_lock()` 判準是「持有鎖但 `SEARCH_PROCESS is None`」。
+它漏掉了鏡像的另一半：**`SEARCH_PROCESS` 有值，但那個子程序已經死了**。
+
+那個狀態下兩個回收者互相推讓：
+
+| 函式 | 放棄的理由 |
+|---|---|
+| `kill_stalled_search()` | `proc.poll()` 不為 `None` → 認為「已經結束了，不關我的事」 |
+| `reap_orphan_search_lock()` | `SEARCH_PROCESS is not None` → 認為「有主，不是孤兒」 |
+
+結果是鎖永遠不放。**這正是本案要根除的那種失敗**：timer 每輪 `SKIPPED`、`exit 0`、
+日誌一切正常，而全機掃描無限期停擺。
+
+**怎麼進到那個狀態**（不是理論）：`_read_search_output()` 是唯一會呼叫
+`_release_search_lock(proc)` 的地方，而它讀的是**爬蟲抓回來的網頁文字**。Popen 的
+`errors=` 若為預設的 strict，任何無法以 locale 解碼的位元組都會讓該行拋
+`UnicodeDecodeError`、reader thread 當場死亡，永遠走不到釋放。若子行程恰好在那一刻
+自行結束，就精準落進這個盲區。
+
+**修法（兩層，缺一不可）：**
+1. `_read_search_output()` 的讀取迴圈包 `try/finally`，`_release_search_lock(proc)`
+   移到 `finally`。`_release_search_lock` 有 owner 檢查，重複呼叫是安全 no-op。
+2. `Popen(..., errors="replace")` —— 寧可看到一個 U+FFFD，也不要一條會靜默停掉
+   全機掃描的路徑。（`_follow_live_log` 讀 live log 本來就用 `errors="replace"`，這只是統一。）
+3. `reap_orphan_search_lock()` 的判準改為「**子程序是否還活著**」
+   （`proc.poll() is None`），而非「欄位是否為 None」。有主的鎖不碰，無主的鎖才收。
+
+### MAJOR-B — `kill_stalled_external()` 會殺無關行程，且會回報假成功
+
+這一項有兩個獨立的傷害，性質不同，所以分開記。
+
+**(1) 拿可能已被回收的 PID 去 SIGKILL。** `search_state.json` 是【上一輪留下的】，
+`kill_stalled_external()` 的 gating 卻連 `phase == "finished"` 的 state 也照讀。裡面的
+pid 早就可能被系統回收給別的行程 —— 拿它直接送不可逆的 `SIGKILL` 就是隨機殺掉一棵
+無關的行程樹。**審查以 `WTERMSIG=9` 實測證實**：受害者是一個與 jobspy 完全無關的
+`sleep 300`。這台又是會 suspend 的 VM，PID 回收比一般機器快；專案自己的 MINOR-10
+測試也用 `flock -c 'sleep'` 製造過 stray holder，所以這條路徑不是純理論。
+
+**修法（兩層防禦）：**
+- **身分閘門**：`state.get("phase") != "running"` → 直接 return。state 自稱已結束時，
+  還持有鎖的那個人一定不是我們的掃描（是 stray holder），而 state 裡的 pid 是遺物。
+  這裡刻意「寧可不殺」：誤殺是**無界**的傷害（可能殺掉別的服務），不殺的代價**有界**
+  —— 真正卡死的掃描仍會被 systemd 的 `TimeoutStartSec=5h` 收掉（規劃階段已接受的風險 #7）。
+  phase 停在 `running` 的正常卡死情境（wrapper 被 SIGKILL → EXIT trap 不執行 →
+  state 永遠停在 running）不受影響，照樣會被終止。
+- **cmdline 身分檢查**：即使 state 自稱 running，pid 也可能在我們讀它之後被回收。
+  動手前讀 `/proc/<pid>/cmdline`，確認含 `run_scan.sh` 或 `linkedin_job_search.py`。
+  判準用 cmdline 而非「pid 存不存在」——**PID 被回收後同一個號碼會是別的行程，
+  只有 cmdline 能區分**。「不確定」一律回 `False`。
+
+**(2) 對 inactive 的 unit 送 `systemctl kill` → 退出碼 0 但什麼也沒殺（本次實測）。**
+原系統分支不檢查 unit 狀態就送出 kill，`returncode == 0` 便被當成成功，於是留下
+「已終止 jobscan.service」這筆**假成功紀錄**。那比不殺更糟 —— 它會讓下一個追查事故的
+人以為停滯偵測正常運作過，正是本案要根除的靜默謊言。
+**修法：** 動手前用 `systemctl --user show jobscan.service -p ActiveState --value` 確認，
+只接受 `active` / `activating` / `reloading`（**oneshot 執行期間的狀態是 `activating`，
+不是 `active`，兩者都要接受**）；否則只留一行 log，改走 PID 路徑（並受上面的 cmdline 檢查）。
+
+### MINOR（本輪一併修正）
+
+| 項目 | 問題 | 修法 |
+|---|---|---|
+| stale 身分（2.3） | `_external_begin()` 照抄上一輪 `finished` state 的 run_id/trigger/pid。生產日誌實證：27 分鐘前就結束的那一輪被重新「偵測到」一次，連 `exit=0` 都是從舊 state 抄的；那個 stale pid 正是 (1) 的燃料 | 只採用 `phase == "running"` 的身分；否則合成 `trigger="unknown"` / `run_id=None`。真實身分由 `_external_pump()` 在 state 轉為 running 後補認（`run_scan.sh` 是「先取鎖、才寫 state」，那個微秒級窗口本來就設計成由 pump 接手，不是新機制） |
+| 生命週期訊息無時戳 | 規劃階段的「掃描結束後 ≤15 秒換檔」判準**在當時的日誌格式下根本不可量測** —— 只能改用 API 輪詢另外量 | 新增 `_log(msg)` 統一輸出 `[HH:MM:SS]` 前綴，23 處 `print` 改用；`run_scan.sh` 同步加 `log()`/`logerr()` |
+| 註解寫死行號 | 註解指涉的行號會隨每次編輯飄移，讀者照著找會找到無關的程式碼 | 改為描述函式名／行為，不寫行號 |
+| `run_scan.sh` 測試污染生產 state | `JOBSCAN_SCRIPT` 鉤子跑的是同一條生產路徑，測一次就覆寫一次生產的 `search_state.json` 與 `search_current.log`（審查兩次踩到，當時只是手工還原） | `LOCK`/`LIVE`/`STATE` 改為可用環境變數覆寫，**預設值完全不變**；理由不是彈性，是測試隔離 |
+| `deploy/README.md` 無測試覆蓋聲明（2.7） | — | 補上「測試覆蓋」專節（含誠實的未覆蓋清單） |
+| `DECISIONS.md` 數字錯誤（1.3） | 上一個條目寫「3 項 FAIL」 | 審查實測為 **5 項**，已更正並加註 |
+
+### 變異測試（修正的自我驗證）
+
+每一項修正都做了變異實驗：**把修正改回去，確認測試會抓到**。沒有 FAIL 的修正等於
+沒有回歸保護。五個變異全數被捕捉：
+
+| 變異 | 破壞的修正 | 結果 |
+|---|---|---|
+| mA1 | reaper 判準改回 `SEARCH_PROCESS is not None` | 1 FAIL（正是那個盲區） |
+| mA2 | `try/finally` → 只在成功時釋放 | 1 FAIL，`SEARCH_LOCK_FD=3`（鎖洩漏） |
+| mB1 | 移除 phase 閘門 | 2 FAIL，變異版**真的送出** `systemctl kill --signal=SIGKILL` 並回報 `'jobscan.service (run_id=stale_000000)'` |
+| mB2 | 移除 cmdline 檢查 | 1 FAIL，殺掉無辜的旁觀者 `PID 183293` |
+| mB3 | 移除 ActiveState 前置檢查 | 1 FAIL，回報假成功 |
+
+> mB1 第一次只讓 F3 失敗，而 F3 本身是 flaky 的（見下）—— 這等於 phase 閘門**沒有
+> 獨立覆蓋**。補了 F4c（mock `subprocess.run` 並斷言 `syscalls == []`）之後，mB1 才
+> 穩定產生 2 個 FAIL。
+>
+> F3 的 flaky 原因：原本用 `sleep 600 linkedin_job_search.py` 製造誘餌，但
+> **GNU `sleep` 只接受數值參數，非數值會立刻報錯退出**，誘餌當場死亡。改用
+> `bash -c 'exec -a linkedin_job_search.py sleep 600'` 才是有效的偽造 cmdline。
+
+### 未涵蓋（誠實聲明）
+
+`run_scan.sh` 的 bash 端仍然**零自動化測試**；`kill_stalled_external()` 的實際
+動手路徑（會殺真行程）測試刻意不碰。詳見本條目上方第二輪條目的說明。
+
 ## 2026-09-19 — 掃描鎖的三個缺陷與一個已知限制（第二輪審查）
 
 第二輪 Senior Reviewer 對 `d1c60c8` 判定 `[REVIEW_REJECTED]`，確認 CRITICAL-1 /
@@ -31,6 +134,14 @@ MAJOR-1 / MAJOR-2 / MINOR-1 / MINOR-8 五項修正到位，但抓到一個新的
 這個狀態只存在於「取鎖 → Popen」之間的微秒級窗口，所以 60 秒極寬鬆；刻意取寬是因為
 **誤放鎖的代價（兩套爬蟲並發，重演 2026-08-13）比多等一分鐘高**。保守之處：只在
 `SEARCH_PROCESS is None` 時動手，子程序還在（或 reader thread 仍在收尾）一律不碰。
+
+> ⚠️ **2026-09-19 更正（第三輪審查）：上一段的判準本身就是缺陷。** 「只在
+> `SEARCH_PROCESS is None` 時動手」漏掉了另一半：`SEARCH_PROCESS` **非 None 但子程序
+> 已經死了**（reader thread 解碼失敗身亡、或子在釋放前自行結束）。那個狀態下
+> `kill_stalled_search()` 看 `poll()` 不為 None 而放棄、`reap_orphan_search_lock()`
+> 看 `SEARCH_PROCESS` 不為 None 而放棄 —— **兩邊都不管，鎖永遠不放**。
+> 現行實作已改為判斷「**子程序是否還活著**」（`proc.poll() is None`）而非
+> 「欄位是否為 None」。詳見下方第三輪條目 MAJOR-A。
 
 ### MINOR-11 — `kill_stalled_external()` 的 TOCTOU（已縮小，未歸零）
 
@@ -63,12 +174,14 @@ no-op 護欄（背景執行緒走模組全域），測試要驗證真正的護�
 
 ### 未涵蓋（誠實聲明）
 
-自動化測試**只有** `tests/test_scan_lock.py`（20 項，含 MAJOR-3 與孤兒鎖自癒），
+自動化測試**只有** `tests/test_scan_lock.py`（**39 項**，含 MAJOR-3 與孤兒鎖自癒），
 其餘仍為手動驗證。該測試以變異實驗自我驗證：把 `SEARCH_LOCK` 換回
 `threading.Lock()` → 5 項 FAIL 並卡死；拿掉 `except` 區塊的 `_release_search_lock()`
-→ 3 項 FAIL（含重現 `"A scan is already running"`）。**未覆蓋**：`run_scan.sh` 的
-重試邏輯（bash 端零測試）、`kill_stalled_external()` 的實際動手路徑（會殺真行程，
-測試刻意不碰）。
+→ **5 項** FAIL（含重現 `"A scan is already running"`）。
+> ⚠️ 2026-09-19 更正：此處原寫「3 項 FAIL」。第三輪審查獨立重跑變異實驗，實測為
+> **5 項**，本行已更正。低估 FAIL 數意味著低估了這條路徑的波及面。
+**未覆蓋**：`run_scan.sh` 的重試邏輯（bash 端仍然零測試）、
+`kill_stalled_external()` 的實際動手路徑（會殺真行程，測試刻意不碰）。
 
 ## 2026-09-19 — 排程主權移交 systemd timer（解決休眠導致整天不掃描）
 

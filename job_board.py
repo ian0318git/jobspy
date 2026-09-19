@@ -407,6 +407,12 @@ def start_search():
                 [sys.executable, "-u", script],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, bufsize=1, cwd=SCRIPT_DIR,
+                # errors="replace"：輸出是抓回來的網頁文字，遇到無法以 locale 解碼的
+                # 位元組時，strict 會讓讀取端拋 UnicodeDecodeError 並帶走整個 reader
+                # thread（詳見 _read_search_output 的說明）。寧可看到一個 U+FFFD，
+                # 也不要一條會靜默停掉全機掃描的路徑。_follow_live_log 讀 live log
+                # 用的也是 errors="replace"，這裡只是統一。
+                errors="replace",
             )
         except Exception as e:
             # 鎖【已經在我們手上了】（本函式開頭呼叫的 _acquire_search_lock()；刻意
@@ -459,12 +465,24 @@ def _read_search_output(proc):
     就換掉 SEARCH_PROCESS，屆時讀全域會混到新程序的輸出。
     """
     global SEARCH_LAST_OUTPUT_AT
-    for line in proc.stdout:
-        _append_output(line.rstrip("\n"))
-        SEARCH_LAST_OUTPUT_AT = time.monotonic()
-    proc.wait()
-    # 子程序結束＝這一輪掃描結束，鎖必須立刻放掉，否則 timer 的下一輪會被擋住。
-    _release_search_lock(proc)
+    # try/finally 是必要的，不是防禦性裝飾。這個迴圈是唯一會呼叫
+    # _release_search_lock(proc) 的地方，而流進來的是【爬蟲抓回來的網頁文字】。
+    # 若 Popen 的 errors= 是預設的 strict，任何一個無法以 locale 解碼的位元組都會讓
+    # 這一行拋 UnicodeDecodeError、執行緒當場死亡，永遠走不到下面的釋放。若子行程
+    # 恰好已自行結束，就落進「SEARCH_PROCESS 非 None 但子行程已死」的盲區：
+    # kill_stalled_search() 看 poll() 不為 None 而放棄，reap_orphan_search_lock()
+    # 看 SEARCH_PROCESS 不為 None 而放棄 —— 兩邊都不管，鎖永遠不放，timer 每輪
+    # SKIPPED、exit 0、日誌一切正常，全機掃描就此永久停擺（2026-09-19 審查實測）。
+    try:
+        for line in proc.stdout:
+            _append_output(line.rstrip("\n"))
+            SEARCH_LAST_OUTPUT_AT = time.monotonic()
+        proc.wait()
+    finally:
+        # 子程序結束＝這一輪掃描結束，鎖必須立刻放掉，否則 timer 的下一輪會被擋住。
+        # 放在 finally：不論是正常 EOF、解碼失敗、還是讀取途中被 kill，鎖都會還回去。
+        # _release_search_lock 有 owner 檢查，重複呼叫是安全的 no-op。
+        _release_search_lock(proc)
 
 
 def get_search_stall_seconds():
@@ -509,26 +527,42 @@ ORPHAN_LOCK_GRACE = 60
 
 
 def reap_orphan_search_lock():
-    """回收「持有鎖、卻沒有任何子程序在跑」的孤兒鎖。回傳釋放的 fd；沒事回 None。
+    """回收「持有鎖、卻沒有【活著的】子程序」的孤兒鎖。回傳釋放的 fd；沒事回 None。
 
     這是最後一道防線。已知的洩漏路徑（Popen 失敗）已在 start_search() 內直接修掉，
     這裡防的是「還沒想到的那一條」。之所以值得為它加一個自癒機制，是因為這個缺陷
     類別的代價是【永久且靜默的全機掃描停擺】：timer 每輪等 20 秒後 SKIPPED、exit 0、
     日誌全部正常，只有 search_results/ 從此不再長大。
 
-    保守之處：只在 SEARCH_PROCESS is None 時動手。若子程序還在（或剛結束、reader
-    thread 仍在收尾），一律不碰 —— 那是有主的鎖，不是孤兒。
+    ⚠️ 判準是「子程序還活著嗎」，不是「SEARCH_PROCESS 是不是 None」。
+    2026-09-19 審查實測到這個差別會造就一個【兩邊都不管】的盲區 —— 子行程已死、
+    但 SEARCH_PROCESS 仍指向它時：
+        kill_stalled_search()  → get_search_stall_seconds() 看 poll() 不為 None
+                                  → 回 None → 直接放棄
+        本函式（修正前）        → 看 SEARCH_PROCESS 不為 None → 直接放棄
+    鎖因此永遠不放。而 start_search() 裡那條「回收已死子程序」的救援路徑，只有
+    使用者手動按下重新搜尋才會走到，timer 完全碰不到。審查者用一個已死的子行程
+    重現了完整後果：之後每一輪 run_scan.sh 都印 SKIPPED、exit 0，state 檔停在
+    上一輪的「正常結束」，從日誌與 UI 完全看不出掃描已經永久停擺。
+
+    仍保留的保守之處：子程序只要還活著（poll() is None）就一律不碰，即使 reader
+    thread 已經死了 —— 那是有主的鎖，誤放會造成兩套爬蟲並發，重演 2026-08-13 事故。
     """
     with SEARCH_LOCK:
-        if SEARCH_LOCK_FD is None or SEARCH_PROCESS is not None:
+        if SEARCH_LOCK_FD is None:
             return None
+        proc = SEARCH_PROCESS
+        if proc is not None and proc.poll() is None:
+            return None                     # 子程序還活著 → 有主的鎖，不是孤兒
         held_since = SEARCH_LOCK_HELD_SINCE
         if held_since is None or time.monotonic() - held_since < ORPHAN_LOCK_GRACE:
             return None
         fd = SEARCH_LOCK_FD
+    who = ("沒有任何子程序在跑" if proc is None
+           else f"子程序 pid {proc.pid} 已結束但 SEARCH_PROCESS 未清空")
     print(
         f"[watchdog] 掃描鎖 fd={fd} 已被持有超過 {ORPHAN_LOCK_GRACE}s，"
-        f"但沒有任何子程序在跑 —— 判定為洩漏，主動釋放以免全機排程永久停擺",
+        f"{who} —— 判定為洩漏，主動釋放以免全機排程永久停擺",
         flush=True,
     )
     _release_search_lock()
@@ -629,6 +663,40 @@ def _external_idle_seconds():
         return time.monotonic() - _EXTERNAL["last_read_at"]
 
 
+def _log(msg):
+    """掃描／看門狗生命週期訊息的統一輸出：前面帶時戳。
+
+    為什麼非要有時戳不可：這幾行是判斷「掃描結束 → 看板自動換檔」延遲的唯一線索，
+    而沒有時戳就無從對齊。2026-09-19 審查指出，規劃階段的「≤15 秒換檔」判準在
+    當時的日誌格式下**根本不可量測** —— 只能改用 API 輪詢另外量。job_board.log 裡
+    Flask 的存取日誌本來就帶時戳，只有我們自己的 print 沒有，事故追查時看不出順序。
+    """
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def _pid_is_our_scan(pid):
+    """pid 真的是我們的掃描（run_scan.sh wrapper 或爬蟲）嗎？
+
+    非檢查不可的理由：state 檔是【上一輪留下的】，而且 phase 已經是 finished 也照讀
+    （見 kill_stalled_external 的 gating）。裡面的 pid 早就可能被系統回收給別的行程，
+    拿它直接 SIGKILL 就是隨機殺掉一棵無關的行程樹。2026-09-19 審查以 WTERMSIG=9
+    實測證實了這件事：受害者是一個與 jobspy 完全無關的 sleep 300。這台又是會 suspend
+    的 VM，PID 回收比一般機器快。專案自己的 MINOR-10 測試也用 `flock -c 'sleep'`
+    製造過 stray holder，所以這條路徑不是純理論。
+
+    判準用 cmdline 而不是「pid 存不存在」：PID 被回收後同一個號碼會是別的行程，
+    只有 cmdline 能區分。「不確定」一律回 False —— 不確定就不動手。
+    """
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            cmdline = f.read().decode("utf-8", "replace")
+    except OSError:
+        return False
+    if not cmdline:
+        return False        # zombie：cmdline 為空，不是可殺的目標
+    return any(m in cmdline for m in ("run_scan.sh", "linkedin_job_search.py"))
+
+
 def kill_stalled_external():
     """終止卡死的外部掃描。回傳被終止對象的說明；未達門檻或無對象回 None。
 
@@ -643,6 +711,20 @@ def kill_stalled_external():
     if idle is None or idle <= SEARCH_STALL_TIMEOUT:
         return None
     state = read_jobscan_state() or {}
+
+    # 身分閘門（2026-09-19 審查 MAJOR）：state 自稱「已結束」時，還持有鎖的那個人
+    # 一定不是我們的掃描 —— 那是 stray holder（例如有人用 flock 手動占著、或 wrapper
+    # 被 SIGKILL 後殘留），而 state 裡的 pid 已經是上一輪的遺物。放行就會拿一個可能
+    # 被回收的 PID 去 SIGKILL，殺掉無關的行程樹。
+    #
+    # 這裡刻意選擇「寧可不殺」：誤殺是無界的傷害（可能殺掉別的服務），而不殺的代價
+    # 有界 —— 真正卡死的掃描仍會被 systemd 的 TimeoutStartSec=5h 收掉，這條退路在
+    # 規劃階段就已明確接受（見 DECISIONS.md 風險 #7）。phase 停在 running 的正常卡死
+    # 情境（wrapper 被 SIGKILL → EXIT trap 不會執行 → state 永遠停在 running）
+    # 不受影響，照樣會被這裡終止。
+    if state.get("phase") != "running":
+        return None
+
     run_id, trigger, pid = state.get("run_id"), state.get("trigger"), state.get("pid")
 
     # TOCTOU 收尾（MINOR-11）：上面的判定與下面的動手之間隔著讀 state 檔與組字串，
@@ -660,20 +742,46 @@ def kill_stalled_external():
     target = None
     if trigger == "systemd-timer":
         # 交給 systemd：只有它知道完整的 cgroup，能一次收掉 wrapper 與爬蟲。
+        #
+        # 動手前必須確認 unit 真的在跑。2026-09-19 實測：對【inactive】的 unit 送
+        # `systemctl --user kill`，**退出碼是 0 但什麼也沒殺**。不確認就會留下
+        # 「已終止 jobscan.service」這筆假成功紀錄 —— 那比不殺更糟，因為它會讓下一個
+        # 追查事故的人以為停滯偵測正常運作過（正是本案要根除的那種靜默謊言）。
+        # 對照：oneshot 執行期間的狀態是 activating，不是 active，兩者都要接受。
         try:
-            r = subprocess.run(
-                ["systemctl", "--user", "kill", "--signal=SIGKILL", "jobscan.service"],
+            act = subprocess.run(
+                ["systemctl", "--user", "show", "jobscan.service",
+                 "-p", "ActiveState", "--value"],
                 capture_output=True, text=True, timeout=10,
                 env={**os.environ, "LC_ALL": "C"},
-            )
-            if r.returncode == 0:
-                target = f"jobscan.service (run_id={run_id})"
+            ).stdout.strip()
         except (OSError, subprocess.SubprocessError) as e:
-            print(f"[watchdog] systemctl kill 失敗: {e}", flush=True)
+            act = ""
+            _log(f"[watchdog] 查詢 jobscan.service 狀態失敗，不接手: {e}")
+        if act in ("active", "activating", "reloading"):
+            try:
+                r = subprocess.run(
+                    ["systemctl", "--user", "kill", "--signal=SIGKILL", "jobscan.service"],
+                    capture_output=True, text=True, timeout=10,
+                    env={**os.environ, "LC_ALL": "C"},
+                )
+                if r.returncode == 0:
+                    target = f"jobscan.service (run_id={run_id})"
+            except (OSError, subprocess.SubprocessError) as e:
+                _log(f"[watchdog] systemctl kill 失敗: {e}")
+        else:
+            _log(f"[watchdog] jobscan.service 目前為 {act or '未知'}，"
+                 f"沒有可終止的掃描 → 改走 PID 路徑（並受 cmdline 身分檢查）")
     if target is None and isinstance(pid, int) and pid > 1 and pid != os.getpid():
-        killed = _kill_tree(pid)
-        if killed:
-            target = f"PID {', '.join(str(p) for p in killed)} (run_id={run_id})"
+        # 第二層：即使 state 自稱 running，pid 也可能在我們讀它之後被回收。送不可逆的
+        # SIGKILL 前用 cmdline 確認身分，不符合就只留一行 log、不動手。
+        if _pid_is_our_scan(pid):
+            killed = _kill_tree(pid)
+            if killed:
+                target = f"PID {', '.join(str(p) for p in killed)} (run_id={run_id})"
+        else:
+            _log(f"[watchdog] 拒絕對 pid={pid} 動手：cmdline 不屬於 jobspy 掃描"
+                 f"（state 可能來自上一輪，pid 已被回收）")
     if target is None:
         return None
     _external_note(f"🛑 外部掃描已 {idle / 60:.1f} 分鐘無輸出，判定卡死，終止 {target}")
@@ -702,8 +810,28 @@ def _reset_external_follow(state):
 
 
 def _external_begin():
-    rid, trig = _reset_external_follow(read_jobscan_state() or {})
-    print(f"[jobscan] 偵測到外部掃描 run_id={rid} trigger={trig}", flush=True)
+    """偵測到有行程持有掃描鎖 → 開始跟讀。
+
+    只採用 phase == "running" 的 state 身分。state 檔是上一輪留下的，phase 已是
+    finished 時裡面的 run_id/trigger/pid 全是【過去式】，照抄會產生兩種傷害：
+      (a) 日誌與 UI 冒出根本不存在的掃描事件 —— 2026-09-19 審查在生產日誌實證：
+          27 分鐘前就結束的那一輪被重新「偵測到」一次，連 exit=0 都是從舊 state 抄的；
+      (b) 那個 stale pid 正是 kill_stalled_external() 誤殺無關行程的燃料。
+    真實身分由 _external_pump() 在 state 轉為 running 後補認 —— run_scan.sh 是
+    「先取鎖、才寫 state」，那個微秒級窗口本來就設計成由 pump 接手，這裡不是新機制。
+    """
+    state = read_jobscan_state() or {}
+    if state.get("phase") != "running":
+        # 來源不明的鎖持有者（stray holder，或 state 剛好不可讀）：不套用任何過期身分。
+        # started_at 用現在時間，讓 ext_id 為 None 時合成的 run_id 仍然可辨識
+        # （get_search_status 會退回 f"external:{started_at}"）。
+        state = {
+            "trigger": "unknown",
+            "run_id": None,
+            "started_at": datetime.now().isoformat(),
+        }
+    rid, trig = _reset_external_follow(state)
+    _log(f"[jobscan] 偵測到外部掃描 run_id={rid} trigger={trig}")
 
 
 def _follow_live_log():
@@ -754,28 +882,28 @@ def maybe_adopt_new_results(pre_run_file):
     global JOBS, DATA_FILE, CURRENT_FILE
     latest = find_latest_kanban()
     if not latest:
-        print("[jobscan] 沒有可用的結果檔，維持現況", flush=True)
+        _log("[jobscan] 沒有可用的結果檔，維持現況")
         return False
     latest_name = os.path.basename(latest)
     with SEARCH_LOCK:
         viewed = CURRENT_FILE
     # 使用者在掃描期間自己換過檔 → 尊重他的選擇，不要把他拉走
     if pre_run_file and viewed != pre_run_file:
-        print(f"[jobscan] 使用者已切換到 {viewed}，不自動換檔", flush=True)
+        _log(f"[jobscan] 使用者已切換到 {viewed}，不自動換檔")
         return False
     if viewed == latest_name:
         return False
     jobs = try_load_jobs(latest)
     if jobs is None:
-        print(f"[jobscan] 新結果檔 {latest_name} 無法解析，保留現有畫面", flush=True)
+        _log(f"[jobscan] 新結果檔 {latest_name} 無法解析，保留現有畫面")
         return False
     if not jobs:
         # 空結果（例如整輪被擋）蓋掉目前有 40 筆的看板，比不換更糟。
-        print(f"[jobscan] 新結果檔 {latest_name} 是空的，保留現有畫面", flush=True)
+        _log(f"[jobscan] 新結果檔 {latest_name} 是空的，保留現有畫面")
         return False
     JOBS, DATA_FILE = jobs, latest_name
     CURRENT_FILE = latest_name
-    print(f"[jobscan] 已自動切換到 {latest_name}（{len(jobs)} 筆）", flush=True)
+    _log(f"[jobscan] 已自動切換到 {latest_name}（{len(jobs)} 筆）")
     return True
 
 
@@ -795,13 +923,13 @@ def _external_end():
                 "exit_code": exit_code,
                 "finished_at": state.get("finished_at"),
             }
-        print(f"[jobscan] 外部掃描結束 run_id={run_id} exit={exit_code}", flush=True)
+        _log(f"[jobscan] 外部掃描結束 run_id={run_id} exit={exit_code}")
     else:
         # 鎖放掉了但 state 沒收尾 —— 可能是 wrapper 被 SIGKILL（EXIT trap 不會
         # 執行），或這一輪根本沒走到 finish()。誠實記錄，不要假裝成功。
-        print(f"[jobscan] 外部掃描結束但 state 未收尾 "
-              f"(phase={state.get('phase')} run_id={state.get('run_id')} "
-              f"預期={run_id})，不自動換檔", flush=True)
+        _log(f"[jobscan] 外部掃描結束但 state 未收尾 "
+             f"(phase={state.get('phase')} run_id={state.get('run_id')} "
+             f"預期={run_id})，不自動換檔")
         return
     if exit_code == 0:
         maybe_adopt_new_results(pre)
@@ -845,37 +973,37 @@ def _external_pump():
     new_id = state.get("run_id")
     if state.get("phase") == "running" and new_id and new_id != cur:
         rid, trig = _reset_external_follow(state)
-        print(f"[jobscan] 外部掃描身分確認為 run_id={rid} trigger={trig}", flush=True)
+        _log(f"[jobscan] 外部掃描身分確認為 run_id={rid} trigger={trig}")
     _follow_live_log()
 
 
 def _jobscan_watch_loop():
     """背景執行緒：每 5 秒檢查是否有外部掃描，並跟讀它的輸出。"""
-    print("[jobscan] External scan watcher started", flush=True)
+    _log("[jobscan] External scan watcher started")
     while not SCHEDULE_STOP.is_set():
         try:
             _jobscan_watch_tick()
         except Exception as e:
-            print(f"[jobscan] watcher error: {e}", flush=True)
+            _log(f"[jobscan] watcher error: {e}")
         SCHEDULE_STOP.wait(5)
 
 
 def watchdog_loop():
     """背景執行緒：定期檢查搜尋子程序（自家的與外部的）是否卡死。"""
-    print("[watchdog] Watchdog thread started", flush=True)
+    _log("[watchdog] Watchdog thread started")
     while not SCHEDULE_STOP.is_set():
         try:
             pid = kill_stalled_search()
             if pid is not None:
-                print(f"[watchdog] Terminated stalled search PID {pid}", flush=True)
+                _log(f"[watchdog] Terminated stalled search PID {pid}")
             target = kill_stalled_external()
             if target is not None:
-                print(f"[watchdog] Terminated stalled external scan: {target}", flush=True)
+                _log(f"[watchdog] Terminated stalled external scan: {target}")
             orphan = reap_orphan_search_lock()
             if orphan is not None:
-                print(f"[watchdog] Released orphan scan lock fd={orphan}", flush=True)
+                _log(f"[watchdog] Released orphan scan lock fd={orphan}")
         except Exception as e:
-            print(f"[watchdog] Error: {e}", flush=True)
+            _log(f"[watchdog] Error: {e}")
         SCHEDULE_STOP.wait(60)
 
 
