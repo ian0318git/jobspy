@@ -19,6 +19,7 @@ jobscan-watch 三個背景執行緒（既有設計，非本測試引入）。wat
 可觀測的不變式（過期 owner 絕不生效、併發猛敲後狀態仍正確、無 fd 洩漏），
 窗口本身是否關閉則以程式碼閱讀佐證（兩行已被 `with SEARCH_LOCK:` 包住）。
 """
+import atexit
 import os
 import subprocess
 import sys
@@ -117,6 +118,60 @@ def proc_alive(pid: int) -> bool:
         return False
 
 
+# 誘餌行程一律走這裡生。兩個理由，都是實際踩到的：
+#   1. stdout/stderr 必須導向 DEVNULL。子行程會【繼承本測試的 stdout】，而 stdout
+#      通常是管線（`... | tail`）。只要有任何一個誘餌沒被殺掉，它就繼續握著管線的
+#      寫入端 → 讀取端永遠等不到 EOF → 整個指令看起來像「卡死」。2026-09-19 診斷
+#      M8 變異逾時 400 秒就是這個：兩個 PPID=1 的孤兒 python 握著管線，測試本身
+#      其實早就跑完了。
+#   2. 全部登記起來，收工時無條件清掉。測試【失敗】的時候最需要這個 —— 而失敗
+#      正是變異測試刻意製造的情境（M8 就是讓應該被殺的誘餌活下來）。留著孤兒等於
+#      每次跑變異都在機器上疊一個 sleep 600。
+_SPAWNED: list[subprocess.Popen] = []
+
+
+def spawn(*argv: str) -> subprocess.Popen:
+    p = subprocess.Popen(list(argv), stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+    _SPAWNED.append(p)
+    return p
+
+
+def wait_dead(proc: subprocess.Popen, timeout: float = 5) -> bool:
+    """等子程序結束，回傳「真的結束了嗎」。
+
+    刻意【不讓 TimeoutExpired 冒出去】：逾時正是「應該被殺的誘餌還活著」這個失敗
+    情境本身，它必須變成一項 FAIL，不能把整個測試炸掉。2026-09-19 實測 —— M8
+    （kill_stalled_external 整個 no-op）就是在這裡拋 TimeoutExpired，害 F7b / F7c /
+    G 共 9 項檢查根本沒跑到：變異表面上「被逮」，實際是把後面的訊號全遮掉了。
+    真實迴歸發生時有一模一樣的後果（只看到第一項失敗，看不到全貌）。
+
+    【本檔鐵律】不得對誘餌呼叫無界的 .wait() —— 誘餌動輒 sleep 600，一旦突變讓它
+    活下來，測試就會卡死而不是失敗。一律走這裡。
+    """
+    try:
+        proc.wait(timeout=timeout)
+        return True
+    except subprocess.TimeoutExpired:
+        return False
+
+
+def reap_all_spawned() -> None:
+    for p in _SPAWNED:
+        if p.poll() is None:
+            p.kill()
+    for p in _SPAWNED:
+        wait_dead(p)
+
+
+# 掛在 atexit，不是只寫在檔尾 —— 因為「檔尾那一行」在【例外】路徑上根本到不了：
+# 上面的跳線故意拋 AssertionError，任何非預期例外也會直接冒出去。atexit 在
+# sys.exit()、未捕捉例外、正常結束三種收場都會跑，不必把 600 行全部再縮排一層。
+# （唯一蓋不到的是 SIGKILL —— 但那種情況下誘餌最長 600 秒就自己結束，
+#   而且已經導向 DEVNULL，不會再出現「握著管線假裝卡死」的問題。）
+atexit.register(reap_all_spawned)
+
+
 # ═══ A. CRITICAL-1：kill_stalled_search() 自我死鎖 ═══════════════════════════
 print("=== A. CRITICAL-1：SEARCH_LOCK 必須可重入 ===")
 
@@ -150,7 +205,7 @@ threading.Thread(target=nested_call, daemon=True).start()
 check("持鎖狀態下呼叫 _append_output() 不會死鎖", nested_done.wait(10))
 
 print("=== A2. CRITICAL-1：完整 kill_stalled_search() 路徑 ===")
-child = subprocess.Popen(["sleep", "600"])
+child = spawn("sleep", "600")
 jb.SEARCH_PROCESS = child
 jb.SEARCH_LAST_OUTPUT_AT = time.monotonic() - 1000  # 遠超 SEARCH_STALL_TIMEOUT
 jb.SEARCH_START_TIME = time.monotonic() - 1000
@@ -311,14 +366,14 @@ jb._release_search_lock()
 
 fd = jb._acquire_search_lock()
 jb.SEARCH_LOCK_HELD_SINCE = time.monotonic() - (jb.ORPHAN_LOCK_GRACE + 10)
-owner_proc = subprocess.Popen(["sleep", "600"])
+owner_proc = spawn("sleep", "600")
 jb.SEARCH_PROCESS = owner_proc
 check(
     "有子程序在跑時不得回收（那是有主的鎖，誤放會導致並發爬蟲）",
     jb.reap_orphan_search_lock() is None,
 )
 owner_proc.kill()
-owner_proc.wait()
+wait_dead(owner_proc)
 jb.SEARCH_PROCESS = None
 jb._release_search_lock()
 check("清理：鎖已釋放", jb.SEARCH_LOCK_FD is None)
@@ -330,8 +385,8 @@ print("=== F. 第三輪退回：孤兒鎖盲區 / 誤殺無關行程 / 幻影掃
 # 修正前 kill_stalled_search() 看 poll() 不為 None 而放棄、reap_orphan_search_lock()
 # 看 SEARCH_PROCESS 不為 None 而放棄，於是鎖永遠不放、timer 每輪 SKIPPED + exit 0。
 fd = jb._acquire_search_lock()
-dead = subprocess.Popen(["true"])
-dead.wait()                                     # 已結束，poll() 回 0（不是 None）
+dead = spawn("true")
+wait_dead(dead)                                     # 已結束，poll() 回 0（不是 None）
 jb.SEARCH_PROCESS = dead
 jb.SEARCH_LOCK_HELD_SINCE = time.monotonic() - (jb.ORPHAN_LOCK_GRACE + 10)
 check(
@@ -344,17 +399,17 @@ jb.SEARCH_PROCESS = None
 # F2：對照組 —— 子程序還活著就絕不能回收（那是有主的鎖，誤放 = 兩套爬蟲並發，
 # 正是 2026-08-13 事故的成因）。
 fd = jb._acquire_search_lock()
-alive = subprocess.Popen(["sleep", "600"])
+alive = spawn("sleep", "600")
 jb.SEARCH_PROCESS = alive
 jb.SEARCH_LOCK_HELD_SINCE = time.monotonic() - (jb.ORPHAN_LOCK_GRACE + 10)
 check("子程序還活著時不得回收（即使超過寬限值）", jb.reap_orphan_search_lock() is None)
 alive.kill()
-alive.wait()
+wait_dead(alive)
 jb.SEARCH_PROCESS = None
 jb._release_search_lock()
 
 # F3：PID 身分驗證 —— state 檔是上一輪留下的，裡面的 pid 可能已被回收給別的行程。
-bystander = subprocess.Popen(["sleep", "600"])
+bystander = spawn("sleep", "600")
 check(
     "_pid_is_our_scan() 必須認出無關行程",
     jb._pid_is_our_scan(bystander.pid) is False,
@@ -367,13 +422,13 @@ check(
 # 2026-09-19 第四輪審查：這一項原本斷言 is True，等於把「子字串比對」的弱點
 # 寫成規格 —— 冒名者被認可。要送的訊號是 SIGKILL（不可逆），寬鬆的方向剛好是
 # 最危險的那一邊，所以改成斷言【必須拒絕】。
-impersonator = subprocess.Popen(["bash", "-c", "exec -a linkedin_job_search.py sleep 600"])
+impersonator = spawn("bash", "-c", "exec -a linkedin_job_search.py sleep 600")
 time.sleep(0.5)          # 等 exec 完成，cmdline 才是最終內容
 check("冒名者必須被拒（argv[0] 不是 python解譯器，只是名字取得像）",
       jb._pid_is_our_scan(impersonator.pid) is False,
       f"cmdline={open(f'/proc/{impersonator.pid}/cmdline','rb').read().decode('utf-8','replace')!r}")
 impersonator.kill()
-impersonator.wait()
+wait_dead(impersonator)
 
 check("不存在的 pid 必須回 False（不確定就不動手）", jb._pid_is_our_scan(999999) is False)
 
@@ -381,22 +436,22 @@ check("不存在的 pid 必須回 False（不確定就不動手）", jb._pid_is_
 # 永遠回 False 也會全部通過 —— 那就變成「永遠不開槍」，卡死的掃描再也不會被收掉。
 # 爬蟲的真實形狀是 run_scan.sh 用 `"$PY" -u "$SCRIPT"` 啟動，所以 argv[0] 是
 # python、腳本路徑在參數裡（不是 argv[0]）。
-ours = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)",
-                         "/tmp/linkedin_job_search.py"])
+ours = spawn(sys.executable, "-c", "import time; time.sleep(600)",
+                         "/tmp/linkedin_job_search.py")
 time.sleep(0.5)
 check("爬蟲形狀必須被認出（argv[0]=python 解譯器、argv 含我們的路徑）",
       jb._pid_is_our_scan(ours.pid) is True,
       f"cmdline={open(f'/proc/{ours.pid}/cmdline','rb').read().decode('utf-8','replace')!r}")
 ours.kill()
-ours.wait()
+wait_dead(ours)
 
-wrapper = subprocess.Popen(["bash", "-c", "exec -a run_scan.sh sleep 600"])
+wrapper = spawn("bash", "-c", "exec -a run_scan.sh sleep 600")
 time.sleep(0.5)
 check("wrapper 形狀必須被認出（argv[0] 就是 run_scan.sh）",
       jb._pid_is_our_scan(wrapper.pid) is True,
       f"cmdline={open(f'/proc/{wrapper.pid}/cmdline','rb').read().decode('utf-8','replace')!r}")
 wrapper.kill()
-wrapper.wait()
+wait_dead(wrapper)
 
 # F4：kill_stalled_external() 的兩道身分閘門。
 # 用真實的 state 檔內容，但 phase=finished —— 這正是審查重現誤殺時的情境。
@@ -474,7 +529,7 @@ check("旁觀者仍未被殺", bystander.poll() is None)
 check("PID 路徑不得呼叫 systemctl（那是 systemd 分支的事）",
       syscalls2 == [], f"實際呼叫={syscalls2}")
 bystander.kill()
-bystander.wait()
+wait_dead(bystander)
 
 # F5：幻影外部掃描 —— 不得採用「已結束那一輪」的 state 身分。
 with mock.patch.object(jb, "read_jobscan_state",
@@ -533,8 +588,8 @@ check("讀取端拋出 UnicodeDecodeError 時仍必須釋放掃描鎖（try/fina
 print("=== F7. 第四輪退回：殺戮路徑的正向覆蓋 ===")
 
 # F7a：PID 路徑 —— state 自稱 running、cmdline 真的是我們的 → 必須動手，且真的殺掉。
-victim = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)",
-                           "/tmp/linkedin_job_search.py"])
+victim = spawn(sys.executable, "-c", "import time; time.sleep(600)",
+                           "/tmp/linkedin_job_search.py")
 time.sleep(0.5)
 victim_pid = victim.pid
 syscalls_pos = []
@@ -557,9 +612,8 @@ check("卡死且身分相符時【必須】動手（否則就是矯正成不殺�
       fired is not None and "pos_manual" in fired, f"回傳={fired!r}")
 check("（承上）PID 路徑不得順便去動 systemctl",
       syscalls_pos == [], f"實際呼叫={syscalls_pos}")
-victim.wait(timeout=5)
 check("目標必須真的死亡（不是只回報殺了）",
-      victim.poll() is not None, f"poll={victim.poll()}")
+      wait_dead(victim, 5), f"poll={victim.poll()}")
 
 # F7b：systemd 分支 —— unit 在 activating（＝真的有一輪在跑）時必須送出 kill。
 syscalls3 = []
@@ -652,8 +706,8 @@ check("（承上）這次失敗後鎖同樣必須已釋放", jb.SEARCH_LOCK_FD i
 # 審查變異 M9：拿掉第二個 _we_hold_scan_lock() → 39 項全過（無覆蓋）。
 # DECISIONS 把它列為「刻意接受的殘餘風險」，但程式碼既然留著這道檢查，
 # 就該有東西證明它還在。
-victim2 = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)",
-                            "/tmp/linkedin_job_search.py"])
+victim2 = spawn(sys.executable, "-c", "import time; time.sleep(600)",
+                            "/tmp/linkedin_job_search.py")
 time.sleep(0.5)
 hold_calls = []
 
@@ -675,7 +729,11 @@ check("動手前若已取得掃描鎖，必須放棄（TOCTOU 重檢）",
       f"回傳={toctou!r} 檢查次數={len(hold_calls)}")
 check("（承上）目標必須還活著", victim2.poll() is None)
 victim2.kill()
-victim2.wait()
+wait_dead(victim2)
+
+# 收工前清場。失敗路徑【最需要】這一行：變異測試刻意製造的情境就是「應該被殺的
+# 誘餌活著」。上面 atexit 是備援，這裡是正常路徑的保證。
+reap_all_spawned()
 
 # ═══ 結果 ════════════════════════════════════════════════════════════════════
 print()
