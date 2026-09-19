@@ -117,4 +117,7 @@ for name, src, to_file in CONFIGS:
 
 print("\n※ rc=-6 就是 SIGABRT（'could not acquire lock ... at interpreter shutdown'）")
 print("※ 兩次獨立的量測可以差距很大（B 實測過 15/60 與 7/60）——")
-print("  小樣本只能證明「A 是 0」，不能拿來排名 B 與 C。要下那種結論請加大 N 並重跑多次。")
+print("  小樣本【不能】拿來排名 B 與 C，也【不能】拿來宣稱 A 是 0：")
+print("  A 在 N=60 的兩次都是 0/60，但 N=20 那次出現了 1/20。")
+print("  要宣稱「某個組態不會 ABRT」，需要的是機制（A 的 os._exit(0) 不進")
+print("  finalization，因此不需要搶那把鎖），不是樣本 —— 0 比非 0 難證明得多。")
