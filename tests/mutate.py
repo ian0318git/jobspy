@@ -127,6 +127,13 @@ MUTATIONS = [
         t,
         '    with _LOG_LOCK:\n        sys.stdout.write(f"{line}\\n")\n        sys.stdout.flush()\n',
         '    with _LOG_LOCK:\n        print(line, flush=True)\n', "M12")),
+    # M13 問的是：鎖本身是不是必要的？（單次 write 留著，只拿掉鎖）
+    # 如果 M13 逃脫，代表**單次 write 才是關鍵**，鎖只是加強 ——
+    # 那麼 job_board.py 的註解就寫錯了，必須改成誠實的版本，不能宣稱「兩個都必要」。
+    ("M13 拿掉鎖（保留整行一次 write）", lambda t: sub_once(
+        t,
+        '    with _LOG_LOCK:\n        sys.stdout.write(f"{line}\\n")\n        sys.stdout.flush()\n',
+        '    sys.stdout.write(f"{line}\\n")\n    sys.stdout.flush()\n', "M13")),
 ]
 
 results = []
