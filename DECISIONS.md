@@ -2,7 +2,113 @@
 
 重要決策紀錄 — 依專案工作流程要求更新。
 
+## 2026-09-19 — 排程主權移交 systemd timer（解決休眠導致整天不掃描）
+
+**問題：** 晚上電腦休眠 → 喚醒後補跑視窗不足 → 整個時段被跳過。
+`scheduler_loop()` 的補跑視窗是**硬性 6 小時**（條件為 `(now - target).total_seconds() < 21600`）：
+
+| 情境 | 結果 |
+|---|---|
+| 23:00 睡 → 09:00 醒 | 06:00 落後 3h < 6h → 補跑 ✅ |
+| 23:00 睡 → **12:30 醒** | 06:00 落後 6.5h > 6h → **整天不掃描** ❌ |
+| 跨午夜（23:00 睡 → 07:00 醒） | 前一天 22:00 永久遺失 ❌ |
+
+**根因：** 這台是 VMware VM，**跟著宿主機一起 suspend，VM 無法自行醒來**，
+所以 timer 的 `WakeSystem=true` 無效。唯一可行的是「醒來後補跑」。
+
+**決策（使用者選定）：** 排程改由 `jobscan.timer` 負責。
+- `deploy/jobscan.timer`：`OnCalendar=*-*-* 06:00:00 / 22:00:00 Australia/Melbourne` + **`Persistent=true`**
+- `Persistent=true` 正是「補跑」的原生機制，且**沒有**內建排程器那種人為視窗上限
+- 內建排程器**停用但保留**（閘門 `JOB_BOARD_INTERNAL_SCHEDULER`，未設＝停用）
+- 維持 **user service**（`Linger=yes` 已開，功能等價且不需 sudo；本機 sudo 需密碼）
+- `jobscan.service` 用 `TimeoutStartSec=5h` 而非 alpha 的 `0`（無限）：`Type=oneshot`
+  一次只能有一個 instance，若卡死又無逾時，unit 會永遠停在 `activating`，
+  之後**每次 timer 觸發都被視為「已在跑」而整批吞掉**，而 `list-timers` 仍顯示漂亮的 NEXT
+  —— 這正是 2026-09-17 那次 50 小時卡死的同一種病。爬蟲理論上限 48 詞 × 300s = 4h，故 5h 不會誤殺。
+
+**三道鎖（缺一不可，防止雙軌觸發）：**
+1. `scheduler_loop()` 開頭閘門 → thread 直接結束（零喚醒、零 log、零 CPU）
+2. 啟動時壓平 `.job_board_schedule.json`：`enabled=false`、清 `_fired_today`、`managed_by="systemd-timer"`
+3. `POST /api/schedule {"enabled":true}` 被拒並回 `warning`（不變更、不寫檔）
+
+**⚠️ 實測推翻的假設（重要，別再犯）：** 原以為 `enable --now jobscan.timer` 會因為
+`Persistent=true` 立刻補跑一次。**實測不會。** systemd 只在
+`~/.local/share/systemd/timers/stamp-jobscan.timer` 這個 stamp「存在且比錯過的時段舊」時才補跑；
+stamp 不存在時，它把 stamp 設為 now 然後等下一個時段（避免第一次啟用就回溯觸發所有歷史時段）。
+stamp 的**內容是空的，時間存在 mtime**。
+正確的驗證方式（2026-09-19 實測通過，Stage 5）：
+
+```bash
+touch -d '2026-09-19 05:00:00' ~/.local/share/systemd/timers/stamp-jobscan.timer
+systemctl --user restart jobscan.timer   # → 立刻補跑，list-timers 的 LAST 變成 now
+```
+
+**可逆性：** `systemctl --user edit jobboard` 加 `Environment=JOB_BOARD_INTERNAL_SCHEDULER=1`
+後重啟即可救回內建排程器（程式碼從未被刪，只是被閘門擋住）。
+
+## 2026-09-19 — 全機唯一掃描入口 run_scan.sh；flock 成為唯一「掃描狀態來源」
+
+**問題：** 排程移到 systemd 之後，timer 啟動的爬蟲不在 dashboard 的 `SEARCH_PROCESS`
+（in-process 全域）裡 → `/api/search/status` 會回報「沒在跑」，跑完 `JOBS` 也不會重載。
+**UI 會比遷移前更糟**，所以這不是加分項而是遷移的必要配套。
+
+**決策：** 新增 `run_scan.sh` 作為**全機唯一**爬蟲入口（systemd timer、`run_search.sh`、
+看板 Re-Search 按鈕都走它），並讓 **flock 鎖檔本身成為掃描狀態的唯一真相來源**：
+- `run_scan.sh`：`exec 9>"logs/jobscan.lock"` + `flock -n 9` 保證不並發（取不到鎖印 SKIPPED 且 exit 0）
+- 持有鎖期間維護 `logs/search_state.json`（原子 `mv`）並 `tee` 到 `logs/search_current.log`
+- `job_board.py` 的 `_jobscan_watch_loop()`（每 5 秒）讀鎖 + 跟讀日誌 → 回報
+  `running / external / trigger / run_id / output`；掃描結束後自動換檔（尊重使用者已選的檔案）
+
+**關鍵性質（最常見的誤解）：** `flock` 綁 **fd / open file description**，不綁檔案存在 →
+**結構上不可能有 stale lock**，刪檔或崩潰都不會留下需要清理的殘鎖。
+且 python 子程序**繼承 fd 9**，所以 wrapper 被 SIGKILL 時，只要爬蟲還活著鎖就不會鬆手
+—— 因此停滯終止必須殺**整棵行程樹**（`_kill_tree()`，深度上限 10）。
+刻意**不用** `os.killpg`：手動掃描的 pgid 是使用者的終端機 pgid，殺下去會連終端機一起殺。
+
+**停滯判定：** 沉默超過門檻 → 殺整棵樹。這是針對 2026-09-17 那次 50 小時卡死的對策：
+`tls_client` 的 Go 層會 deadlock，讓 python 的 `timeout_seconds` 完全失效。
+
+**已知缺口（刻意接受）：** 看板若在外部掃描期間掛掉，就沒有停滯偵測，
+只剩 `jobscan.service` 的 `TimeoutStartSec=5h` 兜底。`Restart=always` 通常 5 秒內救回看板。
+
+## 2026-09-19 — 日誌輪替改用 systemd timer（不用 cron）+ 必須 copytruncate
+
+**問題：** `job_board.log`（157KB / 2618 行，約 2880 行/天）與 `logs/cron_search.log`（1.4MB）
+都無輪替、無限成長。
+
+**決策：** `deploy/logrotate.conf` + `jobboard-logrotate.timer`
+（每日 04:30 Melbourne，`Persistent=true`，刻意選在 22:00 掃描結束後、06:00 掃描開始前）。
+
+**兩點刻意與 alpha-validator 不同，勿「對齊」：**
+1. **不用 cron。** alpha 用 `0 0 * * *` crontab。這台 VM 跟著宿主機 suspend，
+   **cron 錯過就是永遠錯過**；systemd timer 的 `Persistent=true` 會在喚醒後補做。
+2. **一定有 `copytruncate`。** 兩個日誌都由 systemd 以 `StandardOutput=append:` 持有 fd，
+   systemd **不會重開檔**；用預設的 rename 輪替會讓寫入繼續落在已改名的舊 inode
+   （幽靈檔），而新的 `job_board.log` 永遠是空的。
+
+**實測驗證（Stage 7）：** 輪替後 inode **不變**（408086，原地截斷）、大小歸零；
+對看板發請求 → 新內容落在**新的** `job_board.log`（204 bytes，3 筆 GET）；
+舊檔 `job_board.log-2026-09-19` 大小 160097 → 160097 **未成長**（證明無幽靈寫入）；
+`grep -P '\x00'` 無 NUL 空洞（證實 `append:` 以 `O_APPEND` 開檔，截斷後寫入落在檔尾）。
+`jobboard-logrotate.service` 本身 rc=0 / `ExecMainStatus=0`。
+
+**已知取捨：** `copytruncate` 在「複製完、截斷前」有極短窗口會遺失寫入。
+若 logrotate 補跑時正好撞上 06:00/22:00 的掃描，`cron_search.log` 可能少掉幾行逐字稿。可接受。
+
+**注意：** `logs/search_current.log` **刻意排除**在輪替之外 —— 它由 `run_scan.sh`
+每輪 `: >` 截斷，本來就是有界的，且是看板即時跟讀的來源，輪替只會讓 follower 白做一次 reset。
+
 ## 2026-09-13 — 完整遷移到 Oracle VPS，以 SSH tunnel 存取 dashboard
+
+> ⚠️ **2026-09-19 更正：本機沒有退役，且本機重新成為主要執行環境。**
+> 使用者需求變更為「我的本地還是要繼續跑」。另外探索時確認：VPS 的機房 IP 會被
+> Cloudflare 站點（Jora）擋掉，本機可抓 —— 這使「全部搬 VPS」的代價比當初評估的更高。
+> 因此本機 `jobboard.service` 明確綁 `JOB_BOARD_HOST=127.0.0.1`（純本機看板、不對外），
+> 遠端存取改用 `ssh -L 5000:127.0.0.1:5000 <host>`。
+> **本條目其餘內容仍然有效**：editable install 那個 P0（PyPI 版缺 `JORA` 成員導致四來源
+> 全滅且 exit code 仍為 0）、SSH tunnel 而非公開埠的決策，都繼續適用。
+
+
 
 **問題：** dashboard 只綁本機 LAN（`http://192.168.44.128:5000`），離開家裡網段就無法開啟。
 
@@ -131,6 +237,17 @@ Jora 貢獻 134/182 筆（73.6%），但**只有 32 個唯一職稱、24 間唯�
 
 ## 2026-08-19 — dashboard 改以 systemd user service 常駐
 
+> ⚠️ **2026-09-19 更正（兩處）：**
+> 1. `run.sh` / `stop.sh` 已改寫成 `systemctl --user restart|stop jobboard.service` 的薄殼，
+>    **可以正常使用**。舊版 `stop.sh` 用 `pgrep` + `kill`，會被 `Restart=always` 在 5 秒後
+>    復活 —— 它從來沒有真正停掉過服務（實測：舊版停不掉，新薄殼停得住）。
+>    新版**刻意不提供 nohup fallback**：`>` 會用 O_TRUNC 清空 systemd 正在 append 的日誌，
+>    且會與 `Restart=always` 搶 5000 埠造成 EADDRINUSE flap。
+> 2. 本條目最後寫的「排程配置（06:00 / 22:00 + 6h 補觸發）不變」**已被推翻**，
+>    見上方 2026-09-19 條目。
+
+
+
 **問題：** 2026-08-13 決策後 dashboard（job_board.py）為唯一排程來源，
 但僅靠 `./run.sh`（nohup）啟動，重開機或程序死掉後不會自動恢復
 （本次檢查時已無執行，job_board.log 停在當日 07:40）。
@@ -150,6 +267,16 @@ Jora 貢獻 134/182 筆（73.6%），但**只有 32 個唯一職稱、24 間唯�
 **後續：** `run.sh` / `stop.sh` 保留但僅供手動除錯用；啟用服務後勿再使用。
 
 ## 2026-08-13 — 排程改為 dashboard 唯一來源
+
+> ⚠️ **2026-09-19 更正：排程主權已移交 systemd timer，「dashboard 為唯一排程來源」不再成立。**
+> 本條目的**核心貢獻仍然成立且更徹底** —— 它要解決的是「多重觸發來源互不可見」，
+> 現在由 `run_scan.sh` 的 flock 從結構上根絕（全機唯一入口，見 2026-09-19 條目）。
+> 但「由 dashboard 排程」這件事本身已被取代：dashboard 的內建排程器已停用（三道鎖）。
+> 同時 `deploy/jobscan-morning.service/.timer` 與 `morning_catchup.sh` 已於 2026-09-19
+> **`git rm`** —— 前者沒有 `TimeoutStartSec`，直接安裝會在 systemd 的 90 秒預設逾時被殺；
+> 後者做的事已被 `Persistent=true` 取代，留著只會在有人加 cron 時重演本條目記載的並發事故。
+
+
 
 **問題：** 搜尋排程有 3 個實際來源，造成重複觸發：
 1. crontab `0 22 * * *` 直接執行 `linkedin_job_search.py`

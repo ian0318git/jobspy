@@ -36,9 +36,17 @@ pip install pandas python-jobspy flask
 ### 1. Run a search
 
 ```bash
-source .venv/bin/activate
-python linkedin_job_search.py
+./run_search.sh
 ```
+
+> ⚠️ **不要直接 `python linkedin_job_search.py`。**
+> `run_search.sh` → `run_scan.sh` 是全機唯一的爬蟲入口，它用 `logs/jobscan.lock` 的
+> flock 保證手動掃描與 systemd timer 的排程掃描**不會並發**
+> （2026-08-13 發生過兩套系統並發重複搜尋，各產一份結果檔）。
+> 直接呼叫 python 會繞過這道鎖，也會讓看板的掃描狀態顯示失準。
+> `Ctrl-C` / `SIGTERM` 會經由 `exec` 原樣傳到爬蟲。
+
+即時輸出：`tail -f logs/search_current.log`　完整逐字稿：`tail -f logs/cron_search.log`
 
 Output goes to `search_results/`:
 ```
@@ -52,23 +60,49 @@ Each run creates timestamped files — historical results are never overwritten.
 
 ### 2. Launch the Kanban board
 
-```bash
-source .venv/bin/activate
-python job_board.py
-```
-
-Open `http://192.168.44.128:5000` in Chrome.
-
-**For the auto-scheduler to work, the server must run persistently:**
+看板以 **systemd user service** 常駐（`Restart=always`，開機自動啟動、不需登入）：
 
 ```bash
-nohup python job_board.py > job_board.log 2>&1 &
+./run.sh     # = systemctl --user restart jobboard.service
+./stop.sh    # = systemctl --user stop jobboard.service（真的停得住，見下）
 ```
 
-Idle resource usage: ~0.1% CPU, ~32 MB RAM.
+Open `http://127.0.0.1:5000` in Chrome.
 
-Check it's alive: `ps aux | grep job_board`
-Stop it: `pkill -f job_board.py`
+**只綁 loopback**（2026-09-19 起）。要從別台機器看請開 SSH 通道：
+`ssh -L 5000:127.0.0.1:5000 <host>`，然後開 `http://127.0.0.1:5000`。
+
+Idle resource usage: ~0.1% CPU, ~36 MB RAM（`MemoryMax=512M` 是失控成長的天花板）。
+
+```bash
+systemctl --user status  jobboard.service
+journalctl --user -u jobboard.service -n 50
+tail -f job_board.log
+```
+
+> 舊版 `stop.sh` 用 `pkill -f job_board.py`，會被 `Restart=always` 在 5 秒後復活
+> —— 它從來沒有真正停掉過服務。新版走 `systemctl stop`（明確的 stop 不受 `Restart=` 影響）。
+
+**排程由 systemd timer 負責，不是看板本身**（2026-09-19 起）：
+
+| Timer | 時刻（Melbourne） | 用途 |
+|---|---|---|
+| `jobscan.timer` | 06:00 / 22:00 | 執行爬蟲。`Persistent=true` → **休眠喚醒後會補跑** |
+| `jobboard-logrotate.timer` | 04:30 | 輪替 `job_board.log` 與 `logs/cron_search.log` |
+
+```bash
+systemctl --user list-timers --all | grep -E 'jobscan|logrotate'
+```
+
+改用的理由：內建排程器的補跑視窗是硬性 6 小時，**12:30 之後才喚醒就整天不掃描**
+（這台 VM 跟著宿主機 suspend，無法自行醒來）。詳見 `DECISIONS.md` 2026-09-19 條目。
+
+看板標題列有掃描狀態晶片，且能**看見不是它自己啟動的掃描**（timer 觸發的也算，
+會即時跟讀輸出並在結束後自動換檔）。排程面板為**唯讀**：強制 POST `{"enabled":true}`
+會被拒絕並回 `warning`（三道鎖防止雙軌觸發）。
+
+> `python job_board.py` 前景執行仍可用於除錯，但它不會被 systemd 接管日誌，
+> 且會與常駐服務搶 5000 埠。正式使用請走 `./run.sh`。
 
 ---
 

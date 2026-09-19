@@ -15,6 +15,11 @@ melbourne_embedded_jobs_*.csv
 search_results/
 blocked_clearance_jobs_*.json
 *.log
+# 輪替後的日誌。logrotate 用 dateext 產生 job_board.log-2026-09-19 這種名字，
+# 單純的 *.log 不涵蓋它們 —— 少了這條，每次輪替都會在 git status 冒出未追蹤檔案
+# （2026-09-19 Stage 7 實測時就是這樣冒出來的）。這條同時涵蓋 delaycompress
+# 一輪之後才出現的 .gz 版本。
+*.log-*
 
 # ── 執行期狀態（2026-09-19 systemd timer 遷移時新增）─────────────────────────
 # logs/ 全部是執行期產物：systemd 用 append: 持有的逐字稿、flock 鎖檔、

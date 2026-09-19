@@ -1,0 +1,24 @@
+[Unit]
+Description=Rotate jobspy logs (job_board.log, logs/cron_search.log)
+# 刻意沒有 [Install]：這個 unit 只由 jobboard-logrotate.timer 拉動，
+# 不該被 enable 或手動 start 意外觸發（手動測試請直接用 logrotate，見 README）。
+#
+# 刻意沒有 Requires=jobboard-logrotate.service 的反面（也就是 timer 那端的 Requires=）：
+# 理由與 jobscan.timer 相同 —— [Unit] Requires= 會在 timer 啟動當下立刻把 service 拉起來，
+# 變成「每次開機多輪替一次」。詳見 deploy/README.md。
+
+[Service]
+Type=oneshot
+# logrotate 不需要網路、不需要 cwd（設定檔內全是絕對路徑），故不設 After= 與 WorkingDirectory。
+ExecStart=/usr/sbin/logrotate -v \
+    /home/ian/github-project/jobspy/deploy/logrotate.conf \
+    --state /home/ian/github-project/jobspy/logs/logrotate.state
+# -v 是刻意加的：alpha-validator 的做法是 >/dev/null 2>&1（完全靜默），
+# 這裡讓輸出進 journal（已確認 /var/log/journal 存在＝持久化），
+# 出事時 journalctl --user -u jobboard-logrotate 看得到，而不是什麼都沒有。
+# 不另開 logs/logrotate.log：那會變成「日誌的日誌」還要再輪替一層。
+#
+# 有限逾時的理由與 jobscan.service 相同：Type=oneshot 一次只能有一個 instance，
+# 卡死又無逾時會讓 unit 永遠停在 activating，之後每次 timer 觸發都被吞掉。
+# logrotate 處理 1.4MB 的檔案是毫秒級，300s 不可能誤殺正常執行。
+TimeoutStartSec=300

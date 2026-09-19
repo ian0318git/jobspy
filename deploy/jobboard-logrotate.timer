@@ -1,0 +1,18 @@
+[Unit]
+Description=Rotate jobspy logs daily at 04:30 Melbourne (Persistent catches up missed runs)
+# 不要加 Requires=jobboard-logrotate.service：會在 timer 啟動當下立刻拉動一次輪替。
+# alpha-validator 的 journal 是鐵證（開機 23:09:57 → pre-market service 23:10:04 被拉起）。
+# 他們靠 wrapper 的 .done marker 把它變成 no-op，這裡沒有那層保護，所以一律不加。
+
+[Timer]
+# 04:30 是刻意選的：在 22:00 掃描（約 19 分鐘）結束之後、06:00 掃描開始之前。
+# 系統時區是 Australia/Melbourne，但明寫時區（與 jobscan.timer、alpha 慣例一致），
+# 避免日後改系統時區時輪替時刻跟著漂移。
+OnCalendar=*-*-* 04:30:00 Australia/Melbourne
+# Persistent 與 jobscan.timer 同理：VM 跟著宿主機 suspend，錯過的時段要在喚醒後補做。
+# 若不設，休眠一整晚就等於當天不輪替，日誌會慢慢長回來。
+Persistent=true
+Unit=jobboard-logrotate.service
+
+[Install]
+WantedBy=timers.target

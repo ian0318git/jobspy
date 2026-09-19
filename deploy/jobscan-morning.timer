@@ -1,9 +1,0 @@
-[Unit]
-Description=Morning embedded job scan timer (Persistent: missed runs fire on wake)
-
-[Timer]
-OnCalendar=*-*-* 06:00:00
-Persistent=true
-
-[Install]
-WantedBy=timers.target

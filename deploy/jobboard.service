@@ -1,0 +1,31 @@
+[Unit]
+Description=Embedded Job Board dashboard (job_board.py)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ian/github-project/jobspy
+# 不緩衝：這支程式的輸出進 systemd 的 append: 日誌時是 block-buffered，
+# 不設的話啟動訊息與 [watchdog]/[jobscan] 的診斷會卡在緩衝區裡，
+# 出事時翻 job_board.log 什麼都看不到。
+Environment=PYTHONUNBUFFERED=1
+# 只綁 loopback。這台是本機看板，綁 0.0.0.0 只是白白暴露在區網上；
+# 2026-09-19 檢視 job_board.log，所有請求來源本來就都是 127.0.0.1。
+# 要從別台機器看就開 SSH 通道：ssh -L 5000:127.0.0.1:5000 <host>
+Environment=JOB_BOARD_HOST=127.0.0.1
+# 排程主權在 jobscan.timer，所以這裡【刻意不設】任何排程相關環境變數：
+# JOB_BOARD_INTERNAL_SCHEDULER 未設＝內建排程器停用，正是我們要的預設值。
+# 要臨時救回內建排程器（例如 timer 壞掉時），用 systemctl --user edit 加
+# Environment=JOB_BOARD_INTERNAL_SCHEDULER=1 後重啟，不要改這個檔案。
+ExecStart=/home/ian/github-project/jobspy/.venv/bin/python /home/ian/github-project/jobspy/job_board.py
+Restart=always
+RestartSec=5
+# 看板是常駐小程式（四十筆資料）。設上限是為了讓失控的記憶體成長撞到天花板
+# 被 OOM 殺掉、再由 Restart=always 救回，而不是拖垮整台機器。
+MemoryMax=512M
+StandardOutput=append:/home/ian/github-project/jobspy/job_board.log
+StandardError=append:/home/ian/github-project/jobspy/job_board.log
+
+[Install]
+WantedBy=default.target

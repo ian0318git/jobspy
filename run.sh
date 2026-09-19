@@ -1,64 +1,39 @@
 #!/usr/bin/env bash
-# ════════════════════════════════════════════════
-# 🔍 Embedded Job Board — 一鍵啟動腳本
-# ════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+# 🔍 Embedded Job Board — 啟動腳本（systemd 薄殼）
+#
+#   2026-09-19 起，看板由 systemd user service 常駐，這支腳本只是 restart 的別名。
+#
+#   為什麼【刻意不提供】nohup fallback：
+#     1. `nohup python job_board.py > job_board.log` 會用 O_TRUNC 打開同一個檔案，
+#        而 systemd 正以 append: 持有它 —— 等於每次手動啟動就清空一次日誌。
+#     2. 舊版會另外起一個不受 systemd 管的行程去搶 5000 埠，與 Restart=always
+#        形成「每 5 秒 EADDRINUSE 重啟一次」的 flap。
+#   這兩件事都不會有錯誤訊息，只會讓服務莫名其妙不穩，所以不留後路。
+# ═══════════════════════════════════════════════════════════════════════════════
+set -u
 
-set -e
-
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-cd "$SCRIPT_DIR"
+SERVICE="jobboard.service"
 
 echo "============================================"
-echo "🔍 Embedded Job Board - 啟動中..."
+echo "🔍 Embedded Job Board - 重啟中（systemd）"
 echo "============================================"
 
-# 1️⃣ 啟用虛擬環境
-if [ -d ".venv" ]; then
-    source .venv/bin/activate
-    echo "[OK] 虛擬環境已啟用 (.venv)"
-else
-    echo "[!] 找不到 .venv，正在建立..."
-    python3 -m venv .venv
-    source .venv/bin/activate
-    pip install --quiet pandas python-jobspy flask
-    echo "[OK] 虛擬環境已建立並安裝依賴"
-fi
-
-# 2️⃣ 檢查是否已在執行
-if pgrep -f "job_board.py" > /dev/null 2>&1; then
-    echo "[!] job_board.py 已在執行中"
-    echo ""
-    echo "    PID      : $(pgrep -f job_board.py | head -1)"
-    echo "    Log      : job_board.log (tail -f job_board.log)"
-    echo "    URL      : http://192.168.44.128:5000"
-    echo ""
-    echo "    使用停止腳本先停止再重啟: ./stop.sh"
+systemctl --user restart "$SERVICE" || {
+    echo "[失敗] restart 失敗，完整狀態如下："
+    systemctl --user status "$SERVICE" --no-pager
     exit 1
-fi
+}
 
-# 3️⃣ 啟動 Flask 伺服器（背景執行）
-nohup python job_board.py > job_board.log 2>&1 &
-PID=$!
+sleep 1
+systemctl --user status "$SERVICE" --no-pager | head -6
 
-# 等待啟動完成
-sleep 2
-
-if kill -0 "$PID" 2>/dev/null; then
-    echo "[OK] job_board.py 已啟動 (PID: $PID)"
-    echo ""
-    echo "    ┌──────────────────────────────────────────┐"
-    echo "    │  📋  Kanban Board                        │"
-    echo "    │  URL : http://192.168.44.128:5000        │"
-    echo "    │  Log : tail -f job_board.log             │"
-    echo "    │  Stop:  ./stop.sh                        │"
-    echo "    └──────────────────────────────────────────┘"
-    echo ""
-    echo "    常用指令:"
-    echo "    • 看即時日誌 : tail -f job_board.log"
-    echo "    • 手動搜尋   : source .venv/bin/activate && python linkedin_job_search.py"
-    echo "    • 停止服務   : pkill -f job_board.py"
-else
-    echo "[失敗] 服務啟動失敗！請檢查 job_board.log"
-    cat job_board.log
-    exit 1
-fi
+echo ""
+echo "    URL  : http://127.0.0.1:5000   （僅 loopback，遠端請用 ssh -L 5000:127.0.0.1:5000）"
+echo "    日誌 : tail -f job_board.log"
+echo "    停止 : ./stop.sh"
+echo "    排程 : 由 jobscan.timer 負責，systemctl --user list-timers jobscan.timer"
+echo ""
+echo "    常用指令:"
+echo "    • 手動掃描 : ./run_search.sh"
+echo "    • 服務狀態 : systemctl --user status $SERVICE"
