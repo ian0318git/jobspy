@@ -118,12 +118,15 @@ tail -f logs/cron_search.log
 
 ## 測試覆蓋（誠實聲明）
 
-**這個專案的自動化測試只有一支**：`tests/test_scan_lock.py`（39 項檢查）。
+**這個專案的自動化測試只有一支**：`tests/test_scan_lock.py`（53 項檢查）。
 其餘全部是手動驗證 —— 上面各節的「驗證」指令就是手動程序。
 
 ```bash
 cd /home/ian/github-project/jobspy
 .venv/bin/python tests/test_scan_lock.py     # 通過時印「✅ 全數通過」且 exit 0
+
+# 要引用「幾項」時用這個量，不要憑印象寫 —— 這個數字已經腐化過兩次（28→39→53）：
+.venv/bin/python tests/test_scan_lock.py | grep -c '\[PASS\]'
 ```
 
 | 區段 | 項數 | 涵蓋 |
@@ -133,29 +136,50 @@ cd /home/ian/github-project/jobspy
 | C | 5 | 看板持鎖時不得留下凍結的 `active` 狀態 |
 | D | 6 | Popen 失敗時必須把鎖還回去（MAJOR-3） |
 | E | 5 | 孤兒鎖自癒 |
-| F | 14 | 孤兒鎖盲區、誤殺無關行程、幻影掃描、假成功（第三輪退回） |
+| F | 17 | 孤兒鎖盲區、誤殺無關行程、幻影掃描、假成功、`cmdline` 身分驗證（第三輪退回） |
+| F7 | 7 | 殺戮路徑的**正向**覆蓋：必須開火、且目標真的死掉（第四輪退回） |
+| G | 4 | `errors="replace"` 與 TOCTOU 重檢的回歸保護（第四輪退回） |
 
 **測試本身有護欄**（因為它 import `job_board` 會連帶啟動背景 watchdog）：
 
 - 鎖檔指向 `tempfile.mkdtemp()` 的私人檔案 —— **絕不碰生產的 `logs/jobscan.lock`**。
   這一項是第二輪審查的 MINOR-9：原本測試會持有全機鎖約 53 秒，若此時 timer 觸發，
   真實掃描就會白等 20 秒後 SKIP ——**測試本身能製造這次遷移要消滅的失敗**。
-- `kill_stalled_external()` 以 no-op 取代（背景執行緒走模組全域）；
-  要驗證真正的護欄時，測試改呼叫保存下來的原函式 `_REAL_KILL_EXTERNAL`。
+- **跳線（tripwire）**：`jb.subprocess.run` 被包了一層，任何 argv 含 `"kill"` 的呼叫
+  當場拋 `AssertionError`。合法用途（F7b）本來就會 mock 掉 `subprocess.run`，
+  所以**根本走不到跳線** —— 它只在寫錯時響，不需要 opt-in 開關。
 - `run_scan.sh` 的 `LOCK`/`LIVE`/`STATE` 可用環境變數覆寫，就是為了讓手動的
   端到端測試**不污染生產的 `search_state.json`**（第三輪審查的 MINOR）。
 
+> ⚠️ **不要以為「把 `kill_stalled_external` 換成 no-op」就是護欄。**
+> 第四輪審查實證：測試本文是直接呼叫**先前存下來的** `_REAL_KILL_EXTERNAL()`
+> ——換掉模組全域的**名字**擋不住已保存的**函式參照**。當時的後果是測試會對
+> **生產的** `jobscan.service` 送出真的 SIGKILL，殺掉使用者正在跑的那一輪。
+> 現在靠的是上面的跳線（在最底層擋），不是那個 no-op。
+> **任何直接呼叫 `_REAL_KILL_EXTERNAL()` 的新測試都必須 mock `subprocess.run`。**
+
 **以變異實驗自我驗證**：每一項修正都做過「把它改回去，確認測試會 FAIL」。
-沒有 FAIL 的修正等於沒有回歸保護。目前 5 個變異全數被捕捉（詳見 `../DECISIONS.md`
-第三輪條目）。**若你新增修正卻找不到會失敗的變異，代表那個修正沒有被測試覆蓋。**
+沒有 FAIL 的修正等於沒有回歸保護。目前 **10 個變異全數被捕捉**（詳見
+`../DECISIONS.md` 第四輪條目的變異表）。**若你新增修正卻找不到會失敗的變異，
+代表那個修正沒有被測試覆蓋。**
+
+兩個踩過的坑，寫在這裡免得重蹈：
+
+- **假變異**：改到註解的變異**不可能改變行為**，所以永遠不會 FAIL、永遠「逃脫」。
+  看到「逃脫」先懷疑變異本身。
+- **殘留檢查不能用 grep**：「把 `kill_stalled_external` 整個 no-op」的變異是一個
+  裸的 `return None`，任何樣式比對都抓不到。還原一律用
+  `git checkout -- job_board.py`，並以 `git diff --stat` 驗證。
 
 ### ⚠️ 未涵蓋（不要以為有測試就安全）
 
 - **`run_scan.sh` 的 bash 端：零自動化測試。** 鎖重試、`SKIPPED` 路徑、`LOCK_WAIT`
   驗證、`finish()`／`trap` 的退出碼語意，全部只有手動驗證過。改這支腳本時請照
   上面「手動操作」一節實測。
-- **`kill_stalled_external()` 的實際動手路徑**：會殺真行程，測試刻意不碰
-  （只驗證「拒絕動手」與「不該呼叫 systemctl」）。真的動手只在本案的事故重現中驗證過。
+- **stray holder 造成的卡死**：`trigger=manual` 的手動掃描沒有 unit 可等，
+  而 stray holder 持鎖時 state 停在上一輪的 `finished` → phase 閘門直接 return →
+  **沒有任何機制會放掉那把鎖**。已知、未修，理由與解法見 `../DECISIONS.md`
+  第四輪條目的「已知限制」。
 - **systemd 本身的行為**：`Persistent=true` 補跑、`Type=oneshot` 的逾時、
   `copytruncate` 輪替，都是實測記錄在 `../DECISIONS.md`，但**沒有回歸測試**
   —— 升級 systemd 或改 unit 後必須重測。

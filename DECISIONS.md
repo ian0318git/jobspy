@@ -2,6 +2,208 @@
 
 重要決策紀錄 — 依專案工作流程要求更新。
 
+## 2026-09-19 — 測試會殺掉生產掃描、殺戮路徑沒有正向測試（第四輪審查）
+
+第四輪 Senior Reviewer 對 `56cef73`（第三輪 MAJOR 的修正）判定 `[REVIEW_REJECTED]`。
+兩個 MAJOR 有同一個形狀：**修正本身沒有被任何測試守住**；而其中一個是
+**測試親手犯下這一輪正在修的那個錯**。
+
+### MAJOR — 回歸測試會對【生產】unit 送出真的 SIGKILL
+
+`tests/test_scan_lock.py` 的「第二道閘門」區塊用 `trigger="systemd-timer"`，而且
+**沒有 mock `subprocess.run`**。systemd 分支的判斷依據是
+
+```
+systemctl --user show jobscan.service -p ActiveState --value
+```
+
+的**即時值** —— 所以只要測試跑到那裡時真的有一輪在跑（unit 在 06:00／22:00 各約
+19 分鐘處於 `activating`，任何手動掃描也算），測試就會送出
+`systemctl --user kill --signal=SIGKILL jobscan.service`，**殺掉使用者正在跑的那一輪**。
+
+**為什麼「安全護欄」沒擋住**：檔頭的護欄把 `jb.kill_stalled_external` 換成 no-op，
+但測試本文是直接呼叫**先前存下來的** `_REAL_KILL_EXTERNAL()` —— 換掉模組全域的
+**名字**擋不住已保存的**函式參照**。註解聲稱的保護範圍與實際不符，這比漏洞本身更
+該修：**一個說謊的護欄會讓下一個人不再去檢查**。
+
+**修法（三層，第 3 層才是關鍵）：**
+
+1. 該區塊改走 PID 路徑（`trigger="manual"`、pid 指向測試自己生的誘餌）——
+   而且它**本來就該走這條**。systemd 分支是刻意殺掉整個 unit，根本不經過 cmdline
+   身分檢查；用 systemd 分支去測 cmdline 檢查等於**什麼都沒測到**。
+2. `mock.patch.object(jb.subprocess, "run", ...)` 攔下所有 systemctl 呼叫。
+3. **結構性跳線**：把 `jb.subprocess.run` 包一層，argv 含 `"kill"` 就當場拋例外。
+   合法用途（F7b）本來就會 mock 掉，**根本走不到這裡** —— 所以跳線只在寫錯時響，
+   不需要任何 opt-in 開關，也就沒有「忘記開」或「忘記關」的問題。
+   修一行只能修這次；換掉底層的 syscall 才能防止下一次。
+
+### MAJOR — 殺戮路徑完全沒有正向測試：把功能整個停掉也能 39/39 全過
+
+覆蓋探針把 `kill_stalled_external()` 改成開頭 `return None`（整個功能死掉），
+**39 項檢查全數通過**。原因是 F 區每一條斷言都是「**不得**開火」的形式，於是測試
+分不出「正確地拒絕」與「永遠不開火」。
+
+這特別危險，因為**「永遠不開火」正是這一輪修正自己引進的新風險**：矯正過度之後，
+卡死的掃描要等 5 小時（`TimeoutStartSec`），而 `trigger=manual` 的手動掃描**根本
+沒有 unit 可以等**，卡死是無界的（見下方「已知限制」）。
+
+**修法**：補上正向覆蓋 —— F7a（身分相符 → 必須開火，且目標**真的死掉**，
+`poll()=-9`）、F7b（unit `activating` → 必須送出 kill）、F7c（unit `inactive` →
+**不得**送出）。
+
+> F7c 補的是我自己差點弄丟的覆蓋：MAJOR 的修法把 F4b 從 systemd 分支移到 PID
+> 路徑，於是「unit 不在跑時不得送出 kill」這條就沒人守了 —— 拿掉 ActiveState
+> 前置檢查的變異（M6）會直接逃脫。**修一個洞的時候要問：這一動讓哪條斷言失去了
+> 唯一的守衛。**
+
+### MINOR — 兩個「有修正、沒有回歸保護」的缺口
+
+- `errors="replace"`：拿掉它（退回 strict 解碼）39/39 照過。這正是第三輪 MAJOR-A
+  的成因，卻沒有任何東西守著。→ G1 直接斷言 Popen 的 kwarg。
+- TOCTOU 重檢：拿掉「動手前再確認一次沒有取得鎖」39/39 照過。→ G2 用 `side_effect`
+  讓 `_we_hold_scan_lock()` 第一次回 False、第二次回 True，斷言必須放棄。
+
+### MINOR — `_pid_is_our_scan()` 子字串比對太鬆，而測試把這個弱點寫成了規格
+
+舊判準是 `"run_scan.sh" in cmdline or "linkedin_job_search.py" in cmdline`，所以
+`vim run_scan.sh`、`tail -f run_scan.sh` 全部算「我們的掃描」。更糟的是 F3 用
+`exec -a linkedin_job_search.py sleep 600` 造了一個冒名者，然後**斷言它必須被認可**
+—— 等於把缺陷固化成規格。
+
+要送出的訊號是 SIGKILL（**不可逆**），所以寬鬆的方向剛好是最危險的那一邊。
+
+新判準讀 **argv 結構**，不讀字串內容：
+
+| argv 形狀 | 判定 |
+|---|---|
+| `argv[0]` basename == `run_scan.sh` | 是 |
+| `argv[0]` 是 shell 且 `argv[1]` basename **就是** `run_scan.sh` | 是 |
+| `argv[0]` 是 python 解譯器且**參數中**有 `linkedin_job_search.py` | 是 |
+| 其餘（含 `vim`／`tail` 帶著同樣的路徑） | 否 |
+
+> 爬蟲的 `argv[0]` 是 **`python`** 而不是腳本本身，因為 `run_scan.sh` 用
+> `"$PY" -u "$SCRIPT"` 啟動它。這一點寫錯就會變成「永遠不開火」，所以 F3 同時加了
+> 兩個**正向對照組**（真爬蟲形狀、真 wrapper 形狀都必須被認出）。少了正向對照組，
+> 把函式改成永遠回 False 也會全部通過。
+
+### 測試衛生：兩個讓訊號失真的測試缺陷（不是產品缺陷）
+
+第四輪修完後跑變異測試，M8 逾時 400 秒。診斷結果：**測試本身 6 秒就跑完了** ——
+是兩個 PPID=1 的孤兒 python 握著管線的寫入端。子行程會**繼承測試的 stdout**，
+而 stdout 是 `... | tail`；應該被殺的誘餌活下來（正是 M8 製造的情境）就等於
+管線永遠等不到 EOF。留著孤兒也等於每跑一次變異就在機器上疊一個 `sleep 600`。
+
+接著發現更嚴重的：F7a 斷言「應該被殺」之後接**無界等待**，突變讓誘餌活著時直接拋
+`TimeoutExpired`，**F7b / F7c / G 共 9 項根本沒跑到**。變異表面上「被逮」，實際是
+把後面的訊號全遮掉 —— 真實迴歸發生時後果相同（只看得到第一項失敗，看不到全貌）。
+
+**修法：**
+
+- 誘餌一律走 `spawn()`：統一 `DEVNULL`、全部登記，收工無條件清掉（`atexit` +
+  正常路徑各一次）。失敗路徑**最需要**這個，而失敗正是變異測試刻意製造的情境。
+- **本檔鐵律：不得對誘餌呼叫無界的 `.wait()`。** 逾時一律走 `wait_dead()`，它把
+  `TimeoutExpired` 轉成「回傳 False」，於是**逾時本身變成一項 FAIL 而不是例外**。
+- 效果可量測：M8 的輸出從 **44 項 / 1 FAIL（中途炸掉）** 變成
+  **53 項 / 5 FAIL（完整跑完）**。變異測試的價值來自「一次看到全部失敗」，
+  中途炸掉會把 5 個訊號壓成 1 個。
+
+### 變異測試工具：兩個會產生「假安全感」的陷阱
+
+1. **假變異**：M7 原本錨在 `_external_begin()` docstring 的一句註解上。改掉註解
+   **不可能改變行為**，所以這個變異永遠不會 FAIL、永遠「逃脫」—— 看起來像
+   「這個修正沒有回歸保護」，實際上是我根本沒改到程式。改錨在真正的閘門
+   （`if state.get("phase") != "running":` → `if False:`）之後才有效。
+   **凡是「逃脫」的變異，第一個要懷疑的是變異本身，不是測試。**
+2. **殘留檢查不能用 grep**：上一版變異腳本中止時把 M8（`kill_stalled_external`
+   整個 no-op）留在檔案裡，而我的殘留檢查是 `grep -c 'MUTANT\|if True:'` ——
+   **M8 的變異是一個裸的 `return None`，grep 不到**。差一點帶著「停滯偵測完全
+   失效」的版本繼續往下做。
+
+   現在改成：啟動前先確認工作區乾淨（否則「還原」會還原到錯的東西）、還原一律
+   `git checkout -- job_board.py`（**commit 是唯一可信的已知良好狀態**，不依賴
+   `finally` 有沒有跑到）、攔 SIGTERM/SIGINT 就地還原、結束時用 `git diff --stat`
+   驗證還原，而不是比對樣式。
+
+### 第五輪變異測試結果（10/10 被逮）
+
+| 變異 | 內容 | 結果 |
+|---|---|---|
+| M1 | 孤兒回收判準改回 `proc is not None` | 52P / 1F ✅ |
+| M2 | 拿掉 `_read_search_output` 的 try/finally | 52P / 1F ✅ |
+| M3 | 拿掉 `Popen(errors="replace")` | 52P / 1F ✅ |
+| M4 | 拿掉 `kill_stalled_external` 的 phase 閘門 | 51P / 2F ✅ |
+| M5 | 拿掉 cmdline 身分檢查 | 52P / 1F ✅ |
+| M6 | 拿掉 systemd 分支的 ActiveState 前置檢查 | 51P / 2F ✅ |
+| M7 | 拿掉 `_external_begin` 身分閘門 | 51P / 2F ✅ |
+| M8 | `kill_stalled_external` 整個 no-op | 48P / 5F ✅ |
+| M9 | 拿掉 TOCTOU 重檢 | 52P / 1F ✅ |
+| M10 | `_pid_is_our_scan` 退回子字串比對 | 52P / 1F ✅ |
+
+> M10 只被**一項**逮到，就是 F3 反轉後的那條「冒名者必須被拒」。這是第四輪把 F3
+> 從「斷言冒名者必須被認可」改成「必須被拒絕」的直接價值 —— **把弱點寫成規格的
+> 測試，比沒有測試更糟**，因為它會主動阻止別人修。
+
+### 已知限制（本輪未修，誠實列出）
+
+**stray holder 造成的卡死是無界的。** `trigger=manual` 的手動掃描沒有對應的
+systemd unit，`TimeoutStartSec=5h` 不適用；而 stray holder（例如有人
+`flock logs/jobscan.lock -c 'sleep'`）持鎖時，`run_scan.sh` 印 `SKIPPED`、**exit 0**、
+且刻意不覆寫 state —— 於是 state 停在上一輪的 `finished`，
+`kill_stalled_external()` 的 phase 閘門直接 return，**沒有任何機制會放掉那把鎖**。
+
+這不是本輪引進的退步（修正前也殺不到真正的 holder，它拿的是 state 裡已被回收或
+已死的舊 pid，只會殺錯人並留下假成功），但 DECISIONS.md 原本寫的「不殺的代價有界
+—— 真正卡死的掃描仍會被 5h 逾時收掉」**只對一半，不能當成通則**，已在該處加註更正。
+
+真正的解法是照本專案自己的原則 ——「鎖由誰持有是唯一可信的事實」—— 用
+`/proc/*/fd` 反查誰開著 `JOBSCAN_LOCK`，再對那個 pid 驗 cmdline，而不是信任 state
+裡的 pid。同一招也能順帶解掉 cmdline 比對的偽陽性問題。
+
+**觸發前提是人為佔用**：爬蟲本身沒有 subprocess／multiprocessing，不會留下漏繼承
+fd 9 的孫行程（這點第三輪審查已獨立確認），所以嚴重度不是 CRITICAL。
+
+**看板重啟後，閒置狀態會遺失「最近一次是哪一輪」。**
+`get_search_status()` 的閒置分支（`job_board.py:1076`）註解寫著「閒置時仍要回報
+『最近一次是哪一輪』，否則前端的換檔偵測會失去依據」，但 `_EXTERNAL["finished"]`
+與 `_LAST_SCAN_SOURCE` 都是**行程內記憶體狀態**，`Restart=always` 每次復活都會清空。
+
+2026-09-19 重啟後實測 `GET /api/search/status`：
+
+```
+running=False  run_id=None  exit_code=None  start_time=None  last_finished=None
+```
+
+而 `logs/search_state.json` 明擺著 `run_id=20260919_220000, exit_code=0,
+finished_at=2026-09-19T22:21:45` —— **資訊在磁碟上，只是沒人去讀**。
+
+**影響有限，所以本輪刻意不修**：
+
+- 前端換檔偵測需要**先觀察到** `running=true`（`sawRunning`）才會動作，
+  所以不會誤觸重載；`lastHandledRunId` 的比對也不會被 `None` 騙到。
+- 安全相關的「資料已 N 小時未更新」用的是 `data_age_seconds`，那是**獨立**從
+  `search_results/` 的檔案 mtime 算出來的（實測 4679 秒 ≈ 78 分，正確），
+  **不依賴任何記憶體狀態**。也就是說真正要緊的訊號不受這個缺口影響。
+
+**不修的理由不是「不重要」，而是時機**：本專案已經有兩次「修正的旁邊就是下一個
+缺陷」的紀錄（第三輪的 MAJOR-A／MAJOR-B 就是第二輪修正自己引進或沒關掉的）。
+在送審前插入一個未經審查的行為變更，正是前兩輪退件的成因。**列為已知缺口，
+交由審查判斷輕重。**
+
+真要修的話，方向是在閒置分支以 `read_jobscan_state()` 為**唯讀後備**
+（state 檔由 `run_scan.sh` 原子寫入，是「最近一輪」的權威來源），並且必須
+**連同回歸測試一起**——本專案已經吃過兩次「有修正、沒有回歸保護」的虧。
+
+### 文件更正
+
+- 測試數：原稱「28 項」→ 第三輪實測 **39** → 本輪修正後 **53**。
+- 第三輪審查的 FAIL 數：原稱「3 項」→ 審查實測 **5 項**。
+- 兩處都加 `> ⚠️ 更正` 註記，**不改寫歷史**。
+- `deploy/README.md` 補上「測試覆蓋（誠實聲明）」一節。
+
+> **教訓**：這兩個數字都是我憑印象寫的。文件裡的數量聲明如果沒有把**產生它的
+> 指令**一起記下來（`grep -c '\[PASS\]'`），就一定會腐化 —— 而腐化的數字比沒有
+> 數字更糟，因為它會被相信。
+
 ## 2026-09-19 — 掃描鎖的兩個 MAJOR：孤兒鎖盲區、誤殺無關行程與假成功（第三輪審查）
 
 第三輪 Senior Reviewer 對 `8853e68` 判定 `[REVIEW_REJECTED]`，獨立重跑變異實驗後
@@ -51,10 +253,26 @@ pid 早就可能被系統回收給別的行程 —— 拿它直接送不可逆�
 **修法（兩層防禦）：**
 - **身分閘門**：`state.get("phase") != "running"` → 直接 return。state 自稱已結束時，
   還持有鎖的那個人一定不是我們的掃描（是 stray holder），而 state 裡的 pid 是遺物。
-  這裡刻意「寧可不殺」：誤殺是**無界**的傷害（可能殺掉別的服務），不殺的代價**有界**
-  —— 真正卡死的掃描仍會被 systemd 的 `TimeoutStartSec=5h` 收掉（規劃階段已接受的風險 #7）。
+  這裡刻意「寧可不殺」：誤殺是**無界**的傷害（可能殺掉別的服務），而誤殺的替代方案
+  只是少一次終止機會。
   phase 停在 `running` 的正常卡死情境（wrapper 被 SIGKILL → EXIT trap 不執行 →
   state 永遠停在 running）不受影響，照樣會被終止。
+
+  > ⚠️ **2026-09-19 第四輪審查更正：「代價有界」的說法只對一半，不能當成通則。**
+  > 這裡原本寫「不殺的代價有界 —— 真正卡死的掃描仍會被 `TimeoutStartSec=5h` 收掉」。
+  > 審查實測指出這在 **stray holder** 情境下不成立：`trigger=manual` 的手動掃描
+  > 根本沒有對應的 unit，5 小時逾時不適用；而 stray holder（例如有人
+  > `flock logs/jobscan.lock -c 'sleep'`）持鎖時 `run_scan.sh` 印 `SKIPPED`、**exit 0**、
+  > 且刻意不覆寫 state —— 於是 state 停在上一輪的 `finished` → 閘門直接 return →
+  > **沒有任何機制會放掉那把鎖**。這條路徑的卡死是無界的。
+  >
+  > **這不是本輪引進的退步**：修正前也殺不到真正的 holder（它拿的是 state 裡已被
+  > 回收或已死的舊 pid，只會殺錯人並留下假成功），所以是「本來就有的洞 + 說法不精確」。
+  > **已知且尚未修復。** 真正的解法是照本專案自己的原則——「鎖由誰持有是唯一可信的
+  > 事實」——用 `/proc/*/fd` 反查誰開著 `JOBSCAN_LOCK`，再對那個 pid 驗 cmdline，
+  > 而不是信任 state 裡的 pid。同一招也能順帶解掉 cmdline 比對的偽陽性問題。
+  > 觸發前提是**人為**佔用（爬蟲本身沒有 subprocess/multiprocessing，不會留下
+  > 漏繼承 fd 9 的孫行程 —— 這點審查已獨立確認），所以嚴重度不是 CRITICAL。
 - **cmdline 身分檢查**：即使 state 自稱 running，pid 也可能在我們讀它之後被回收。
   動手前讀 `/proc/<pid>/cmdline`，確認含 `run_scan.sh` 或 `linkedin_job_search.py`。
   判準用 cmdline 而非「pid 存不存在」——**PID 被回收後同一個號碼會是別的行程，
