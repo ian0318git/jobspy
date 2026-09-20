@@ -450,13 +450,19 @@ _AST_CHECKS = sum(
 
 _bout, _bp, _bf, _brc = _run_suite(TEST)
 _bad = []
-if "✅ 全數通過" not in _bout:
+# ⚠️ 收尾標記有【兩個】，失敗路徑印的是「項失敗：」而不是「✅ 全數通過」。
+# 第一版只認後者，於是「1 項失敗」會被多報一句「沒有印出收尾標記（沒跑到底）」
+# —— 診斷訊息指向錯的原因。判定要與下面每一個變異用的 `done` 一致。
+if "✅ 全數通過" not in _bout and "項失敗：" not in _bout:
     _bad.append("沒有印出收尾標記（沒跑到底）")
 if _bf != 0:
     _bad.append(f"{_bf} 項失敗")
 if _brc != 0:
     _bad.append(f"rc={_brc}")
-if _bp != _AST_CHECKS:
+# ⚠️ 只有在【零失敗】時才比對項數。有失敗時 `_bp` 本來就會少幾項，
+# 那時再喊「有檢查沒被執行到」是把讀者指向錯的原因（實測：1 項失敗被多報成
+# 4 個理由，其中一句是假的）。診斷訊息的準確性與判定本身一樣重要。
+if _bf == 0 and _bp != _AST_CHECKS:
     _bad.append(f"印出 {_bp} 項，但原始碼裡有 {_AST_CHECKS} 個 check() 呼叫點"
                 " —— 有檢查沒被執行到，這把量尺短了一格")
 if _bad:
