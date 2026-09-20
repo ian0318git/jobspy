@@ -248,7 +248,7 @@ tail -f logs/cron_search.log
 
 ## 測試覆蓋（誠實聲明）
 
-**這個專案的自動化測試只有一支**：`tests/test_scan_lock.py`（89 項檢查）。
+**這個專案的自動化測試只有一支**：`tests/test_scan_lock.py`（90 項檢查）。
 其餘全部是手動驗證 —— 上面各節的「驗證」指令就是手動程序。
 
 ```bash
@@ -256,7 +256,7 @@ cd /home/ian/github-project/jobspy
 .venv/bin/python tests/test_scan_lock.py     # 通過時印「✅ 全數通過」且 exit 0
 
 # 要引用「幾項」時用這個量，不要憑印象寫 —— 這個數字已經腐化過十次
-# （28→39→53→55→56→58→65→81→83→87→89）。
+# （28→39→53→55→56→58→65→81→83→87→89→90）。
 #   65→81 是第七輪退回：L 區 9 項 + M 區 7 項。
 #   81→83 是第八輪自查：F 區 +1（F4 補回漏掉的 subprocess.run 攔截）、
 #           M 區 +1（banner 的「下次觸發」不得把「執行中」印成「(無)」）。
@@ -264,9 +264,17 @@ cd /home/ian/github-project/jobspy
 #           三個呼叫點補上攔截與斷言）、L 區 +2（_fired_list 的 6 種畸形值
 #           與正向控制）。
 #   87→89 是第九輪：J 區 +2（子行程必須真的採用 JOBSCAN_* env —— 守著 MINOR-3）。
-#           ⚠️ 這兩項是**修完之後回頭補的**：MINOR-3 修好了「隔離是假的」，
-#           但當時沒有任何檢查守著它，把 env 讀取拿掉照樣全綠。
-#           對應的變異是 **M31**（已確認會被逮：89→87P/2F）。
+#   89→90 是第九輪：L 區 +1（AST 靜態不變式：_fired_today 的原始讀取只准出現在
+#           _fired_map() —— 守著 MINOR-2 的【另一半】）。
+#           ⚠️ 這兩組都是**修完之後回頭補的**。兩個缺陷（MINOR-2／MINOR-3）都被
+#           修好了，但當時都沒有任何檢查守著它們的關鍵那一半：
+#             * 拿掉 JOBSCAN_* env 讀取 → 全綠（實測）
+#             * 把 scheduler_loop 的讀取退回原生 .get() → 全綠（實測）
+#           對應變異 **M31**（89→87P/2F）與 **M32**（已確認會被逮：89P/1F）。
+#
+# ⚠️ 這條註解本身也是「說會腐化、然後就腐化了」的第十次。**不要相信這裡的數字，
+#    跑上面那條 grep -c。** 它腐化的方式是「每一次補完檢查忘了回來改這一行」——
+#    而這正是本專案反覆抓到的那個形狀。
 .venv/bin/python tests/test_scan_lock.py | grep -c '\[PASS\]'
 ```
 
@@ -289,7 +297,7 @@ cd /home/ian/github-project/jobspy
 | I | 1 | `job_board.py` 不得有 live 的 `print()`（第五輪退回） |
 | J | 4 | 啟動時的排程主權轉移：兩個方向都要正確（見「回復到舊制」一節）；`JOBSCAN_*` env 隔離必須是真的（第八輪 MINOR-3，對應變異 M31） |
 | K | 7 | `api_schedule` 的輸入驗證：幽靈排程（`times: []`）、非物件主體、`enabled` 的字串陷阱、第三道鎖（不得重新武裝）（第六輪退回） |
-| L | 11 | **跨午夜的掃描被靜默跳過**（MAJOR-1）、`post-run` 的 `next_run` 必須等於 `_compute_next_run`、`interval_hours` 的 `inf`、非 ASCII 的「數字」（第七輪退回）；`_fired_list` 對 6 種畸形 `_fired_today` 都不得丟例外 + 正向控制（第八輪審查） |
+| L | 12 | **跨午夜的掃描被靜默跳過**（MAJOR-1）、`post-run` 的 `next_run` 必須等於 `_compute_next_run`、`interval_hours` 的 `inf`、非 ASCII 的「數字」（第七輪退回）；`_fired_list` 對 6 種畸形 `_fired_today` 都不得丟例外 + 正向控制（第八輪審查）；`_fired_today` 的**原始讀取**只准出現在 `_fired_map()`（AST 靜態不變式，第九輪 MINOR-2，對應變異 M32） |
 | M | 8 | 損壞排程檔的**靜默降級**、`save_schedule` 的原子性、`ok` 的語意、`TimerCalendar` 解析（第七輪退回）；banner 的「下次觸發」必須區分「沒裝」與「執行中還沒算」（第八輪） |
 
 > ⚠️ **H 那一格是錯的，而且錯了兩輪。** 第七輪審查 MAJOR-2：原本寫 `| H | 3 |`，
@@ -354,7 +362,7 @@ cd /home/ian/github-project/jobspy
 .venv/bin/python tests/mutate.py     # 需乾淨的工作區；在 /tmp 隔離副本裡跑
 ```
 
-目前 **30 個變異、29 個被逮、1 個已知逃脫**（`EXPECTED_ESCAPES = {"M13"}`；
+目前 **32 個變異、31 個被逮、1 個已知逃脫**（`EXPECTED_ESCAPES = {"M13"}`；
 `mutate.py` 把「已理解的逃脫」與「沒被發現的覆蓋缺口」分開回報，只有後者
 會讓退出碼變 1）。**若你新增修正卻找不到會失敗的變異，代表那個修正沒有被測試
 覆蓋** —— 那就把那個變異加進來、列進 `EXPECTED_ESCAPES`，讓缺口誠實地站出來。

@@ -375,6 +375,18 @@ MUTATIONS = [
          "JOBSCAN_STATE = os.path.join(LOG_DIR, \"search_state.json\")\n"
          "JOBSCAN_LIVE  = os.path.join(LOG_DIR, \"search_current.log\")\n",
          "M31")),
+
+    # MINOR-2 的另一半：消毒函式留著，但【呼叫端】退回原生 `.get()`。
+    # 這正是「只修了一半」的樣子 —— 症狀（每 30 秒一行的 AttributeError、
+    # 排程器永久停擺）完全回來，而直接測 `_fired_list()` 的那兩項照樣全綠。
+    # 守著它的是 L 區的 AST 靜態不變式。
+    ("M32", "呼叫端退回原生 .get(\"_fired_today\")（繞過消毒）",
+     lambda t: sub_once(
+         t,
+         "                    already_fired = _fired_list(cfg, today_str)\n",
+         "                    _fm = cfg.get(\"_fired_today\", {})\n"
+         "                    already_fired = _fm.get(today_str, [])\n",
+         "M32")),
 ]
 
 # ── 基準線：先確認【沒被變異的】那一份是全綠的 ──────────────────────────────

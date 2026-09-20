@@ -1483,6 +1483,62 @@ check("（承上）正常值必須原樣讀出，不得被消毒邏輯吃掉",
       and jb._fired_list({"_fired_today": {}}, "2026-09-20") == [],
       "正常值與缺鍵都要正確")
 
+# ── 靜態不變式：`_fired_today` 的原始讀取只准出現在 `_fired_map()` 裡 ──────────
+# 上面兩項測的是 `_fired_list()` **本身**。但 MINOR-2 的修正是【兩件事】：
+#   (1) `_fired_map()` 消毒，並且 (2) **呼叫端改用 `_fired_list()`**。
+# 只想著 (1) 的話，把 (2) 改回去（`cfg.get("_fired_today", {}).get(today_str, [])`）
+# 上面兩項照樣全綠 —— 因為它們直接呼叫 `_fired_list()`，根本不經過呼叫端。
+#
+# ⚠️ 這不是假想的缺口，是【實測】的：把 scheduler_loop 那行退回原生 `.get()`
+# 之後跑測試 → **89 項全綠**。跟 MINOR-3 一模一樣的形狀：
+# **修好了，但沒有東西守著它。**
+#
+# 用 AST 而不是 grep（同 I 區的理由）：grep 分不出程式碼與註解，而本檔與
+# job_board.py 的註解裡【大量引用】`cfg.get("_fired_today", {})` 這個寫法
+# （MINOR-2 的說明本身就在引用它）。grep 會把它們全算成違規 → 偽陽性 → 關掉測試。
+#
+# 唯一豁免：**只做真假測試、不取值**的那一處（`if X.get("_fired_today"): pop(...)`）。
+# 判準是它的 AST 父節點必須是 `If` —— 一旦被指派給變數（就是那個缺陷版）
+# 或再被 `.get()`／下標，父節點就不是 `If`，立刻違規。
+_fm_fn = next((n for n in ast.walk(_jb_ast)
+               if isinstance(n, ast.FunctionDef) and n.name == "_fired_map"), None)
+_fm_span2 = (_fm_fn.lineno, _fm_fn.end_lineno) if _fm_fn else (0, 0)
+_fm_parent = {c: n for n in ast.walk(_jb_ast) for c in ast.iter_child_nodes(n)}
+
+
+def _reads_fired_today_raw(n):
+    """`cfg.get("_fired_today", …)` 或 `cfg["_fired_today"]`（不看註解）。
+
+    ⚠️ 下標那一個必須限定 `ast.Load` —— 第一版沒限定，於是
+    `cfg["_fired_today"] = {...}`（`_record_run()` 的【寫入】）被判成違規。
+    偽陽性比漏報更危險：I 區註解自己寫過「然後就會有人把這個測試關掉」。
+    寫入不經過消毒是正確的 —— 消毒是讀取端的事。
+    """
+    if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "get" and n.args
+            and isinstance(n.args[0], ast.Constant)
+            and n.args[0].value == "_fired_today"):
+        return True
+    return (isinstance(n, ast.Subscript) and isinstance(n.ctx, ast.Load)
+            and isinstance(n.slice, ast.Constant)
+            and n.slice.value == "_fired_today")
+
+
+_raw_fired = []
+for _n in ast.walk(_jb_ast):
+    if not _reads_fired_today_raw(_n):
+        continue
+    if _fm_span2[0] <= _n.lineno <= _fm_span2[1]:
+        continue                                  # 消毒函式自己：唯一合法的原讀
+    if isinstance(_fm_parent.get(_n), ast.If):
+        continue                                  # 只做真假測試，不取值
+    _raw_fired.append(_n.lineno)
+check(
+    "`_fired_today` 的原始讀取只准出現在 _fired_map()（否則呼叫端會繞過消毒）",
+    _fm_fn is not None and not _raw_fired,
+    f"違規行={sorted(_raw_fired)}",
+)
+
 # ── 第七輪 m1／m2：兩個「驗證器自己丟例外」的路徑 ────────────────────────────
 # m1：`except (TypeError, ValueError)` 接不住 OverflowError（issubclass(OverflowError,
 # ValueError) 是 False）。JSON 的 1e400 會解析成 inf，`int(inf)` → OverflowError
