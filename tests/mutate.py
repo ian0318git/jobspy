@@ -36,6 +36,7 @@ INCONCLUSIVE／套用失敗。
 看到逃脫先懷疑變異本身。
 """
 import ast
+import atexit
 import hashlib
 import os
 import re
@@ -123,6 +124,18 @@ PROD_BEFORE = sha256(PROD_TARGET)
 
 # ── 建立隔離副本：生產目錄從此不再被寫入 ────────────────────────────────────
 WORK = Path(tempfile.mkdtemp(prefix="jobspy-mutate-"))
+# ⚠️ 第九輪【自查】：清掃不能只靠下面那個 `finally` —— 它管不到 `try:` **之前**
+# 的提早結束。**基準線前置檢查的 `sys.exit(2)` 正好在那之前**，而它是最常被
+# 觸發的那條路（兩個探針都走它）。實測留下的孤兒：
+#     drwx------ /tmp/jobspy-mutate-tuvnhdx_   12:11（那次以「基準線不可信」中止）
+# 一份隔離副本 = 一份完整的 repo 複本，堆積起來還會讓人分不清哪一份是活的
+# （這一輪我自己就被兩個目錄困惑過）。
+#
+# 用 atexit 一次關掉【整類】漏，而不是在每一條 sys.exit() 前面各補一行 ——
+# 後者會隨新增的提早結束路徑而腐化，而「新增路徑時忘了補」正是這條漏的成因。
+# SIGTERM / SIGINT 另有 `_cleanup_and_die()` 明確處理（atexit 不跑在訊號上）；
+# 重複 rmtree 無害（ignore_errors=True）。
+atexit.register(lambda: shutil.rmtree(WORK, ignore_errors=True))
 try:
     _archive = subprocess.run(["git", "archive", "HEAD"], cwd=REPO,
                               capture_output=True, check=True).stdout
