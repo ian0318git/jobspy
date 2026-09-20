@@ -1137,6 +1137,47 @@ check(
     f"enabled={_rev.get('enabled')} managed_by={_rev.get('managed_by')} "
     f"next_run={_rev.get('next_run')} {_rev.get('__error__', '')}",
 )
+# ── MINOR-3：env 隔離必須是【真的】───────────────────────────────────────────
+# 第八輪審查抓到的缺陷：J 區與 M 區都傳 JOBSCAN_LOCK/LIVE/STATE 當隔離，但
+# job_board.py 把這三個路徑【寫死】、根本不讀 env（只有 run_scan.sh 讀）。
+# 也就是說「測試把狀態檔指向 /tmp 以求安全」是**假的保護**：子行程讀的仍是生產的
+# search_state.json，一旦排程器判定逾期，就會去開**生產的** logs/jobscan.lock。
+# 當時沒事純粹是因為 `_seed()` 把 interval_hours 設成 100000 —— 那是【常數】，
+# 不是護欄；那個常數一改，子行程就會在生產目錄拿鎖。
+#
+# ⚠️ 下面這一項就是**守著那句話的斷言**。少了它，把 env 讀取拿掉不會讓任何檢查
+# 變紅 —— 而「修好了但沒有東西守著」正是這個缺陷能活過六輪的原因。
+_K_ENV = {"JOBSCAN_LOCK": os.path.join(_J_TMP, "jobscan.lock"),
+          "JOBSCAN_LIVE": os.path.join(_J_TMP, "live.log"),
+          "JOBSCAN_STATE": os.path.join(_J_TMP, "state.json")}
+_K_PROBE = _J_TRIPWIRE.replace(
+    "import job_board\n",
+    "import job_board, json as _j\n"
+    "print('PROBE' + _j.dumps([job_board.JOBSCAN_LOCK, job_board.JOBSCAN_LIVE,\n"
+    "                          job_board.JOBSCAN_STATE, job_board.LOG_DIR]))\n")
+_K_R = subprocess.run([sys.executable, "-c", _K_PROBE],
+                      env=dict(os.environ, **_K_ENV),
+                      capture_output=True, text=True, timeout=120)
+_K_GOT = None
+for _l in _K_R.stdout.splitlines():
+    if _l.startswith("PROBE"):
+        _K_GOT = json.loads(_l[5:])
+# 生產的預設值長什麼樣：<repo>/logs/...。子行程拿到的三個路徑【都不該】落在裡面。
+_K_PROD_DIR = _K_GOT[3] if _K_GOT else None
+check(
+    "子行程必須真的採用 JOBSCAN_* env，而不是寫死的生產路徑（第八輪 MINOR-3）",
+    _K_GOT is not None and _K_GOT[:3] == [_K_ENV["JOBSCAN_LOCK"],
+                                          _K_ENV["JOBSCAN_LIVE"],
+                                          _K_ENV["JOBSCAN_STATE"]],
+    f"rc={_K_R.returncode} 得到={_K_GOT[:3] if _K_GOT else None} "
+    f"預期={list(_K_ENV.values())} {( _K_R.stderr or '')[-200:]}",
+)
+check(
+    "（承上）三個路徑都不得落在生產的 LOG_DIR 底下 —— 這是『隔離是假的』的判準",
+    _K_GOT is not None and _K_PROD_DIR is not None
+    and not any(str(p).startswith(str(_K_PROD_DIR)) for p in _K_GOT[:3]),
+    f"LOG_DIR={_K_PROD_DIR} 路徑={_K_GOT[:3] if _K_GOT else None}",
+)
 shutil.rmtree(_J_TMP, ignore_errors=True)
 
 print("=== K. 第六輪退回：api_schedule 的輸入驗證（幽靈排程）===")

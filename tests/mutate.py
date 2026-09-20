@@ -359,6 +359,22 @@ MUTATIONS = [
          "    if raw is None:\n"
          "        return {}\n",
          "M30")),
+
+    # MINOR-3：把三個路徑退回【寫死】，也就是「測試傳的 JOBSCAN_* 被完全忽略」
+    # 的那個版本。這正是缺陷當時的樣子 —— 不是明著報錯，而是安靜地用生產路徑。
+    ("M31", "JOBSCAN_* 三個路徑退回寫死（測試的 env 隔離變成假的）",
+     lambda t: sub_once(
+         t,
+         "JOBSCAN_LOCK  = (os.environ.get(\"JOBSCAN_LOCK\")\n"
+         "                 or os.path.join(LOG_DIR, \"jobscan.lock\"))\n"
+         "JOBSCAN_STATE = (os.environ.get(\"JOBSCAN_STATE\")\n"
+         "                 or os.path.join(LOG_DIR, \"search_state.json\"))\n"
+         "JOBSCAN_LIVE  = (os.environ.get(\"JOBSCAN_LIVE\")\n"
+         "                 or os.path.join(LOG_DIR, \"search_current.log\"))\n",
+         "JOBSCAN_LOCK  = os.path.join(LOG_DIR, \"jobscan.lock\")\n"
+         "JOBSCAN_STATE = os.path.join(LOG_DIR, \"search_state.json\")\n"
+         "JOBSCAN_LIVE  = os.path.join(LOG_DIR, \"search_current.log\")\n",
+         "M31")),
 ]
 
 # ── 基準線：先確認【沒被變異的】那一份是全綠的 ──────────────────────────────
