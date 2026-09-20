@@ -165,12 +165,31 @@ LC_ALL=C systemctl --user list-timers jobscan.timer --all   # LAST 應變成剛�
 
 2026-09-20 的量測（`NEXT` ／ `NextElapseUSecMonotonic` ／ `list-timers --output=json` 的 `next`）：
 
-| 狀態 | `NEXT` | `NextElapseUSecMonotonic` | JSON `next` |
-|---|---|---|---|
-| timer **未**觸發、service **手動**拉起（running） | `Sun 09:14:00 AEST` | 有值 | `1789859640000000`（int） |
-| **timer 已觸發**、其 service 仍在跑 | **`-`** | **`infinity`** | **`None`（null）** |
-| service 結束後 | 下一個 `:00` | `0` | 下一次的值 |
-| **生產的 `jobscan.timer`**（08:49:02→09:07:55） | `-` | `infinity` | — |
+| 狀態 | `NEXT` | `NextElapseUSecRealtime` | `NextElapseUSecMonotonic` | JSON `next` |
+|---|---|---|---|---|
+| timer **未**觸發、service 未跑 | `Sun 09:14:00 AEST` | `Sun 2026-09-20 11:22:00 AEST` | **`0`** | `1789859640000000`（int） |
+| timer **未**觸發、service **手動**拉起 | `Sun 09:14:00 AEST` | 同上 | **`0`** | 同上 |
+| **timer 已自行觸發**、其 service 仍在跑 | **`-`** | **（空）** | **`infinity`** | **`None`（null）** |
+| service 結束後 | 下一個 `:00` | 下一次的值 | `0` | 下一次的值 |
+| **生產的 `jobscan.timer`**（08:49:02→09:07:55） | `-` | （空） | `infinity` | — |
+
+> ⚠️ **2026-09-20 更正（第八輪 NIT-3）：上一版這張表的第三欄寫「有值」，那是錯的。**
+> 當初是用 `systemctl show` 讀**位置欄位**，而它印的是**固定的規範順序**
+> （`Realtime` 在前、`Monotonic` 在後），所以把 Realtime 的值看成了 Monotonic 的。
+> 實測第一列是 `Realtime=Sun …11:22:00 AEST` / **`Monotonic=0`**。
+> 現在改用 `systemctl show … -p NextElapseUSecRealtime -p NextElapseUSecMonotonic`
+> **逐項指名**，讓這種誤讀在結構上不可能。
+>
+> **而更正之後看到的比原本記的更有用：這兩欄不是同一個值的兩種視圖，值會搬家。**
+> 尚未觸發時下次觸發是一個**牆鐘時刻**（Realtime 有值、Monotonic `0`）；
+> 已觸發而下次還沒算時，它**不再等**（Realtime 空、Monotonic `infinity`）。
+> 哪一欄有值，取決於 systemd 當下用哪個時鐘在想「下一次」。
+> 所以 `infinity` 不是「一個很大的牆鐘時間」，`Monotonic=0` 也不是「1970-01-01」。
+>
+> 🔴 **這正是寫錯那一格的實質後果**：`get_timer_state()` 若改用 `systemctl show`
+> 取 `NextElapseUSecMonotonic`（名字看起來最像「倒數」），正常狀態下拿到的是
+> **`0`** → 會被當成 `1970-01-01` 的「下次觸發」。**文件裡犯的誤讀，就是程式碼
+> 換一個屬性會犯的同一個錯。**
 
 probe 的可重跑指令（自己建、自己收，不碰 jobspy 的 unit）：
 
@@ -229,36 +248,44 @@ tail -f logs/cron_search.log
 
 ## 測試覆蓋（誠實聲明）
 
-**這個專案的自動化測試只有一支**：`tests/test_scan_lock.py`（83 項檢查）。
+**這個專案的自動化測試只有一支**：`tests/test_scan_lock.py`（87 項檢查）。
 其餘全部是手動驗證 —— 上面各節的「驗證」指令就是手動程序。
 
 ```bash
 cd /home/ian/github-project/jobspy
 .venv/bin/python tests/test_scan_lock.py     # 通過時印「✅ 全數通過」且 exit 0
 
-# 要引用「幾項」時用這個量，不要憑印象寫 —— 這個數字已經腐化過八次
-# （28→39→53→55→56→58→65→81→83）。
+# 要引用「幾項」時用這個量，不要憑印象寫 —— 這個數字已經腐化過九次
+# （28→39→53→55→56→58→65→81→83→87）。
 #   65→81 是第七輪退回：L 區 9 項 + M 區 7 項。
 #   81→83 是第八輪自查：F 區 +1（F4 補回漏掉的 subprocess.run 攔截）、
 #           M 區 +1（banner 的「下次觸發」不得把「執行中」印成「(無)」）。
+#   83→87 是第八輪【審查退回】：C 區 +1 與 G 區 +1（未攔 subprocess.run 的
+#           三個呼叫點補上攔截與斷言）、L 區 +2（_fired_list 的 6 種畸形值
+#           與正向控制）。
 .venv/bin/python tests/test_scan_lock.py | grep -c '\[PASS\]'
 ```
+
+> ⚠️ **跑測試請用 `.venv/bin/python`。** 用系統 `python3` 會停在
+> `ModuleNotFoundError: No module named 'flask'`。`tests/mutate.py` 現在會自己
+> 選對解譯器，並且**先跑一次未變異的基準線**（要求 `✅ 全數通過` 且 0 失敗），
+> 通過了才開始跑變異 —— 否則整張表都只是同一個既有故障的回音，而它看起來一模一樣。
 
 | 區段 | 項數 | 涵蓋 |
 |---|---|---|
 | A / A2 | 2 + 3 | `SEARCH_LOCK` 必須可重入（CRITICAL-1）、完整 `kill_stalled_search()` 路徑 |
 | B | 4 | 過期 owner 不得釋放現任鎖（含 8 執行緒 hammer） |
-| C | 5 | 看板持鎖時不得留下凍結的 `active` 狀態 |
+| C | 6 | 看板持鎖時不得留下凍結的 `active` 狀態；C 區兩個 `_REAL_KILL_EXTERNAL()` 呼叫點不得碰 `systemctl`（第八輪審查） |
 | D | 6 | Popen 失敗時必須把鎖還回去（MAJOR-3） |
 | E | 5 | 孤兒鎖自癒 |
 | F | 18 | 孤兒鎖盲區、誤殺無關行程、幻影掃描、假成功、`cmdline` 身分驗證（第三輪退回）；F4 的 `subprocess.run` 攔截（第八輪自查） |
 | F7 | 7 | 殺戮路徑的**正向**覆蓋：必須開火、且目標真的死掉（第四輪退回） |
-| G | 4 | `errors="replace"` 與 TOCTOU 重檢的回歸保護（第四輪退回） |
+| G | 5 | `errors="replace"` 與 TOCTOU 重檢的回歸保護（第四輪退回）；TOCTOU 路徑不得呼叫 `systemctl`（第八輪審查） |
 | H | 2 | 日誌每行必須**一次** `write()` 寫出（第五輪退回，見下） |
 | I | 1 | `job_board.py` 不得有 live 的 `print()`（第五輪退回） |
 | J | 2 | 啟動時的排程主權轉移：兩個方向都要正確（見「回復到舊制」一節） |
 | K | 7 | `api_schedule` 的輸入驗證：幽靈排程（`times: []`）、非物件主體、`enabled` 的字串陷阱、第三道鎖（不得重新武裝）（第六輪退回） |
-| L | 9 | **跨午夜的掃描被靜默跳過**（MAJOR-1）、`post-run` 的 `next_run` 必須等於 `_compute_next_run`、`interval_hours` 的 `inf`、非 ASCII 的「數字」（第七輪退回） |
+| L | 11 | **跨午夜的掃描被靜默跳過**（MAJOR-1）、`post-run` 的 `next_run` 必須等於 `_compute_next_run`、`interval_hours` 的 `inf`、非 ASCII 的「數字」（第七輪退回）；`_fired_list` 對 6 種畸形 `_fired_today` 都不得丟例外 + 正向控制（第八輪審查） |
 | M | 8 | 損壞排程檔的**靜默降級**、`save_schedule` 的原子性、`ok` 的語意、`TimerCalendar` 解析（第七輪退回）；banner 的「下次觸發」必須區分「沒裝」與「執行中還沒算」（第八輪） |
 
 > ⚠️ **H 那一格是錯的，而且錯了兩輪。** 第七輪審查 MAJOR-2：原本寫 `| H | 3 |`，
@@ -323,10 +350,17 @@ cd /home/ian/github-project/jobspy
 .venv/bin/python tests/mutate.py     # 需乾淨的工作區；在 /tmp 隔離副本裡跑
 ```
 
-目前 **27 個變異、26 個被逮、1 個已知逃脫**（`EXPECTED_ESCAPES = {"M13"}`；
+目前 **30 個變異、29 個被逮、1 個已知逃脫**（`EXPECTED_ESCAPES = {"M13"}`；
 `mutate.py` 把「已理解的逃脫」與「沒被發現的覆蓋缺口」分開回報，只有後者
 會讓退出碼變 1）。**若你新增修正卻找不到會失敗的變異，代表那個修正沒有被測試
 覆蓋** —— 那就把那個變異加進來、列進 `EXPECTED_ESCAPES`，讓缺口誠實地站出來。
+
+> ⚠️ **`INCONCLUSIVE` 也【不】算逃脫**（第八輪新增）。測試檔必須印出收尾標記
+> （`✅ 全數通過` 或 `項失敗：`）才算跑到底；沒印 → 記 `INCONCLUSIVE` 並讓
+> 退出碼非 0。這個判定在第九輪**自己救了一輪**：整張表 30 個 `INCONCLUSIVE`、
+> 真正的原因只是啟動載具時用了系統 `python3`（見上方「跑測試請用
+> `.venv/bin/python`」）。若沒有這個判定，同一輪會被讀成「30 個逃脫」——
+> 一個完全不存在的災難。**「量到 0」和「量尺壞了」在報表上長得一樣。**
 
 > ⚠️ **但「列進 `EXPECTED_ESCAPES`」比它看起來危險得多。** 這裡曾經躺著第二個
 > 豁免 `M20`，理由寫著「要 `INTERNAL_SCHEDULER=1` 且跑完一輪 19 分鐘的真掃描才會
@@ -469,10 +503,28 @@ cd /home/ian/github-project/jobspy
   > 所以判定不能靠提醒，要靠機械：**`mutate.py` 現在要求測試檔印出收尾標記**
   > （`✅ 全數通過` 或 `項失敗：`）。沒印＝沒跑到底 → 記 **`INCONCLUSIVE`**，
   > 明確標示「這不是逃脫」，並讓退出碼非 0。同時 F4 補上了它漏掉的
-  > `subprocess.run` 攔截（它是七個 `_REAL_KILL_EXTERNAL()` 呼叫點裡唯一沒攔的）。
+  > `subprocess.run` 攔截。
+  >
+  > ⚠️⚠️ **上面那句「它是七個 `_REAL_KILL_EXTERNAL()` 呼叫點裡唯一沒攔的」也是假的**
+  > （第八輪審查用 AST 逐點重算，沒有採信我列的清單）：
+  >
+  > | 時點 | 呼叫點 | 其中沒被 mock 包住的 |
+  > |---|---|---|
+  > | 寫下那句話當時 | **9** 個（我寫「七個」） | **4** 個（我寫「唯一一個」） |
+  > | 補上 F4 之後 | 9 個 | 3 個（C 區兩處、G 區 TOCTOU） |
+  > | 本輪修完 | 9 個 | **0** 個 |
+  >
+  > 而且我還點名「TOCTOU 攔了」——**它正是那 4 個之一**。
+  > **同一個缺陷（宣告 > 實際）在三段先後「宣告它已經修好」的文字裡各犯了一次。**
   >
   > **教訓：寫在註解裡的規則不會自己執行。** 那句鐵律註解寫得完全正確，
   > 而且就寫在違反它的那段程式碼上方 —— 差別在於它一直是「文字」而不是「判定」。
+  >
+  > **第二層教訓：「我列舉過了」不是證據。** 列舉的結果要能被別人重跑，
+  > 而且重跑的方法本身不能把**註解**算成**實例** —— `grep -n "_REAL_KILL_EXTERNAL()"`
+  > 在本檔 15 個命中裡有 6 個是註解，而我的第一版檢查腳本甚至把鐵律註解裡那句
+  > `mock.patch.object(jb.subprocess, "run", ...)` 當成了真的 mock，於是判定變成
+  > 「全部都有攔」。唯一可靠的是 AST 逐點判 enclosing（腳本見 DECISIONS.md）。
 
 ### ⚠️ 未涵蓋（不要以為有測試就安全）
 

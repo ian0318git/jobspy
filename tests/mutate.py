@@ -36,6 +36,7 @@ INCONCLUSIVE／套用失敗。
 看到逃脫先懷疑變異本身。
 """
 import hashlib
+import os
 import re
 import shutil
 import signal
@@ -73,6 +74,28 @@ TIMEOUT = 400
 #   M20 現在改成 _record_run() 的日期那一半，L 區逮得到它。
 #   ⚠️ 留這一段的教訓：「測不到」通常只是「還沒抽出來」的另一種說法。
 EXPECTED_ESCAPES = {"M13"}
+
+# ── 要用哪個解譯器跑測試 ────────────────────────────────────────────────────
+# ⚠️ 第九輪：這裡原本是 `sys.executable`，而它的意思是「**你剛好用哪個解譯器
+# 啟動我**」，不是「這個專案該用哪個解譯器」。用 `python3 tests/mutate.py`
+# （系統 Python）啟動時，子行程 `import job_board` → `from flask import …`
+# → ModuleNotFoundError，於是【每一個】變異都以 `rc=1`、**0 個檢查**收場。
+#
+# 判定本身是對的（它沒把這讀成「30 個逃脫」——第八輪加的收尾標記判定救了這一輪），
+# 但代價是整輪白跑，而且原因得自己猜。生產（run_scan.sh）用的是
+# `$DIR/.venv/bin/python`，測試沒有理由用別的。
+#
+# ⚠️ 真正學到的不是「要寫 .venv/bin/python」——是**這個載具會安靜地量錯東西**。
+# 下面那段基準線才是結構性的修法：先確認量尺在已知的良好樣本上讀數正確。
+#
+# `JOBSPY_MUTATE_PY` 是**測試鉤子**，不是設定選項（同 run_scan.sh 的 JOBSCAN_SCRIPT）。
+# 它存在的唯一理由是讓「基準線守衛」本身可以被故意觸發 —— 一個觸發不了的守衛
+# 等於沒有守衛，而「沒驗過的守衛」正是這個專案被燒最多次的形狀。驗法：
+#     JOBSPY_MUTATE_PY=/usr/bin/python3 .venv/bin/python tests/mutate.py
+# 預期：**幾秒內**以「✗ 基準線就不是全綠」中止，而不是產出一張 30 列的假表。
+_VENV_PY = REPO / ".venv" / "bin" / "python"
+PY = (os.environ.get("JOBSPY_MUTATE_PY")
+      or (str(_VENV_PY) if _VENV_PY.is_file() else sys.executable))
 
 
 def git(*args, check=True):
@@ -338,6 +361,34 @@ MUTATIONS = [
          "M30")),
 ]
 
+# ── 基準線：先確認【沒被變異的】那一份是全綠的 ──────────────────────────────
+# 這一步量的是「量尺本身」。如果連原始碼都跑不過，後面每一個變異的 PASS/FAIL
+# 都只是同一個既有故障的回音 —— 而表格看起來一模一樣（30 列數字，長得很正常）。
+#
+# ⚠️ 這一輪就是這樣燒掉一次的：整張表 30 個 INCONCLUSIVE，真正的差別只在
+# 啟動載具時用了 `python3` 而不是 `.venv/bin/python`。**「量到 0」和「量尺壞了」
+# 在報表上長得一樣**，差別只在有沒有人先驗過量尺。
+def _run_suite(test_path):
+    r = subprocess.run([PY, str(test_path)], cwd=WORK,
+                       capture_output=True, text=True, timeout=TIMEOUT)
+    out = r.stdout + r.stderr
+    return (out, len(re.findall(r"\[PASS\]", out)),
+            len(re.findall(r"\[FAIL\]", out)), r.returncode)
+
+
+print(f"解譯器：{PY}")
+_bout, _bp, _bf, _brc = _run_suite(TEST)
+if "✅ 全數通過" not in _bout or _bf != 0 or _brc != 0:
+    print(f"\n✗ 基準線就不是全綠（{_bp}P/{_bf}F rc={_brc}）—— 先修好再跑變異。")
+    print("  否則下面每一個變異都只是這個既有故障的回音，而表格會長得很正常。")
+    print("  尾巴：")
+    for _l in _bout.strip().splitlines()[-15:]:
+        print(f"    │ {_l}")
+    shutil.rmtree(WORK, ignore_errors=True)
+    sys.exit(2)
+BASE_PASS = _bp
+print(f"基準線：{_bp} 項全過、0 失敗（rc=0）\n")
+
 results = []
 try:
     for mid, label, mutate in MUTATIONS:
@@ -349,14 +400,14 @@ try:
             print(f"{full:44s} ✗ 錨點失效：{e}")
             continue
 
-        if subprocess.run([sys.executable, "-m", "py_compile", str(TARGET)],
+        if subprocess.run([PY, "-m", "py_compile", str(TARGET)],
                           capture_output=True).returncode != 0:
             results.append((mid, full, "SYNTAX-ERR", "變異本身語法錯誤", "BAD"))
             print(f"{full:44s} ✗ 變異本身語法錯誤")
             continue
 
         try:
-            r = subprocess.run([sys.executable, str(TEST)], cwd=WORK,
+            r = subprocess.run([PY, str(TEST)], cwd=WORK,
                                capture_output=True, text=True, timeout=TIMEOUT)
         except subprocess.TimeoutExpired:
             # 逾時【不】算被逮：分不出「變異造成死鎖（=有偵測到）」與

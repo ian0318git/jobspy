@@ -2,6 +2,88 @@
 
 重要決策紀錄 — 依專案工作流程要求更新。
 
+## 2026-09-20 — 第九輪（收尾）：修正第八輪審查退回的 3 MINOR + 3 NIT
+
+使用者選了「做一輪小規模收尾，只處理這 6 項，然後補一次審查」。三項 MINOR 有共同形狀
+——**宣告的保護大於實際的保護**：
+
+| | 宣告 | 實際 |
+|---|---|---|
+| MINOR-1 | 鐵律註解說「呼叫 `_REAL_KILL_EXTERNAL()` 的地方都攔了 `subprocess.run`」 | 9 個呼叫點裡有 4 個沒攔（更正後為 3、再修完為 0；見上） |
+| MINOR-2 | `_record_run()` 裡有 `isinstance(fired_map, dict)` 守衛，註解說「壞掉的 `_fired_today` 不會讓帳務炸掉」 | 守衛在**寫入端**，但先炸的是 `scheduler_loop()` 的**讀取端**，那行在守衛被執行**之前**就跑掉了 → 守衛**到不了** |
+| MINOR-3 | 測試傳 `JOBSCAN_LOCK/LIVE/STATE` 指向 `/tmp` 以求隔離 | `job_board.py` 把這三個路徑**寫死**、不讀 env（只有 `run_scan.sh` 讀）→ 隔離是假的 |
+
+**MINOR-2 的症狀值得單獨記**：`[scheduler] Error: 'list' object has no attribute 'get'`
+每 30 秒一行（約 120 行/小時），而**面板照樣顯示漂亮的 `next_run`** ——
+排程器停擺但 UI 看起來完全正常。可達路徑是工具與文件互相指向對方的正常操作：
+`JOB_BOARD_INTERNAL_SCHEDULER=1`（文件記載的回復舊制路徑）+ 手改過的排程檔。
+修法是把「什麼算合法的 `_fired_today`」定義在**唯一一個地方**（`_fired_map()`），
+讀取端與寫入端共用它。
+
+### 這一輪真正的教訓：**量尺自己會安靜地量錯東西**
+
+修完之後重跑變異測試，得到 **30 個 `INCONCLUSIVE`**（`0P/0F rc=1`）。
+
+判定是對的 —— 第八輪加的「測試檔必須跑到底」守衛**沒有**把它讀成「30 個逃脫」。
+但真正的原因跟被測的程式無關：**我用 `python3 tests/mutate.py` 啟動載具，
+而載具用 `sys.executable` 跑測試**，於是子行程是**系統 Python**，
+`import job_board` → `from flask import …` → `ModuleNotFoundError`。
+
+> `sys.executable` 的意思是「**你剛好用哪個解譯器啟動我**」，不是「這個專案該用
+> 哪個解譯器」。生產（`run_scan.sh`）用的是 `$DIR/.venv/bin/python`，測試沒有
+> 理由用別的。
+
+修了兩件事，而**第二件才是結構性的**：
+
+1. 解譯器改為固定取 `.venv/bin/python`（並留 `JOBSPY_MUTATE_PY` 測試鉤子，
+   讓守衛本身可以被故意觸發 —— 一個觸發不了的守衛等於沒有守衛）。
+2. **先跑一次未變異的基準線**，要求 `✅ 全數通過` 且 0 失敗，通過了才開始跑變異。
+
+> **「量到 0」和「量尺壞了」在報表上長得一樣。** 兩者都是一張 30 列的數字表。
+> 差別只在有沒有人先驗過量尺 —— 而這一輪是我自己差點沒驗。
+> 基準線守衛的實測：`JOBSPY_MUTATE_PY=/usr/bin/python3` → **1 秒**內以
+> 「✗ 基準線就不是全綠（0P/0F rc=1）」中止，並直接把
+> `ModuleNotFoundError: No module named 'flask'` 印出來。
+
+### 第三個實例：更正「宣告 > 實際」的那段文字，自己又犯了同一個錯
+
+第八輪我在 `tests/test_scan_lock.py` 的鐵律註解裡補了一段更正，寫著
+「`_REAL_KILL_EXTERNAL()` 共有 **9 個**呼叫點，其中 **3 個**沒有 mock ——
+F4、C 區的兩處、以及 G2 的 TOCTOU」。這一輪用 AST 逐點重算才發現：
+
+- 那是 **4 個項目掛在「3 個」底下**（清單與自己的計數不一致）；
+- 而且 **F4 在寫那段話的時候已經修好了** —— 3 是修完 F4 之後的數字，
+  4 才是寫下原句當時的數字，**兩件事被混成一句**。
+
+AST 判定的結果（判準：這個呼叫點外面有沒有包著 mock `subprocess.run` 的 `with`）：
+
+| 時點 | 呼叫點 | 沒被包住的 |
+|---|---|---|
+| 寫下「七個裡唯一一個」當時 | **9** 個 | **4** 個（302／311／472／739） |
+| 補上 F4 之後（`5c036ee`） | 9 個 | 3 個（308／317／774） |
+| 本輪修完（`26c1e39`） | 9 個 | **0** 個 |
+
+> **同一個缺陷（宣告 > 實際）在三段先後「宣告它已經修好」的文字裡各犯了一次。**
+> 教訓：「我列舉過了」不是證據 —— **列舉的結果要能被別人重跑**，
+> 而且**重跑的方法本身不能把【註解】算成【實例】**。
+
+我第一版的檢查腳本就是這樣爛掉的：`grep -n "_REAL_KILL_EXTERNAL()"` 在本檔 15 個
+命中裡有 6 個是**註解**（其中一個是**鐵律註解本身在引用這個名字**），而我的腳本
+甚至把鐵律註解裡那句 `mock.patch.object(jb.subprocess, "run", ...)` 當成了真的
+mock —— 於是判定變成「全部都有攔」。**那跟 NIT-3（用 `systemctl show` 讀位置欄位、
+把 Realtime 的值看成 Monotonic 的）是同一種病：把「提到」算成「實例」。**
+
+### 本輪數字
+
+- 測試：83 → **87** 項（C +1、G +1、L +2），全過、0 失敗。
+- 變異：27 → **30** 個（M28 `_timer_next_text` 的「否認一件會發生的事」、
+  M29 `kill_stalled_external` 的持鎖前置檢查、M30 `_fired_today` 不消毒）。
+- `mutate.py` 的 `INCONCLUSIVE` 判定補記兩個已知界線（見該檔註解）：
+  反向誤判是**保守**的（逼人來看，留著不修）；**非主執行緒崩潰是真正的盲區**
+  —— 收尾標記由主執行緒印出，而這個專案的產品碼大量使用 daemon thread。
+
+
+
 ## 2026-09-20 — 第八輪（自查，不是審查退回）：保護的「宣告」與「實際」之間的落差
 
 第七輪退回的修正做完、測試 65→81 全綠之後，我在重跑變異測試時看到一件不該發生的事：
@@ -18,6 +100,67 @@
 
 **F4 沒有攔。** 而它是七個呼叫點裡唯一沒攔的（F4b、F4c、F7a–c、TOCTOU 全部攔了）。
 那段註解聲稱的保護範圍與實際不符 —— 這正是**第四輪 MAJOR 的原句**，換一個地方復發。
+
+> ⚠️⚠️ **2026-09-20 更正（第八輪審查）：上面那句話本身也是假的，而且錯了三層。**
+>
+> 審查員沒有採信我列的清單，自己重新列舉 —— 用 AST 逐一個問「這個呼叫點外面
+> 有沒有包著 mock `subprocess.run` 的 `with`」，結果（`5c036ee~1`，也就是我寫下
+> 那句話的當時）：
+>
+> | 時點 | `_REAL_KILL_EXTERNAL()` 呼叫點 | 其中【沒被包住】的 |
+> |---|---|---|
+> | 寫下那句話的當時 | **9** 個 | **4** 個（302／311／472／739） |
+> | 補上 F4 之後（`5c036ee`） | 9 個 | 3 個（308／317／774） |
+> | 本輪修完（`26c1e39`） | 9 個 | **0** 個 |
+>
+> 1. **總數錯**：不是七個，是九個。
+> 2. **「唯一」錯**：當時沒攔的不是 1 個而是 **4 個** —— F4 之外，還有 C 區的兩處
+>    與 G 區的 TOCTOU。
+> 3. **最糟的是第三層**：我**點名 TOCTOU「攔了」**，而它正是那 4 個之一。
+>    「列舉過」和「列舉對」是兩件事，我把前者當成了後者。
+>
+> **同一個缺陷（宣告 > 實際）在「宣告它已經修好」的那一段話裡又犯了一次** ——
+> 這一則的標題是「保護的宣告與實際之間的落差」，而它自己就是那個落差的第三個實例。
+>
+> **可重跑的做法**（不要相信任何清單，包括這張表）：
+>
+> ```bash
+> grep -n "_REAL_KILL_EXTERNAL()" tests/test_scan_lock.py   # 逐一往上找 mock
+> ```
+>
+> ⚠️ 但 `grep` 會把**註解裡提到這個名字的行**也算進去（本檔 15 個命中裡有 6 個是
+> 註解），而我的第一版檢查腳本又進一步把**鐵律註解裡那句
+> `mock.patch.object(jb.subprocess, "run", ...)` 當成了真的 mock** —— 因為它也是
+> 一行符合字串的內容。於是判定變成「全部都有攔」。
+> **那跟 NIT-3（讀位置欄位）是同一種病：把「提到」算成「實例」。**
+> 唯一可靠的是走 AST：
+
+```python
+# 逐一問：這個 _REAL_KILL_EXTERNAL() 呼叫點，外面有沒有包著 mock subprocess.run？
+import ast, subprocess
+src = subprocess.run(["git", "show", "HEAD:tests/test_scan_lock.py"],
+                     capture_output=True, text=True).stdout
+tree = ast.parse(src)
+
+def is_mockrun(w):                      # 只看真的 with 陳述，不看註解
+    s = ast.unparse(w)
+    return "patch.object" in s and "subprocess" in s and '"run"' in s
+
+calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+         and isinstance(n.func, ast.Name) and n.func.id == "_REAL_KILL_EXTERNAL"]
+parent = {c: n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
+
+def enclosing(c):
+    out, n = [], c
+    while n in parent:
+        n = parent[n]
+        if isinstance(n, (ast.With, ast.AsyncWith)) and is_mockrun(n):
+            out.append(n.lineno)
+    return out
+
+unmocked = sorted(c.lineno for c in calls if not enclosing(c))
+print(f"呼叫點 {len(calls)} 個；沒被包住的 {len(unmocked)} 個：{unmocked}")
+```
 
 後果分兩層：
 
@@ -62,12 +205,36 @@ systemctl --user kill --signal=SIGKILL jobscan.service
 systemd-run --user --unit=jwprobe2 --on-calendar='*-*-* *:*:00' /bin/sleep 30
 ```
 
-| 狀態 | `NEXT` | `NextElapseUSecMonotonic` | **JSON `next`** |
-|---|---|---|---|
-| timer 尚未觸發、service **手動**拉起（running） | `Sun 09:14:00 AEST` | 有值 | **`1789859640000000`（int）** |
-| **timer 已觸發**、其 service 仍在跑 | **`-`** | **`infinity`** | **`None`（null）** |
-| service 結束後 | `Sun 09:14:00 AEST` | `0` | 下一次的值 |
-| 生產 `jobscan.timer`（08:49:02→09:07:55） | `-` | `infinity` | — |
+| 狀態 | `NEXT` | `NextElapseUSecRealtime` | `NextElapseUSecMonotonic` | **JSON `next`** |
+|---|---|---|---|---|
+| timer 尚未觸發、service 未跑 | `Sun 09:14:00 AEST` | `Sun 2026-09-20 11:22:00 AEST` | **`0`** | **`1789859640000000`（int）** |
+| timer 尚未觸發、service **手動**拉起 | `Sun 09:14:00 AEST` | 同上 | **`0`** | 同上 |
+| **timer 已自行觸發**、其 service 仍在跑 | **`-`** | **（空）** | **`infinity`** | **`None`（null）** |
+| service 結束後 | `Sun 09:14:00 AEST` | 下一次的值 | `0` | 下一次的值 |
+| 生產 `jobscan.timer`（08:49:02→09:07:55） | `-` | （空） | `infinity` | — |
+
+> ⚠️ **2026-09-20 更正（第八輪 NIT-3）：上一版這張表把第三欄寫成「有值」，
+> 那是錯的。** 我當初是用 `systemctl show` 讀**位置欄位**——而它印的是**固定的
+> 規範順序**（`Realtime` 在前、`Monotonic` 在後），所以我把 Realtime 的值看成了
+> Monotonic 的值。實測第一列是 `Realtime=Sun …11:22:00 AEST` / **`Monotonic=0`**。
+> 現在改成用 `systemctl show …-p NextElapseUSecRealtime -p NextElapseUSecMonotonic`
+> **逐項指名**，讓這種誤讀在結構上不可能。
+
+**而更正之後看到的事情比原本記的更有用：這兩欄不是同一個值的兩種視圖，值會搬家。**
+
+| | `NextElapseUSecRealtime` | `NextElapseUSecMonotonic` |
+|---|---|---|
+| 尚未觸發（下次觸發是一個**牆鐘時刻**） | 有值 | `0` |
+| 已觸發、下次還沒算（**不再等**） | （空） | `infinity` |
+
+哪一欄有值，取決於 systemd 當下**用哪個時鐘在想「下一次」**。所以 `infinity`
+不是「一個很大的牆鐘時間」，而單獨看 `Monotonic=0` 也不是「1970-01-01」。
+
+> 🔴 **這正是我寫錯的那一格的實質後果，不是美醜問題**：`get_timer_state()` 若改用
+> `systemctl show` 取 `NextElapseUSecMonotonic`（看起來最像「倒數」的那個名字），
+> 正常狀態下拿到的是 **`0`** → 會被當成 `1970-01-01` 的「下次觸發」。
+> **我在文件裡犯的誤讀，就是程式碼換一個屬性是會犯的同一個錯。**
+> 文件寫錯一格只是難看；程式碼讀錯一欄會讓面板顯示一個過去的時間，而它看起來像答案。
 
 **⚠️ 上面第二列才是生產的實際狀態，而它教我一件比原本以為更精確的事：**
 觸發條件**不是「service 正在跑」**，而是**「timer 的那次 elapse 已經被消費掉、下一次還沒算出來」**。
@@ -103,6 +270,23 @@ timer 的那次 elapse 還在。**生產的 `jobscan.timer` 是自己觸發 serv
 判定邏輯抽成 `_timer_next_text()` 以便測試（同 `_record_run()` / `_compute_next_run()`
 的手法）。前端本來就是對的：`next_run` 為 null 時它**省略**「下次 …」那一段，
 而不是顯示一個錯的值。
+
+**⚠️ 本輪審查對這一節的更正（NIT-2）**：我原本在這裡寫「這個修正的守衛是一行
+probe 的輸出，**不是一個測試**」。**那是錯的** —— 它是測試套件裡的正式一項
+（`banner 的『下次觸發』必須區分…`）。審查員把它改回修正前，那一項真的 FAIL。
+
+**真正的缺口是別的：它沒有對應的＊變異＊。**
+`grep -c "_timer_next_text" tests/mutate.py` 當時是 **0** —— 也就是說「這個測試是
+load-bearing 的」這件事**從來沒有被變異實驗證明過**。而本專案自己的規則就寫在
+`deploy/README.md`：「若你新增修正卻找不到會失敗的變異，代表那個修正沒有被測試
+覆蓋」。
+
+> **「有測試」與「測試是 load-bearing 的」是兩件事。** 只有變異能區分它們 ——
+> 一個永遠會通過的測試與一個不存在的測試，在測試報告上長得一模一樣（都是綠的）。
+> 本輪已補上 **`M28`**（把 `_timer_next_text()` 退回無條件「（無）」），實測被逮。
+>
+> 順帶：連**我自己在寫下這個更正的時候**都在猜「是測試還是 probe」——
+> 所以判斷一句話對不對的方式是**去跑它**，不是去想它。
 
 ### 3. 生產證據：休眠喚醒後 `Persistent=true` 真的補跑了一輪
 
