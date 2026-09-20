@@ -479,9 +479,38 @@ BASE_PASS = _bp
 print(f"基準線：{_bp} 項全過、0 失敗（rc=0）；"
       f"與原始碼的 {_AST_CHECKS} 個 check() 呼叫點相符\n")
 
+# ── 兩個測試鉤子：只跑指定的變異、以及每個變異連跑 N 次 ────────────────────────
+# 第九輪【審查退回】MINOR-2 的產物。審查員把整張表重跑一次，得到 M9 = 88P/2F、
+# M29 = 89P/1F —— 與我記錄的**剛好相反**。而 M9 與 M29 在 G2 那個情境下行為等價
+# （都把「動手前再確認一次持有鎖」拿掉，於是都真的去殺那個誘餌），
+# **行為等價的兩個變異，失敗集合必然相同**。
+#
+# → 所以「兩個等價變異讀數不同」本身就是【抽樣雜訊的證明】，不需要任何額外工具。
+#   這一條是讀這張表時最有用的偵測器，寫在這裡是因為它不直觀：
+#   **表格看起來只是數字不同，但那個不同就是「某一項檢查不穩定」的鐵證。**
+#
+# 那個雜訊的來源是 MINOR-1（G2 用 `poll() is None` 當存活斷言，而 SIGKILL 送出到
+# 真的死掉之間有窗口）。修掉之後 M9 / M29 在 6 次重跑下都是穩定的 88P/2F。
+#
+# 用法（只在需要時跑，平常的整張表不受影響）：
+#   JOBSPY_MUTATE_ONLY=M9,M29 JOBSPY_MUTATE_REPEAT=6 .venv/bin/python tests/mutate.py
+# 讀數只要在重跑之間變化，就標成 UNSTABLE（INCONCLUSIVE，退出碼非 0）——
+# 因為那代表【這一列不能寫進文件】：單次抽樣不是變異的性質。
+_ONLY = {s.strip() for s in os.environ.get("JOBSPY_MUTATE_ONLY", "").split(",") if s.strip()}
+try:
+    _REPEAT = max(1, int(os.environ.get("JOBSPY_MUTATE_REPEAT", "1")))
+except ValueError:
+    sys.exit("✗ JOBSPY_MUTATE_REPEAT 必須是整數")
+_SELECTED = [m for m in MUTATIONS if not _ONLY or m[0] in _ONLY]
+if _ONLY and not _SELECTED:
+    sys.exit(f"✗ JOBSPY_MUTATE_ONLY={sorted(_ONLY)} 沒有對應任何變異")
+if _ONLY or _REPEAT > 1:
+    print(f"⚠️  子集模式：{len(_SELECTED)}/{len(MUTATIONS)} 個變異、每個連跑 {_REPEAT} 次"
+          "（這不是完整的一輪）\n")
+
 results = []
 try:
-    for mid, label, mutate in MUTATIONS:
+    for mid, label, mutate in _SELECTED:
         full = f"{mid} {label}"
         try:
             TARGET.write_text(mutate(ORIG), encoding="utf-8")
@@ -508,9 +537,32 @@ try:
             print(f"{full:44s} ⏱  逾時 {TIMEOUT}s —— INCONCLUSIVE，請查因")
             continue
 
+        _readings = [(len(re.findall(r"\[PASS\]", r.stdout + r.stderr)),
+                      len(re.findall(r"\[FAIL\]", r.stdout + r.stderr)),
+                      r.returncode)]
+        # 重跑模式：同一個變異再跑幾次，讀數只要不一樣就代表【有檢查不穩定】。
+        # 這種列不能寫進文件 —— 單次抽樣不是變異的性質（第九輪 MINOR-2 就是這樣
+        # 被審查員抓到的：M9 與 M29 行為等價，讀數卻不同）。
+        for _ in range(_REPEAT - 1):
+            try:
+                _r2 = subprocess.run([PY, str(TEST)], cwd=WORK,
+                                     capture_output=True, text=True, timeout=TIMEOUT)
+            except subprocess.TimeoutExpired:
+                _readings.append((-1, -1, -1))
+                continue
+            _readings.append((len(re.findall(r"\[PASS\]", _r2.stdout + _r2.stderr)),
+                              len(re.findall(r"\[FAIL\]", _r2.stdout + _r2.stderr)),
+                              _r2.returncode))
+        if len(set(_readings)) > 1:
+            _all = " ".join(f"{p}P/{f}F" for p, f, _ in _readings)
+            results.append((mid, full, _all,
+                            f"{_REPEAT} 次重跑讀數不一致 —— 有檢查不穩定，"
+                            "這一列不能寫進文件", "UNSTABLE"))
+            print(f"{full:44s} 🎲 {_all} —— UNSTABLE：{_REPEAT} 次重跑讀數不一致")
+            continue
+
         out = r.stdout + r.stderr
-        passed = len(re.findall(r"\[PASS\]", out))
-        failed = len(re.findall(r"\[FAIL\]", out))
+        passed, failed, rc = _readings[0]
 
         # ⚠️ 測試檔【必須跑到底】才算數。第八輪實測：M4（拿掉 phase 閘門）會讓
         # F4 那段走到真的 systemctl，被最底層那把「指令含 kill 就拋例外」的跳線
@@ -545,7 +597,7 @@ try:
         # 歸因錯誤（真正的原因是「檢查沒被執行」，不是「修正沒有守衛」）。
         # 這裡把它拉出來當 INCONCLUSIVE，逼人去看。
         if done and passed + failed != BASE_PASS:
-            results.append((mid, full, f"{passed}P/{failed}F rc={r.returncode}",
+            results.append((mid, full, f"{passed}P/{failed}F rc={rc}",
                             f"總項數 {passed + failed} ≠ 基準線 {BASE_PASS}"
                             "（檢查被跳過？）", "INCONCLUSIVE"))
             print(f"{full:44s} ⚠️  總項數 {passed + failed} ≠ 基準線 {BASE_PASS}"
@@ -555,10 +607,10 @@ try:
             # 多印出實際的 P/F 與最後幾行，讓「崩在哪」一眼可見 ——
             # 否則唯一的線索是一個看起來很正常的 `32P/0F`。
             tail_lines = [l for l in out.strip().splitlines()[-4:]]
-            results.append((mid, full, f"{passed}P/{failed}F rc={r.returncode}",
+            results.append((mid, full, f"{passed}P/{failed}F rc={rc}",
                             "測試檔未跑完（崩潰？）—— 這不是逃脫", "INCONCLUSIVE"))
             print(f"{full:44s} ⚠️  測試檔【未跑完】({passed}P/{failed}F "
-                  f"rc={r.returncode}) —— INCONCLUSIVE，不是逃脫，請查因")
+                  f"rc={rc}) —— INCONCLUSIVE，不是逃脫，請查因")
             for _l in tail_lines:
                 print(f"{'':44s}     │ {_l}")
             continue
@@ -567,8 +619,8 @@ try:
             verdict, kind = "✅ 被逮", "CAUGHT"
         else:
             verdict, kind = "❌ 逃脫（無回歸保護）", "ESCAPED"
-        results.append((mid, full, f"{passed}P/{failed}F rc={r.returncode}", verdict, kind))
-        print(f"{full:44s} {passed:>2}P / {failed:>2}F  rc={r.returncode}  {verdict}")
+        results.append((mid, full, f"{passed}P/{failed}F rc={rc}", verdict, kind))
+        print(f"{full:44s} {passed:>2}P / {failed:>2}F  rc={rc}  {verdict}")
 finally:
     shutil.rmtree(WORK, ignore_errors=True)
 
@@ -597,7 +649,15 @@ for _mid, full, stat, verdict, _kind in results:
     print(f"  {full:44s} {stat:>18s}  {verdict}")
 print("=" * 80)
 
-bad = [r for r in results if r[4] in ("BAD", "INCONCLUSIVE")]
+# ⚠️⚠️ 這個 tuple 是「這一列不能拿來下結論」的完整集合。第九輪加入 UNSTABLE 時
+# **漏了這裡** —— 而症狀正是本專案的主旋律缺陷：加了守衛，但守衛不會讓任何東西
+# 失敗。實測（探針造出來的）：
+#     M13 拿掉鎖（保留整行一次 write）  🎲 90P/1F 91P/0F —— UNSTABLE
+#     ✅ 1/1 個變異被逮捕，無逃脫【子集：1/32…】      ← 收尾這樣印，rc=0
+# 明明整列被判「不能寫進文件」，結論行卻說它被逮捕了。原因：UNSTABLE 不在這個
+# tuple 裡 → 既不算 bad 也不算 escaped → 直接落到下面的成功路徑。
+# 教訓：**新增一種判定時，要去找所有「分類」的地方，不是只加到產生它的地方。**
+bad = [r for r in results if r[4] in ("BAD", "INCONCLUSIVE", "UNSTABLE")]
 escaped = [r for r in results if r[4] == "ESCAPED"]
 known = [r for r in escaped if r[0] in EXPECTED_ESCAPES]
 new = [r for r in escaped if r[0] not in EXPECTED_ESCAPES]
@@ -628,6 +688,20 @@ if new:
 if new or bad:
     sys.exit(1)
 
+# ⚠️ 子集模式（JOBSPY_MUTATE_ONLY）下，這裡的 N 是**子集大小**，不是 32。
+# 不加標記的話，這一行讀起來跟完整一輪的結論一模一樣 —— 那正是本專案
+# 反覆被燒的形狀（把抽樣讀成性質）。所以子集一律在結論行上自我標示。
+#
+# ⚠️⚠️ 這裡一開始寫成 `_SELECTED is MUTATIONS` —— **永遠是 False**，因為上面的
+# 推導式每次都建一個新 list，身分檢查恆不成立。也就是說「防謊報的那一行」
+# 本身在完整一輪時會謊報【子集】。
+# 教訓與 M13 那段同源：**別用身分／存在與否去推導「我跑了幾項」，直接數。**
+# 用 len(_SELECTED) != len(MUTATIONS) 是從資料推導，不依賴任何旗標。
+_is_subset = len(_SELECTED) != len(MUTATIONS)
+_subset = (f"【子集：{len(_SELECTED)}/{len(MUTATIONS)} 個變異"
+           + (f"、每個連跑 {_REPEAT} 次" if _REPEAT > 1 else "") + "】") if _is_subset else ""
 print(f"\n✅ {len(results) - len(known)}/{len(results)} 個變異被逮捕"
-      + (f"，{len(known)} 個為已知逃脫" if known else "，無逃脫"))
+      + (f"，{len(known)} 個為已知逃脫" if known else "，無逃脫") + _subset)
+if _is_subset:
+    print("   ⚠️ 這不是完整的一輪，不要把這一行當成 32 個變異的結論。")
 sys.exit(0)
