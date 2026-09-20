@@ -86,9 +86,29 @@ INTERNAL_SCHEDULER = os.environ.get("JOB_BOARD_INTERNAL_SCHEDULER", "0") == "1"
 # timer 或手動啟動的外部爬蟲 —— 那時 SEARCH_PROCESS 是 None，光看行程內狀態
 # 會誤判成「沒在跑」。
 LOG_DIR       = os.path.join(SCRIPT_DIR, "logs")
-JOBSCAN_LOCK  = os.path.join(LOG_DIR, "jobscan.lock")
-JOBSCAN_STATE = os.path.join(LOG_DIR, "search_state.json")
-JOBSCAN_LIVE  = os.path.join(LOG_DIR, "search_current.log")
+
+# ⚠️ 2026-09-20 第八輪審查 MINOR-3：下面三個路徑【原本是寫死的】，但上面的註解
+# 說它們「沿用 run_scan.sh 的 JOBSCAN_LOCK/LIVE/STATE 慣例」，而 tests 也照那個
+# 說法傳這三個 env 當隔離 —— 實際上**被完全忽略**。
+# 也就是說「測試把狀態檔指向 /tmp 以求安全」是【假的保護】：
+#   env JOBSCAN_LOCK=/tmp/x  →  jb.JOBSCAN_LOCK 仍是 .../logs/jobscan.lock
+# 子行程讀的仍是生產的 search_state.json，一旦排程器判定逾期，就會去開
+# **生產的** logs/jobscan.lock。
+#
+# 這正是第六輪 MAJOR M2 的原句：「『我擋住了 X』和『我擋住了通往 X 的所有路』
+# 是兩個不同的宣稱」。今天沒事，純粹是因為測試的 _seed() 把 interval_hours 設成
+# 100000（所以永遠不逾期）—— 那是【常數】，不是護欄；那個常數一改，子行程就會在
+# 生產目錄拿鎖。
+#
+# 修法：改成與 SCHEDULE_FILE 同一個寫法（env 優先、否則預設），讓宣告與事實一致。
+# 生產不受影響：三個 unit 都沒有設這三個變數（已用 /proc/<pid>/environ 確認），
+# 所以預設值就是原本寫死的值。
+JOBSCAN_LOCK  = (os.environ.get("JOBSCAN_LOCK")
+                 or os.path.join(LOG_DIR, "jobscan.lock"))
+JOBSCAN_STATE = (os.environ.get("JOBSCAN_STATE")
+                 or os.path.join(LOG_DIR, "search_state.json"))
+JOBSCAN_LIVE  = (os.environ.get("JOBSCAN_LIVE")
+                 or os.path.join(LOG_DIR, "search_current.log"))
 
 app = Flask(__name__)
 
@@ -1397,6 +1417,51 @@ def _compute_next_run(cfg, now=None):
     return (base + timedelta(hours=cfg.get("interval_hours", 6))).isoformat()
 
 
+def _fired_map(cfg):
+    """回傳 `_fired_today` 的【已消毒複本】：保證是 `dict[str, list[str]]`。
+
+    ⚠️ 這個函式存在的原因是第八輪審查的 MINOR-2：**守衛放錯了樓層**。
+    `_record_run()` 裡原本有一個 `if not isinstance(fired_map, dict)`，註解寫著
+    「壞掉的 `_fired_today`（手改成 list、null 等）不該讓整個帳務炸掉」。但真正
+    先炸的是 `scheduler_loop()` 裡的**讀取**：
+
+        fired_map = cfg.get("_fired_today", {})
+        already_fired = fired_map.get(today_str, [])   # ← 這裡就 AttributeError
+
+    那一行在 `_record_run()` 被呼叫【之前】就執行了 —— 所以那個守衛
+    **永遠到不了**，宣稱的保護不存在。（`mode == "interval"` 時甚至連
+    `_record_run()` 的 `if fired_date and fired_time` 都不進，更是碰不到。）
+
+    失效形狀正是本專案最怕的那一種：外層的 `except Exception` 每 30 秒記一次
+    `[scheduler] Error: 'list' object has no attribute 'get'`，約 120 行/小時的
+    日誌膨脹，而排程器就此停擺 —— 面板卻照樣顯示漂亮的 `next_run`。
+    這與 2026-09-17 那次 50 小時卡死是同一種病：**壞掉的是機器，看起來壞掉的
+    是沒有的**。
+
+    可達性不是理論的：需要 `JOB_BOARD_INTERNAL_SCHEDULER=1`（＝`deploy/README.md`
+    記載的復原程序）＋ 排程檔的 `_fired_today` 被改成非物件 —— 而那份文件正好在
+    教使用者「只能手改 `.job_board_schedule.json` 才救得回來」。工具與文件互相
+    指向對方，這條路是真的有人會走。
+
+    修法：把「什麼算合法的 `_fired_today`」定義在【唯一一個地方】，而且放在
+    **真正會讀它的那一層**。寫入端（`_record_run`）也用同一份，避免兩邊對同一個
+    壞輸入有不同解讀 —— 那正是第七輪 MAJOR-1 的形狀。
+    """
+    raw = cfg.get("_fired_today")
+    if not isinstance(raw, dict):
+        return {}
+    # 逐項消毒：key 必須是字串（下面用 `d >= cutoff` 比大小，非字串會 TypeError）、
+    # value 必須是 list（`t not in ...` 對 dict/str 會給出意外的答案而非報錯）。
+    return {d: [t for t in v if isinstance(t, str)]
+            for d, v in raw.items()
+            if isinstance(d, str) and isinstance(v, list)}
+
+
+def _fired_list(cfg, date_str):
+    """某一天已觸發過的時段清單。壞掉的值一律當成空的（見 `_fired_map()`）。"""
+    return _fired_map(cfg).get(date_str, [])
+
+
 def _record_run(cfg, now2, fired_date, fired_time):
     """掃描跑完後的帳務：記錄剛剛燒掉哪個時段、算出下一次執行時間。就地改 cfg。
 
@@ -1419,15 +1484,17 @@ def _record_run(cfg, now2, fired_date, fired_time):
     cfg["last_run"] = now2.isoformat()
     cfg["last_run_date"] = now2.strftime("%Y-%m-%d")
     if fired_date and fired_time:
-        fired_map = cfg.get("_fired_today")
-        # 壞掉的 _fired_today（手改成 list、null 等）不該讓整個帳務炸掉 ——
-        # 它只是內建排程器的記憶，重建成空的代價是「這一輪可能多掃一次」。
-        if not isinstance(fired_map, dict):
-            fired_map = {}
-        fired_map.setdefault(fired_date, [])
-        if fired_time not in fired_map[fired_date]:
-            fired_map[fired_date].append(fired_time)
-        # 清掉 3 天以上的舊紀錄
+        # 第八輪 MINOR-2：消毒與讀取都走 `_fired_map()` / `_fired_list()`，
+        # 與 scheduler_loop() 用【同一份】判定。原本這裡自己寫了一份
+        # `if not isinstance(fired_map, dict)`，而那個守衛因為位置錯了而永遠
+        # 到不了（詳見 `_fired_map()` 的 docstring）。壞值的代價是「這一輪可能
+        # 多掃一次」，遠小於整個排程器停擺。
+        fired_map = _fired_map(cfg)
+        existing = _fired_list(cfg, fired_date)
+        if fired_time not in existing:
+            existing.append(fired_time)
+        fired_map[fired_date] = existing
+        # 清掉 3 天以上的舊紀錄（`_fired_map()` 已保證 key 是字串，可比大小）
         cutoff = (now2 - timedelta(days=3)).strftime("%Y-%m-%d")
         cfg["_fired_today"] = {d: v for d, v in fired_map.items() if d >= cutoff}
     # 用【同一份】實作算 next_run，而不是在這裡再複製一段。第七輪的 M20 之所以
@@ -1541,9 +1608,12 @@ def scheduler_loop():
                     #     排序只發生在【需要順序語意】的地方。
                     times = sorted(cfg.get("times") or ["06:00", "22:00"])
                     today_str = now.strftime("%Y-%m-%d")
-                    # Track which (date_time) combos have already fired
-                    fired_map = cfg.get("_fired_today", {})
-                    already_fired = fired_map.get(today_str, [])
+                    # Track which (date_time) combos have already fired.
+                    # 第八輪 MINOR-2：走 `_fired_list()` 而不是直接
+                    # `cfg.get("_fired_today", {})` —— 後者對「檔案裡是 list/null」
+                    # 會當場 AttributeError，而這裡的例外被外層吞掉後每 30 秒
+                    # 記一行，排程器就永遠不會恢復。`_fired_list()` 把壞值當空清單。
+                    already_fired = _fired_list(cfg, today_str)
                     for t in times:
                         if t in already_fired:
                             continue

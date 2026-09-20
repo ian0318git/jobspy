@@ -41,6 +41,9 @@ import job_board as jb  # noqa: E402
 # 全機鎖約 53 秒，若剛好撞上 timer 觸發，真實掃描就會白等 20 秒後 SKIP ——
 # 也就是說測試本身能製造這次遷移要消滅的那種失敗。改指向暫存目錄的私人鎖檔。
 import tempfile  # noqa: E402
+# 第八輪 MINOR-1：原本這行在 D 區才 import，於是 C 區（更早）用不到 mock。
+# 提到最前面 —— C 區現在也要攔 subprocess.run 了。
+import unittest.mock as mock  # noqa: E402
 
 jb.JOBSCAN_LOCK = os.path.join(tempfile.mkdtemp(prefix="jobscan-test-"), "jobscan.lock")
 print(f"（測試鎖檔：{jb.JOBSCAN_LOCK}）")
@@ -75,6 +78,18 @@ _REAL_KILL_EXTERNAL = jb.kill_stalled_external
 # 保護範圍與實際不符」。一個寫在註解裡的規則不會自己執行，所以要靠變異測試
 # （M4）與 tests/mutate.py 的「測試檔是否跑到底」判定來當第二道。兩者本輪都補了。
 # 教訓：規則要寫在【會被執行】的地方，註解只能解釋它，不能代替它。
+#
+# ⚠️⚠️ 2026-09-20 第八輪【審查】：上面那句「F4 是唯一沒攔的」本身也是假的。
+# 審查員自己列舉（沒有採信我的清單）之後確認：`_REAL_KILL_EXTERNAL()` 共有
+# 【9 個】呼叫點，其中【3 個】沒有 mock subprocess.run —— F4、C 區的兩處
+# （308/317）、以及 G2 的 TOCTOU。我當時寫的「七個裡唯一一個」總數錯、「唯一」也錯，
+# 而我還點名「TOCTOU 攔了」，它根本沒攔。
+# **同一個缺陷（宣告 > 實際）在「宣告它已經修好」的那一段話裡又犯了一次。**
+# 三個都補上 mock 與斷言了。教訓再往下一層：
+#   「我列舉過了」不是證據，**列舉的結果要能被別人重跑**。
+#   想知道現在還剩幾個沒攔，不要讀這段註解，跑：
+#       grep -n "_REAL_KILL_EXTERNAL()" tests/test_scan_lock.py
+#   然後逐一確認往上是否有 mock.patch.object(jb.subprocess, "run")。
 
 
 def _noop_kill_external(*_a, **_k):
@@ -305,17 +320,42 @@ check(
 )
 # 呼叫保存下來的【原】函式（jb.kill_stalled_external 已被換成 no-op 護欄）。
 check("護欄條件成立：鎖確實在我們手上", jb._we_hold_scan_lock() is True)
-check("kill_stalled_external() 不得對自己的掃描動手", _REAL_KILL_EXTERNAL() is None)
 
-# 負向對照：就算 active 被外力重新設回 True（模擬防禦性檢查的處境），
-# 只要鎖在我們手上，kill_stalled_external() 依然必須拒絕動手。
-with jb.SEARCH_LOCK:
-    jb._EXTERNAL["active"] = True
-    jb._EXTERNAL["last_read_at"] = time.monotonic() - 1000
-check(
-    "即使 active 被重設為 True，持鎖者仍受 _we_hold_scan_lock() 保護",
-    _REAL_KILL_EXTERNAL() is None,
-)
+# ⚠️ 2026-09-20 第八輪審查 MINOR-1：這裡【原本沒有攔 subprocess.run】。
+# 它今天之所以安全，只是因為 `_we_hold_scan_lock()` 在 `kill_stalled_external()`
+# 的第一行就 return —— 也就是靠【上游的閘門】，不是靠這裡的防護。這跟 F4 當初
+# 的形狀一模一樣（見下方 F4 的長註解）：閘門一旦失效，這裡就會直接走到
+# `systemctl --user kill --signal=SIGKILL jobscan.service`，而生產的掃描
+# 一天有兩次、各約 19 分鐘是【真的在跑】的。
+# 審查員列舉後確認：9 個 `_REAL_KILL_EXTERNAL()` 呼叫點裡有 3 個沒攔（這裡兩個
+# 加上 G2 的 TOCTOU），而文件當時卻宣稱「七個裡唯一一個是 F4」。數字與事實都不對。
+# 修法：把「不得呼叫 subprocess」從【推論】變成【斷言】。
+c_syscalls = []
+
+
+class _FakeRunC:
+    returncode = 0
+    stdout = ""
+
+
+def _fake_run_c(cmd, **kw):
+    c_syscalls.append(cmd)
+    return _FakeRunC()
+
+
+with mock.patch.object(jb.subprocess, "run", side_effect=_fake_run_c):
+    check("kill_stalled_external() 不得對自己的掃描動手", _REAL_KILL_EXTERNAL() is None)
+    # 負向對照：就算 active 被外力重新設回 True（模擬防禦性檢查的處境），
+    # 只要鎖在我們手上，kill_stalled_external() 依然必須拒絕動手。
+    with jb.SEARCH_LOCK:
+        jb._EXTERNAL["active"] = True
+        jb._EXTERNAL["last_read_at"] = time.monotonic() - 1000
+    check(
+        "即使 active 被重設為 True，持鎖者仍受 _we_hold_scan_lock() 保護",
+        _REAL_KILL_EXTERNAL() is None,
+    )
+check("（承上）持鎖時連 systemctl 都不該被呼叫（第八輪 MINOR-1）",
+      c_syscalls == [], f"實際呼叫={c_syscalls}")
 
 with jb.SEARCH_LOCK:
     jb._EXTERNAL["active"] = False
@@ -328,8 +368,6 @@ print("=== D. MAJOR-3：Popen 失敗時必須把鎖還回去 ===")
 jb.SEARCH_PROCESS = None
 jb._release_search_lock()
 check("測試前提：目前未持有鎖", jb.SEARCH_LOCK_FD is None)
-
-import unittest.mock as mock  # noqa: E402
 
 with mock.patch.object(
     jb.subprocess, "Popen",
@@ -765,17 +803,35 @@ def _hold_seq():
     return len(hold_calls) > 1     # 第一次 False（判定時未持鎖），之後 True（動手前已持鎖）
 
 
+# ⚠️ 2026-09-20 第八輪審查 MINOR-1：這裡也【原本沒有攔 subprocess.run】。
+# 它今天安全是因為 `trigger="manual"` 讓 `kill_stalled_external()` 跳過整個
+# systemd 分支、只走 PID 路徑（`_kill_tree` 用 `os.kill`）。但那個「安全」是
+# 建立在這一行 mock 自己提供的 trigger 值上 —— 變異只要讓 trigger 的處理改成
+# 一律走 systemd 分支，這裡就會直接對生產 unit 送出 SIGKILL。
+# 補上攔截之後，`_kill_tree` / `_pid_is_our_scan` 完全不受影響（它們不用
+# subprocess），所以這個 mock 只擋掉「不該發生的那一條路」。
+toctou_syscalls = []
+
+
+def _fake_run_toctou(cmd, **kw):
+    toctou_syscalls.append(cmd)
+    return _FakeRunC()
+
+
 with mock.patch.object(jb, "read_jobscan_state",
                        return_value={"phase": "running", "pid": victim2.pid,
                                      "run_id": "toctou", "trigger": "manual"}):
     with mock.patch.object(jb, "_external_idle_seconds",
                            return_value=jb.SEARCH_STALL_TIMEOUT + 100):
         with mock.patch.object(jb, "_we_hold_scan_lock", side_effect=_hold_seq):
-            toctou = _REAL_KILL_EXTERNAL()
+            with mock.patch.object(jb.subprocess, "run", side_effect=_fake_run_toctou):
+                toctou = _REAL_KILL_EXTERNAL()
 check("動手前若已取得掃描鎖，必須放棄（TOCTOU 重檢）",
       toctou is None and len(hold_calls) >= 2,
       f"回傳={toctou!r} 檢查次數={len(hold_calls)}")
 check("（承上）目標必須還活著", victim2.poll() is None)
+check("（承上）TOCTOU 這條路徑不得呼叫 systemctl（第八輪 MINOR-1）",
+      toctou_syscalls == [], f"實際呼叫={toctou_syscalls}")
 victim2.kill()
 wait_dead(victim2)
 
@@ -1332,6 +1388,45 @@ try:
 except Exception as e:  # noqa: BLE001 — 丟例外本身就是一項 FAIL
     _l_broken_ok, _l_broken_msg = False, f"丟出例外：{e!r}"
 check("_fired_today 是畸形值時必須重建而不是丟例外", _l_broken_ok, _l_broken_msg)
+
+# ⚠️ 第八輪審查 MINOR-2：上面那一項【只涵蓋寫入端】(`_record_run`)，
+# 而真正先炸的是**讀取端** —— `scheduler_loop()` 的
+#     fired_map = cfg.get("_fired_today", {}); fired_map.get(today_str, [])
+# 它在 `_record_run()` 被呼叫【之前】就執行，所以寫入端那個守衛**永遠到不了**。
+# 審查員用真的 scheduler thread 重現了症狀：每 30 秒一行
+#     [scheduler] Error: 'list' object has no attribute 'get'
+# 排程器就此停擺，而面板照樣顯示漂亮的 next_run。
+# 所以讀取端必須【自己有】測試 —— 這也是 M30 這個變異存在的理由。
+_l_read_shapes = [
+    (["06:00"], "list（審查員的案例）"),
+    (None, "null"),
+    ("06:00", "字串"),
+    ({"2026-09-20": "06:00"}, "value 不是 list"),
+    ({1: ["06:00"]}, "key 不是字串"),
+    ({"2026-09-20": ["06:00", 5]}, "list 內含非字串"),
+]
+_l_read_bad = []
+for _bad, _desc in _l_read_shapes:
+    try:
+        _got = jb._fired_list({"_fired_today": _bad}, "2026-09-20")
+        # 唯一允許的「有內容」情形：清單裡的字串項目要留下來，非字串要濾掉
+        if _bad == {"2026-09-20": ["06:00", 5]}:
+            if _got != ["06:00"]:
+                _l_read_bad.append(f"{_desc}→{_got!r}（應為 ['06:00']）")
+        elif _got != []:
+            _l_read_bad.append(f"{_desc}→{_got!r}（應為 []）")
+    except Exception as e:  # noqa: BLE001 — 丟例外本身就是 FAIL
+        _l_read_bad.append(f"{_desc}→例外 {type(e).__name__}")
+check("讀取端（_fired_list）對每一種畸形 _fired_today 都不得丟例外（第八輪 MINOR-2）",
+      _l_read_bad == [], f"出錯={_l_read_bad}")
+
+# 正向控制：正常值必須【原樣】讀出來。少了這一項，一個「永遠回 []」的
+# _fired_list 也會讓上面全部通過 —— 而那會讓排程器每 30 秒重掃一次。
+check("（承上）正常值必須原樣讀出，不得被消毒邏輯吃掉",
+      jb._fired_list({"_fired_today": {"2026-09-20": ["06:00", "22:00"]}},
+                     "2026-09-20") == ["06:00", "22:00"]
+      and jb._fired_list({"_fired_today": {}}, "2026-09-20") == [],
+      "正常值與缺鍵都要正確")
 
 # ── 第七輪 m1／m2：兩個「驗證器自己丟例外」的路徑 ────────────────────────────
 # m1：`except (TypeError, ValueError)` 接不住 OverflowError（issubclass(OverflowError,

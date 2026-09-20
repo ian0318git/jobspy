@@ -255,13 +255,15 @@ MUTATIONS = [
     ("M20", "把已觸發時段記在【跑完那天】而非【觸發那天】（跨午夜記錯日期）",
      lambda t: sub_once(
          t,
-         "        fired_map.setdefault(fired_date, [])\n"
-         "        if fired_time not in fired_map[fired_date]:\n"
-         "            fired_map[fired_date].append(fired_time)\n",
+         "        existing = _fired_list(cfg, fired_date)\n"
+         "        if fired_time not in existing:\n"
+         "            existing.append(fired_time)\n"
+         "        fired_map[fired_date] = existing\n",
          "        _d = now2.strftime(\"%Y-%m-%d\")\n"
-         "        fired_map.setdefault(_d, [])\n"
-         "        if fired_time not in fired_map[_d]:\n"
-         "            fired_map[_d].append(fired_time)\n",
+         "        existing = _fired_list(cfg, _d)\n"
+         "        if fired_time not in existing:\n"
+         "            existing.append(fired_time)\n"
+         "        fired_map[_d] = existing\n",
          "M20")),
     # 第三道鎖：這道是三道鎖裡唯一擋得住 curl／devtools 的，到第六輪為止沒有測試。
     ("M21", "第三道鎖失效（停用中仍可用 API 重新武裝內建排程器）", lambda t: sub_once(
@@ -292,6 +294,48 @@ MUTATIONS = [
      lambda t: sub_once(
          t, "    if not specs:\n        return None\n",
          "    if not specs:\n        return \"06:00 / 22:00\"\n", "M27")),
+
+    # ── 第八輪審查的修正（MINOR-1／MINOR-2／NIT-2）─────────────────────────
+    #
+    # NIT-2：`_timer_next_text()` 有測試（第 83+ 項）卻【沒有對應的變異】。
+    # 這個專案自己的規則寫在 deploy/README.md：「若你新增修正卻找不到會失敗的
+    # 變異，代表那個修正沒有被測試覆蓋」。審查員指出我漏了這一個 ——
+    # 「有測試」與「測試是 load-bearing 的」是兩件事，而只有變異能區分它們。
+    ("M28", "banner 的『下次觸發』退回無條件「（無）」（否認一件會發生的事）",
+     lambda t: sub_once(
+         t,
+         "    if t.get(\"next_iso\"):\n"
+         "        return t[\"next_iso\"]\n"
+         "    return \"（掃描執行中，systemd 尚未計算下一次）\" if t.get(\"installed\") else \"（無）\"\n",
+         "    return t.get(\"next_iso\") or \"（無）\"\n", "M28")),
+
+    # MINOR-1：C 區那兩個呼叫點「今天安全」靠的是 `kill_stalled_external()` 第一行
+    # 的 `if _we_hold_scan_lock(): return None` —— 也就是【上游的閘門】，不是那裡
+    # 自己的防護。這個變異拿掉閘門，驗證新加的 `mock.patch.object(subprocess, "run")`
+    # 與 `c_syscalls == []` 斷言真的會響（而不是只在我腦中成立）。
+    # ⚠️ 這個變異【一定要有 mock 才會被逮】：沒有的話它會真的對生產 unit 送出
+    # SIGKILL —— 那正是 F4 當初的近失事故。它現在能被安全地測，就是 MINOR-1 的價值。
+    ("M29", "拿掉 kill_stalled_external 的持鎖前置檢查（可能殺掉自己的掃描）",
+     lambda t: sub_once(
+         t,
+         "    if _we_hold_scan_lock():\n        return None\n    idle = _external_idle_seconds()\n",
+         "    idle = _external_idle_seconds()\n", "M29")),
+
+    # MINOR-2：把消毒整個拿掉，退回「讀取端直接對值呼叫 .get()」的狀態。
+    # 這正是審查員證實的那個不可達守衛 —— 症狀是每 30 秒一行的
+    # `[scheduler] Error: 'list' object has no attribute 'get'`。
+    # 注意這個變異是【不可達守衛】的忠實版本：不是「明著丟例外」，而是
+    # 「假設值一定是 dict」—— 後者才是真實程式碼出錯的樣子。
+    ("M30", "_fired_today 不消毒（讀取端直接 .get()，畸形值就 AttributeError）",
+     lambda t: sub_once(
+         t,
+         "    raw = cfg.get(\"_fired_today\")\n"
+         "    if not isinstance(raw, dict):\n"
+         "        return {}\n",
+         "    raw = cfg.get(\"_fired_today\")\n"
+         "    if raw is None:\n"
+         "        return {}\n",
+         "M30")),
 ]
 
 results = []
@@ -333,12 +377,37 @@ try:
         # 只看 `failed > 0` 的判定會把這記成「逃脫」——也就是說【最嚴重的變異
         # 看起來最無害】，而且判定還會隨生產 unit 當下的狀態翻來翻去。
         # 症狀是「PASS 數遠低於基準」：這裡用收尾標記判定，不看數字。
+        #
+        # ⚠️⚠️ 第八輪【審查】補記這個判定的兩個已知界線（審查員都造出來了）：
+        #
+        #   (1) 【反向】誤判：如果在測試檔尾端插入 `check(...False)` 之後才
+        #       traceback，收尾標記還沒印 → 會被判 INCONCLUSIVE，儘管它其實
+        #       有 FAIL、是「被逮」。實測：`passed=83 failed=1` → INCONCLUSIVE。
+        #       這個方向是【保守】的（退出碼非 0、逼人來看），所以留著不修。
+        #
+        #   (2) 【正向】盲區：收尾標記由【主執行緒】印出，所以**非主執行緒**
+        #       （daemon thread）的崩潰不會阻止它 —— 主執行緒照樣跑到底、照樣
+        #       印標記、rc=0、`[FAIL]` 數 0 → 記成「逃脫」。
+        #       實測：`threading.Thread(target=lambda: 1/0, daemon=True).start()`
+        #       之後主執行緒照常印字、rc=0。
+        #       這個專案的產品碼**大量使用 daemon thread**（scheduler_loop、
+        #       watchdog_loop、_jobscan_watch_loop），所以這不是純理論。
+        #
+        # 也就是說：這個判定保證的是「**主執行緒**跑到底」，不是「整個行程
+        # 健康」。會這樣寫是因為它要解的 M4 正是主執行緒崩潰；非主執行緒的
+        # 崩潰需要另一種守衛（例如在收尾時檢查執行緒是否還活著），本輪沒做。
+        # **不要把「0 個 INCONCLUSIVE」讀成「判定完美」。**
         done = "✅ 全數通過" in out or "項失敗：" in out
         if not done:
+            # 多印出實際的 P/F 與最後幾行，讓「崩在哪」一眼可見 ——
+            # 否則唯一的線索是一個看起來很正常的 `32P/0F`。
+            tail_lines = [l for l in out.strip().splitlines()[-4:]]
             results.append((mid, full, f"{passed}P/{failed}F rc={r.returncode}",
                             "測試檔未跑完（崩潰？）—— 這不是逃脫", "INCONCLUSIVE"))
             print(f"{full:44s} ⚠️  測試檔【未跑完】({passed}P/{failed}F "
                   f"rc={r.returncode}) —— INCONCLUSIVE，不是逃脫，請查因")
+            for _l in tail_lines:
+                print(f"{'':44s}     │ {_l}")
             continue
 
         if failed > 0:
