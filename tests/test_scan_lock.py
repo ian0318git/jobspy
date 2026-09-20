@@ -1500,6 +1500,17 @@ check("（承上）正常值必須原樣讀出，不得被消毒邏輯吃掉",
 # 唯一豁免：**只做真假測試、不取值**的那一處（`if X.get("_fired_today"): pop(...)`）。
 # 判準是它的 AST 父節點必須是 `If` —— 一旦被指派給變數（就是那個缺陷版）
 # 或再被 `.get()`／下標，父節點就不是 `If`，立刻違規。
+#
+# ⚠️ 已知界線（第九輪自查，交付審查時主動列出）：**這個檢查只認兩種形狀** ——
+# `X.get("_fired_today", …)` 與 `X["_fired_today"]`。它【認不出】
+# `cfg.pop("_fired_today")`、`del cfg["_fired_today"]`、`"…" in cfg` 之類。
+# 目前這三種在 `job_board.py` 裡都存在（1519–1520／1809／1840），而且**都是刪除，
+# 不是讀取** —— 值被丟掉，所以不構成「繞過消毒」。`SCHEDULE_CONFIG` 本身是 dict，
+# `.pop()` 不會因為值壞掉而炸。
+# 真正會出事的形狀是 `x = cfg.pop("_fired_today", {})` 之後對 `x` 取值 ——
+# 那時 x 未經消毒。**現在沒有這種寫法**，但這個檢查不會在有人寫出來的時候響。
+# 寫在這裡而不是默默放著：本專案的主旋律缺陷就是「宣告的保護 > 實際的保護」，
+# 而這一段的用途正是讓「這個檢查到底守到哪裡」有可被重跑的答案。
 _fm_fn = next((n for n in ast.walk(_jb_ast)
                if isinstance(n, ast.FunctionDef) and n.name == "_fired_map"), None)
 _fm_span2 = (_fm_fn.lineno, _fm_fn.end_lineno) if _fm_fn else (0, 0)
