@@ -35,6 +35,7 @@ INCONCLUSIVE／套用失敗。
 另外：**假變異**（改到註解、不可能改變行為）永遠不會 FAIL，看起來像「逃脫」。
 看到逃脫先懷疑變異本身。
 """
+import ast
 import hashlib
 import os
 import re
@@ -140,9 +141,31 @@ if sha256(TARGET) != PROD_BEFORE:
     sys.exit("✗ 隔離副本的 job_board.py 與工作區不一致（HEAD 與工作區不同？）")
 
 ORIG = TARGET.read_text(encoding="utf-8")
+
+# `JOBSPY_MUTATE_TEST` 是**測試鉤子**，不是設定選項（同 `JOBSPY_MUTATE_PY`）。
+# 它存在的唯一理由是讓【基準線的兩道校準】本身可以被故意觸發 —— 一個觸發不了的
+# 守衛等於沒有守衛，而「沒驗過的守衛」正是這個專案被燒最多次的形狀。
+# 驗法（第九輪 MINOR-3 的反例，兩個都必須【立刻】中止）：
+#   A. 把某個 check() 移到條件底下 → 應該以「印出 N 項，但原始碼裡有 N+1 個」中止
+#   B. 讓某個 check() 失敗     → 應該以「1 項失敗」中止
+#   sed 's|^check("（承上）目標必須還活著"|if False: check("（承上）目標必須還活著"|' \
+#     tests/test_scan_lock.py > /tmp/probe_test.py
+#   JOBSPY_MUTATE_TEST=/tmp/probe_test.py .venv/bin/python tests/mutate.py
+_TEST_OVERRIDE = os.environ.get("JOBSPY_MUTATE_TEST")
+if _TEST_OVERRIDE:
+    _ov = Path(_TEST_OVERRIDE)
+    if not _ov.is_file():
+        shutil.rmtree(WORK, ignore_errors=True)
+        sys.exit(f"✗ JOBSPY_MUTATE_TEST 指向的檔案不存在：{_ov}")
+    TEST.write_text(_ov.read_text(encoding="utf-8"), encoding="utf-8")
+
 print(f"隔離副本：{WORK}")
 print(f"生產目錄【不會被寫入】：{PROD_TARGET.name} sha256={PROD_BEFORE[:16]}…")
-print(f"起始狀態：乾淨，{len(ORIG)} bytes\n")
+print(f"起始狀態：乾淨，{len(ORIG)} bytes")
+if _TEST_OVERRIDE:
+    print(f"⚠️  測試檔已被 JOBSPY_MUTATE_TEST 覆蓋：{_TEST_OVERRIDE}"
+          "（只影響隔離副本；這不是正常的一輪）")
+print()
 
 
 def _cleanup_and_die(signum, _frame):
@@ -405,17 +428,50 @@ def _run_suite(test_path):
 
 
 print(f"解譯器：{PY}")
+
+# ── 量尺的第二道校準：印出來的項數必須等於【原始碼裡的 check() 呼叫點數】 ──────
+# 第九輪【審查退回】MINOR-3。上面那個「全綠」判定只證明「沒有 FAIL」，
+# 不證明「每一項都跑了」。反例（審查員實測）：把 L 區那項 AST 不變式整段註解掉，
+# 基準線照樣印 `✅ 全數通過`、rc=0、0 FAIL —— 前置檢查完全放行，
+# 而 M32 會被判成 `❌ 逃脫（無回歸保護）`。**那不是逃脫，是量尺短了一格。**
+# 載具分不出這兩者，於是把「檢查被跳過」記成「修正沒有回歸保護」，歸因錯誤，
+# 文件數字跟著腐化。
+#
+# 判準用 AST 而不是 `grep -c 'check('` —— 同一個理由在本專案出現過很多次：
+# **grep 會把註解與字串裡的 `check(` 算成呼叫**（本檔的說明文字就在引用它）。
+#
+# 這一項抓到的是「呼叫點還在、但沒被執行到」（被移到條件底下、被 return 跳過）。
+# 抓不到的是「有人把某個 check() 整個刪掉」—— 兩邊一起變少，守衛看不出來；
+# 那一種由變異表負責（少一個守衛，就會多一個逃脫）。
+_AST_CHECKS = sum(
+    1 for _n in ast.walk(ast.parse(TEST.read_text(encoding="utf-8")))
+    if isinstance(_n, ast.Call) and isinstance(_n.func, ast.Name)
+    and _n.func.id == "check")
+
 _bout, _bp, _bf, _brc = _run_suite(TEST)
-if "✅ 全數通過" not in _bout or _bf != 0 or _brc != 0:
-    print(f"\n✗ 基準線就不是全綠（{_bp}P/{_bf}F rc={_brc}）—— 先修好再跑變異。")
+_bad = []
+if "✅ 全數通過" not in _bout:
+    _bad.append("沒有印出收尾標記（沒跑到底）")
+if _bf != 0:
+    _bad.append(f"{_bf} 項失敗")
+if _brc != 0:
+    _bad.append(f"rc={_brc}")
+if _bp != _AST_CHECKS:
+    _bad.append(f"印出 {_bp} 項，但原始碼裡有 {_AST_CHECKS} 個 check() 呼叫點"
+                " —— 有檢查沒被執行到，這把量尺短了一格")
+if _bad:
+    print(f"\n✗ 基準線不可信（{_bp}P/{_bf}F rc={_brc}）：{'；'.join(_bad)}")
     print("  否則下面每一個變異都只是這個既有故障的回音，而表格會長得很正常。")
     print("  尾巴：")
     for _l in _bout.strip().splitlines()[-15:]:
         print(f"    │ {_l}")
     shutil.rmtree(WORK, ignore_errors=True)
     sys.exit(2)
+# BASE_PASS 不是裝飾品：下面的判定全部拿它當「滿分」的基準（第九輪 MINOR-3
+# 之前它被賦值後從未讀取，那正是「宣告了但沒有做到」的最小樣本）。
 BASE_PASS = _bp
-print(f"基準線：{_bp} 項全過、0 失敗（rc=0）\n")
+print(f"基準線：{_bp} 項全過、0 失敗（rc=0）；"
+      f"與原始碼的 {_AST_CHECKS} 個 check() 呼叫點相符\n")
 
 results = []
 try:
@@ -477,6 +533,18 @@ try:
         # 崩潰需要另一種守衛（例如在收尾時檢查執行緒是否還活著），本輪沒做。
         # **不要把「0 個 INCONCLUSIVE」讀成「判定完美」。**
         done = "✅ 全數通過" in out or "項失敗：" in out
+        # 第九輪 MINOR-3 的第二半：**「跑到底」不等於「每一項都跑到了」。**
+        # 一個印得出收尾標記、0 個 FAIL 的執行，如果總項數比基準線少，
+        # 那就是量尺短了一格 —— 而下面的判定會把它記成 `❌ 逃脫（無回歸保護）`，
+        # 歸因錯誤（真正的原因是「檢查沒被執行」，不是「修正沒有守衛」）。
+        # 這裡把它拉出來當 INCONCLUSIVE，逼人去看。
+        if done and passed + failed != BASE_PASS:
+            results.append((mid, full, f"{passed}P/{failed}F rc={r.returncode}",
+                            f"總項數 {passed + failed} ≠ 基準線 {BASE_PASS}"
+                            "（檢查被跳過？）", "INCONCLUSIVE"))
+            print(f"{full:44s} ⚠️  總項數 {passed + failed} ≠ 基準線 {BASE_PASS}"
+                  f" —— INCONCLUSIVE，不是逃脫，請查因")
+            continue
         if not done:
             # 多印出實際的 P/F 與最後幾行，讓「崩在哪」一眼可見 ——
             # 否則唯一的線索是一個看起來很正常的 `32P/0F`。

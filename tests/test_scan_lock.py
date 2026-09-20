@@ -843,7 +843,22 @@ with mock.patch.object(jb, "read_jobscan_state",
 check("動手前若已取得掃描鎖，必須放棄（TOCTOU 重檢）",
       toctou is None and len(hold_calls) >= 2,
       f"回傳={toctou!r} 檢查次數={len(hold_calls)}")
-check("（承上）目標必須還活著", victim2.poll() is None)
+# ⚠️⚠️ 2026-09-20 第九輪【審查退回】MINOR-1：這裡原本是
+#     check("（承上）目標必須還活著", victim2.poll() is None)
+# ——**同一支檔案在 563 行明文禁止的正是這個形狀**（「SIGKILL 送出到子行程真的
+# 死掉之間有窗口，poll() 若在窗口內呼叫會回 None，於是『該被殺』的變異體假通過」），
+# 而 F 區在第六輪就改掉了，這一處漏掉。
+#
+# 它是怎麼被發現的：審查員把整張變異表重跑一次，得到 M9 = 88P/2F、M29 = 89P/1F，
+# 與我記錄的**剛好相反**。M9 與 M29 在 G2 這個情境下行為等價（都只剩一次
+# _we_hold_scan_lock() 呼叫且回 False → 都真的動手殺），所以它們的失敗集合
+# 逐次執行必然相同 —— 兩列讀數不同，本身就證明是抽樣假象而不是變異的差異。
+# 審查員另外直接量了窗口：os.kill(SIGKILL) 後立刻 poll() → 還活著 150/150；
+# 中間夾一次與 check() 等價的 print+flush → 只剩 100/150 與 130/150。
+#
+# 判準與 566 / 628 兩處一致：**有界等待，等它真的死，再斷言它沒死。**
+# 正常路徑要多花 0.5 秒（victim2 真的活著，等滿才回 False），這是刻意的代價。
+check("（承上）目標必須還活著", not wait_dead(victim2, 0.5))
 check("（承上）TOCTOU 這條路徑不得呼叫 systemctl（第八輪 MINOR-1）",
       toctou_syscalls == [], f"實際呼叫={toctou_syscalls}")
 victim2.kill()
