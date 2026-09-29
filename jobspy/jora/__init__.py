@@ -76,8 +76,16 @@ class JoraScraper(Scraper):
     # fallback 成「今天」而**通過** 7 天過濾 —— 日期過濾會被靜默停用。
     _AGE_RE = re.compile(r"(\d+)\s*(mo|[hdw])\s*ago")
 
-    # Jora 的位置字串是空白分隔（"Southbank VIC"），沒有逗號，
-    # 所以 Seek 的 .split(",")[0] 慣用法在此會丟掉州別。
+    # Jora 的位置字串是空白分隔（"Southbank VIC"），沒有逗號。
+    #
+    # 注意：Seek 有自己的一份解析（jobspy/seek/__init__.py 的 _LOCATION_RE），
+    # 兩者意圖相同但已各自演化 —— Seek 多容忍尾隨的 4 位郵遞區號。
+    # 目前漂移無害，但【兩邊的 fallback 其實不一樣】：Seek 會把尾端的
+    # ", Australia" 剝掉（'Victoria, Australia' → city='Victoria'），Jora 留整串。
+    # 下游 linkedin_job_search.is_melbourne_location() 對兩種形式的結論相同
+    # （實測 11/11 一致，包含 Jora 那種會印成「Victoria, Australia, Australia」的
+    # 雙重國名），所以漂移還不致命 —— 但別把「結論相同」寫成「輸出相同」。
+    # 要消掉重複請抽到 jobspy/util.py 讓兩邊共用，不要只改其中一邊。
     _STATE_RE = re.compile(
         r"^(?P<city>.+?)\s+(?P<state>VIC|NSW|QLD|WA|SA|TAS|ACT|NT)$",
         re.IGNORECASE,

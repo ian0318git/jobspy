@@ -2,6 +2,171 @@
 
 重要決策紀錄 — 依專案工作流程要求更新。
 
+## 2026-09-29 — 地點誤收：Seek 丟失州別 × 過濾器子字串比對（第十輪）
+
+**回報**：使用者發現 GWA Group Limited 的「IoT Developer」列在看板上，但它在
+**Prestons, Sydney NSW**，不在墨爾本。
+
+### 根因兩層，各自都會單獨致錯
+
+| 層 | 位置 | 行為 |
+|---|---|---|
+| 1 | `linkedin_job_search.py` 的墨爾本白名單 | 用**子字串**比對，白名單裡的 `preston`（Preston, VIC）命中了雪梨的 `Prestons` |
+| 2 | `jobspy/seek/__init__.py` 的地點解析 | `location_raw.split(",")[0]` 只取逗號前那段，**州別與都會區一起丟掉** |
+
+第 2 層的實際輸入（2026-09-29 對 `au.seek.com` 實抓的 11 份搜尋、各 1 頁，共
+352 張卡片、144 個相異字串。原始 HTML 存於 `/tmp/seek*.html`）：
+
+```
+'Prestons, Sydney NSW'     → 舊: "Prestons"             新: city="Prestons, Sydney", state="NSW"
+'Cremorne, Melbourne VIC'  → 舊: "Cremorne"（被誤殺）    新: city="Cremorne, Melbourne", state="VIC"
+'Melbourne VIC'            → 舊: "Melbourne"            新: city="Melbourne", state="VIC"
+'Toowoomba, Toowoomba & Darling Downs QLD'（同上，州別殿後）
+```
+
+**舊寫法雙向都錯**，這點在修之前沒有被記錄過：`Prestons` 是誤收（州別被丟掉，下游
+只能靠地名猜），而 `Cremorne`、`Surrey Hills` 這些**不在白名單的墨爾本郊區則是被
+誤殺** —— 丟掉 "Melbourne" 之後就沒有任何白名單詞可命中。所以這次修正同時改善了
+精確率與召回率，不是單純收緊。
+
+### 決策
+
+1. **過濾改成兩道關卡**（`is_melbourne_location()`，從 `main()` 抽成純函式才測得到）：
+   州別明確非 VIC → 直接排除；否則比對白名單（**套 `\b` 詞邊界**）。
+   加詞邊界是 `prestons`/`preston` 那一項的直接修法。
+2. **`Location.city` 對 Seek 而言是「郊區, 都會區」**（`"Cremorne, Melbourne"`），不是
+   單一城市。`jobspy/model.py` 沒有都會區欄位，所以這是被迫的取捨。保留都會區是
+   必要的：那是下游唯一認得的地名。（`state` 目前唯一的下游消費者是
+   `display_location()`，`job_board.py` 只用於顯示。）
+3. **解析失敗時不猜州別**：原字串整段留在 `city`、`state=None`，並記一筆 warning。
+   猜州別會讓外州職缺通過過濾，比缺州別更糟。副作用一併修掉：尾端 `, Australia`
+   會被移除（否則顯示成「Victoria, Australia, Australia」），但**只移除逗號後的**
+   —— 寫成 `[,\s]*Australia$` 會把 `"South Australia"` 削成 `"South"`，正好吃掉
+   州別關卡要看的字。
+
+### 已知邊界（刻意的，不是意外）
+
+- **沒有任何州別 token 的字串會放行**（`Epping, Australia` → True）。這其實是**兩種
+  不同機制**，2026-09-29 審查把標籤分開了（原本混稱「同名 suburb」，是錯的）：
+
+  | 機制 | 例子 | 為什麼 `\b` 擋不掉 |
+  |---|---|---|
+  | (a) 同名 suburb | `Epping`、`Richmond`、`Burwood` | 該地名在 VIC 與他州都有，無州別時無法分辨 |
+  | (b) 白名單詞嵌在更長地名裡 | `Brunswick Heads`、`Victoria Park` | `\bbrunswick\b` 在 `"brunswick heads"` 裡**是命中的** |
+
+  兩者都**只在字串裡沒有任何州別 token 時**才放行 —— 一旦帶州別，州別關卡先攔下。
+  live 資料上就是這樣正確擋掉 `Victoria Point, Brisbane QLD` 與
+  `Mount Hawthorn, Perth WA` 的。注意攔下它們的是**州別關卡**，不是 (b) ——
+  (b) 是「沒有州別時它們會【被放行】」的那個機制，兩者方向相反，別混用。
+
+  改成一律排除會誤殺合法的墨爾本同名 suburb；Jora 端的信條「誤丟一筆職缺無法
+  挽回」在此適用。實測範圍（216 個 CSV 檔、7816 列）：105 個相異 location 中
+  20 筆無州別，其中 **18 筆**命中墨爾本白名單，**合計 667 次**；全部 699 次無州別
+  出現 **100% 來自 seek**。最多的幾筆：`Port Melbourne, Australia` x118、
+  `Richmond, Australia` x98、`East Melbourne, Australia` x73。
+  seek 端的州別已由本次修正補回，且 live 樣本（144 個相異字串）中已無無州別字串。
+  **但 144 個字串仍不足以當證明** —— 若哪天 seek 又吐出無州別字串，這條放行路徑
+  就會重新打開。測試把它釘成決策而非意外，正是為了那時候看得見。
+
+  > ⚠️ 這組數字第一版寫錯了，記在這裡：我寫成「4 筆、216 次」。216 其實是
+  > **CSV 檔數**，不是出現次數；而 4 筆是我只列了其中 4 個，卻寫成整個類別 ——
+  > 低估了 3 倍（667 才是真的）。與下面「本輪的自身失誤」同一條病根：數字要用量的。
+- **沒有國別關卡**：州別閘門只認澳洲州名，所以**外國的墨爾本同名地點會放行** ——
+  實測 `Melbourne, Florida, United States`、`Victoria, British Columbia, Canada`、
+  `Preston, Lancashire, United Kingdom`、`Richmond, BC, Canada` **全部回 True**。
+
+  這是**已知且刻意不修的取捨**，不是漏掉的洞：四個來源都以澳洲為範圍（jobspy 的
+  `location` 是 `"Melbourne, Victoria, Australia"`），可達性低；而「列一張非澳洲國名
+  清單」是個開放集合，列一半會給人「已經擋住了」的假信心，比誠實揭露更糟。
+  要修請往「拒絕已知非澳洲國名」的方向加 gate，**不要**改成「必須含 Australia」
+  —— 那會殺掉以國碼 `AU`（而非國名）結尾的字串：實測歷史資料裡有 **24 個相異
+  location、878 次**是這種（`Melbourne, VIC, AU` x420、`Cremorne, VIC, AU` x57…），
+  它們全都不含 "australia" 字樣。測試把這 4 筆釘成決策。
+
+  > ⚠️ 這裡原本舉 `Werribee` 當反例，是錯的：資料裡的實際字串是
+  > `'Werribee, Australia'`，**含 "Australia"，在那道 gate 下根本不會被殺**；
+  > 而且 105 個歷史 location 裡**沒有一個**是完全不含逗號的裸地名。
+  > 結論（別用 require-Australia）是對的，但理由當時是憑感覺挑的 —— 已換成量到的。
+- **多州字串一律排除**（`Melbourne VIC & Sydney NSW` → False）。舊的子字串法會收下它。
+  這是方向性收緊；144 個相異 live 字串與 105 個相異歷史 location 中都沒有這種字串
+  （未觀察到可達性）。
+
+### 驗證
+
+- 新測試 `tests/test_location_filter.py`（57 項）＋既有 `tests/test_scan_lock.py`（90 項）
+  全過。Seek 的測試字串**大多**是對 `au.seek.com` 實抓的原樣輸出 —— 用自己編的格式
+  測等於在測自己的假設。但**不是全部**：比對 11 份抓取檔後確認，`'Melbourne VIC 3000'`、
+  `'Victoria, Australia'`、`'South Australia'` 這 3 筆是**人工合成**的（用來探測解析
+  失敗路徑）。其中郵遞區號那筆當初是憑「Seek 部分卡片會帶」這個印象寫的，而抓取檔裡
+  **一張都沒有** —— 留著仍值得（解析器該容忍），但它是合成的，不該宣稱是實測。
+- **live 抓取（LD 自測）**：11 份搜尋（各 1 頁）共 **352 張卡片、144 個相異字串**，
+  原始 HTML 在 `/tmp/seek*.html`；審查員用同一批檔案獨立重算，得到相同數字。
+  在此集合上：解析失敗 0、誤收 0、誤殺 0、無州別字串 0 筆。
+  （另有一次 `iot-developer-jobs` 的重抓只成功 2 頁就被 429 擋下；該次沒有存檔，
+  數字無法供他人複核，故不引用 —— 第一版引用了它，那是錯的。）
+- **歷史回歸（LD 自測，216 檔／7816 列）— 精確率面**：新舊過濾的差異只有 **2 筆**
+  相異字串被剔除，兩筆都對 —— `Kewdale, Australia`（Perth 郊區，舊法是 `kew` 子字串
+  命中）與 `Prestons, Australia`（雪梨，舊法是 `preston` 子字串命中），合計 32 次。
+  `Prestons` 正是本次回報的誤收路徑。
+- **召回面必須從 live 原始字串算，不能從歷史 CSV 算**（2026-09-29 審查 MINOR-3）。
+  歷史 CSV 是**舊過濾器自己的輸出**，結構上不可能含有舊過濾器丟掉的字串，所以在那裡
+  數「被救回幾筆」恆等於 0 —— 那是空轉，不是證據。（第一版就是這樣寫的，已刪。）
+  在 144 個相異 live 字串上：真 VIC 有 **41** 個，**舊管線在這 41 個裡只留 11 個、
+  新管線留 41 個
+  —— 舊寫法靜默殺掉了 30 個合法墨爾本職缺**（Abbotsford、Ascot Vale、Broadmeadows、
+  Bundoora、Cheltenham、Clayton…）。同一組資料上，新管線剔除的 4 筆全是外州
+  （`Victoria Point, Brisbane QLD`、`Mount Hawthorn, Perth WA`、`Burwood, Sydney NSW`、
+  `Prestons, Sydney NSW`），**剔除全部正確**。
+  即：這次同時提升了精確率與召回率，不是單純收緊。
+- 白名單集合與舊 pattern 逐項比對：舊 35 項、新 35 項、identical set。
+- **8 個等效變異：8/8 被逮、0 存活（LD 自己跑，非引用他人結果）**。在 `/tmp` 的隔離
+  副本上逐一施加；每次先確認基準線 57 項全過，且**確認變異真的改動了文字**才計分
+  —— 否則「變異根本沒套上」會冒充成「被逮到」。括號內是觸發的 FAIL 數：
+
+  | 變異 | FAIL |
+  |---|---|
+  | 白名單去 `\b` | 3 |
+  | 停用州別關卡 | 4 |
+  | `NON_VIC` 去 `\b` | 8 |
+  | 白名單移除 `preston` | 2 |
+  | 過濾函式永遠回 True | 13 |
+  | Seek 不允許郵遞區號 | 1 |
+  | Seek 呼叫點退回 `split(",")[0]` | 2 |
+  | Seek fallback 捏造州別 | 2 |
+
+  變異 harness 本身還在 `/tmp`（臨時、未進版控），所以上表是**當次可重現、隔天不可
+  重現**。要真正可重現得把它做成 `tests/` 裡的檔案 —— 這是已知缺口。
+  **這 8 個尚未接進 `tests/mutate.py`** —— 該工具是單檔設計（`PROD_TARGET` / `TEST_REL`
+  寫死、變異函式接收單一檔案文字、基準線校準會數測試檔的 `check(` 數量），且隔離副本
+  來自 `git archive HEAD`，要接得先 commit。缺口記在 `deploy/README.md` 的
+  「測試覆蓋（誠實聲明）」一節。
+- **生效路徑**：`job_board.py` 不 import 這兩個模組（掃描是 `run_scan.sh` 的子行程），
+  所以**不需要重啟服務**，下一輪掃描自動生效。
+  ⚠️ **但看板上已經在顯示的那筆不會自己消失**：最新的
+  `search_results/kanban_jobs_20260929_2200.json`（22:00，修正前產出）裡仍然有
+  GWA「IoT Developer」／`"Prestons, Australia"`。在下一輪掃描（06:00）之前看到的
+  是舊檔，**別把「還在」誤判成「修沒有效」**。要立刻更新就手動觸發一次掃描。
+
+### 本輪的自身失誤（記下來）
+
+- LD 向使用者回報「34 項全過」，實際量到的 `[PASS]` 是 **39**（當時）。**沒有量就報
+  數字** —— 正是這個專案反覆在抓的「宣告 > 實際」，而且發生在正在修這個問題的同一輪。
+  新測試加入後現在是 **57** 項；要引用請跑 `grep -c '\[PASS\]'`，不要憑印象。
+- LD 第一版把移除國名的正則寫成 `[,\s]+Australia$`，會把 `"South Australia"` 削成
+  `"South"` —— 那正是州別關卡要看的字，等於自己關掉一道防線。已補一項測試釘住。
+- **只改了一個檔案就以為改完了**：`352` 這個數字在 `DECISIONS.md` 更正了，測試檔裡的
+  同一句卻原封不動 —— 兩個檔案互相矛盾，而矛盾就在同一段論證裡。是 2026-09-29 審查員
+  抓到的。**更正一個數字時要 grep 整個 repo，不是 grep 你正好開著的那個檔。**
+- **探到了卻沒記下來**：LD 自己的 `/tmp/battery.py` 把 `'Melbourne, Florida, United
+  States'` 列在 `SHOULD_REJECT`，實跑顯示 `**FALSE POSITIVE**` —— 我看到了，然後沒寫進
+  任何地方，直到審查員把它挖出來。**一次失敗的探測如果沒被記錄，等於沒探過。**
+- **驗證工具自己會說謊**：變異 harness 的輸出印著「基準線 OK（53 項全過）」，但那個
+  53 是**寫死在腳本裡的字串**，不是量出來的 —— 實際已經是 57 項。如果我相信自己工具
+  的輸出，就會第三次傳播同一個錯數字。已改成從測試輸出讀實數。
+  **工具印出來的數字和工具量到的數字是兩回事**，前者更危險，因為它帶著權威感。
+  （同一輪也發生在變異表上：新增測試後 M4 的 FAIL 數從 1 變成 2，表格如果沒重跑就是
+  過期的。**變異表要跟著測試改動重跑，不是抄上一次的。**）
+
 ## 2026-09-20 — 第九輪（收尾）：修正第八輪審查退回的 3 MINOR + 3 NIT
 
 使用者選了「做一輪小規模收尾，只處理這 6 項，然後補一次審查」。三項 MINOR 有共同形狀

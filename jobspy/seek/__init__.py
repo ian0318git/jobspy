@@ -112,6 +112,42 @@ class SeekScraper(Scraper):
             log.error(f"Seek: Error fetching jobs - {e}")
             return None
 
+    # Seek 的地點字串實測（2026-09-29，au.seek.com 搜尋結果卡片）有兩種形式：
+    # 有都會區「Prestons, Sydney NSW」「Cremorne, Melbourne VIC」，
+    # 無都會區「Melbourne VIC」「Brisbane QLD」。州別一律殿後，
+    # 允許尾隨郵遞區號。
+    _LOCATION_RE = re.compile(
+        r"^(?P<city>.+?)\s+(?P<state>VIC|NSW|QLD|WA|SA|TAS|ACT|NT)"
+        r"(?:\s+\d{4})?$",
+        re.IGNORECASE,
+    )
+
+    @staticmethod
+    def _parse_location(location_raw: str) -> tuple[str, str | None]:
+        """把 Seek 的地點字串拆成 (city, state)。
+
+        舊寫法 `location_raw.split(",")[0]` 只取逗號前那段，會同時丟掉
+        州別與都會區：`"Prestons, Sydney NSW"` 變成 `"Prestons"`，
+        下游的 Melbourne 過濾器便無從得知它在 NSW。它同時也誤殺合法
+        職缺 —— `"Cremorne, Melbourne VIC"` 丟掉 "Melbourne" 後只剩
+        "Cremorne"，而 Cremorne 不在墨爾本白名單內。
+
+        無法辨識時【不猜測】州別：原字串整段保留為 city、state 回 None，
+        並記一筆 warning。捏造州別會讓外州職缺通過過濾，比缺州別更糟。
+        """
+        raw = location_raw.strip()
+        match = SeekScraper._LOCATION_RE.match(raw)
+        if match:
+            return match.group("city").strip(), match.group("state").upper()
+        log.warning(f"Seek: 無法從地點字串解析州別，原樣保留：{raw!r}")
+        # 尾端的 "Australia" 由 Location.country 負責（見 display_location()），
+        # 留在 city 會印成「Victoria, Australia, Australia」。
+        #
+        # ⚠️ 只移除【逗號後】的國名。若寫成 [,\s]* 會把 "South Australia"
+        # 削成 "South" —— 而那串正是州別關卡要看的東西，等於自己關掉一道防線。
+        city = re.sub(r",\s*Australia$", "", raw, flags=re.IGNORECASE).strip()
+        return ("" if city.lower() == "australia" else city), None
+
     def _extract_job_info(self, article: BeautifulSoup) -> JobPost | None:
         """Extract job info from a search-results <article> element."""
         title_el = article.find(attrs={"data-automation": "jobTitle"})
@@ -150,9 +186,10 @@ class SeekScraper(Scraper):
 
         location_obj = None
         if location_raw:
+            city, state = self._parse_location(location_raw)
             location_obj = Location(
-                city=location_raw.split(",")[0].strip(),
-                state=None,
+                city=city,
+                state=state,
                 country=Country.AUSTRALIA,
             )
 

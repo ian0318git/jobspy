@@ -810,6 +810,58 @@ def scrape_jobs_with_timeout(timeout=SCRAPE_TIMEOUT, **kwargs):
     return result.get("jobs")
 
 
+# ── 地點判定 ─────────────────────────────────────────────────────────────────
+# 墨爾本都會區的地名白名單。每一項在比對時都必須套 \b 詞邊界：
+# 白名單裡的 "preston"（Preston, VIC）若用子字串比對，會命中雪梨的
+# "Prestons"（Prestons, Sydney NSW），讓 NSW 職缺滲進墨爾本看板。
+MELB_AREAS = (
+    "melbourne", "victoria", "vic", "doncaster", "templestowe",
+    "box hill", "blackburn", "nunawading", "ringwood",
+    "glen waverley", "mount waverley", "burwood", "camberwell",
+    "hawthorn", "kew", "balwyn", "preston", "geelong", "ballarat",
+    "bendigo", "dandenong", "frankston", "mornington", "werribee",
+    "sunbury", "craigieburn", "epping", "south yarra", "richmond",
+    "brunswick", "northcote", "footscray", "st kilda",
+    "port melbourne", "south melbourne",
+)
+
+MELB_AREA_PATTERN = "|".join(rf"\b{area}\b" for area in MELB_AREAS)
+
+# 明確「不是維多利亞州」的州別。Seek 給的是縮寫（"Prestons, Sydney NSW"），
+# LinkedIn 給的是全名（"Sydney, New South Wales, Australia"），兩種都要認。
+#
+# 這道關卡非有不可：Richmond、Epping、Burwood 在 VIC 與 NSW 都有，光靠
+# 地名白名單無法區分同名 suburb。詞邊界同樣不可省略 —— "Watsonia" 含 "wa"
+# 子字串但不是獨立的 "wa"，"Acton" 含 "act" 子字串但不是獨立的 "act"。
+#
+# ⚠️ 這裡原本舉的例子是 "newcastle west"，那是錯的：那串【連 "wa" 子字串都沒有】，
+# 有沒有 \b 都回 False，證明不了任何事。同一個空轉例子在測試檔裡已被刪掉並標為
+# 空轉測試，這裡當時漏改 —— 兩個檔案一度互相矛盾。舉反例也要量。
+NON_VIC_STATE_PATTERN = (
+    r"\b(nsw|new south wales|qld|queensland|wa|western australia|"
+    r"sa|south australia|tas|tasmania|act|australian capital territory|"
+    r"nt|northern territory)\b"
+)
+
+
+def is_melbourne_location(location):
+    """判斷地點字串是否屬於墨爾本都會區（維多利亞州）。
+
+    兩道關卡，順序有意義：
+
+    1. 州別明確且不是 VIC → 直接排除。處理同名 suburb：Richmond、
+       Epping、Burwood 在 VIC 與 NSW 都有，只靠地名白名單會誤收。
+    2. 地名白名單（套詞邊界）。處理沒有州別的來源。
+
+    沒有州別又不在白名單者一律排除 —— 寧可漏收也不誤收。誤收會讓看板
+    出現外州職缺（如 2026-09-29 回報的 GWA「IoT Developer」）。
+    """
+    loc = str(location).lower()
+    if re.search(NON_VIC_STATE_PATTERN, loc):
+        return False
+    return bool(re.search(MELB_AREA_PATTERN, loc))
+
+
 def main():
     all_jobs = []
 
@@ -860,21 +912,8 @@ def main():
 
     # ── Melbourne Location Filter ────────────────────────────────────────────
     if "location" in combined.columns:
-        combined["_loc"] = combined["location"].astype(str).str.lower()
-        melb_pattern = (
-            "melbourne|victoria|vic|doncaster|templestowe|box hill|"
-            "blackburn|nunawading|ringwood|glen waverley|mount waverley|"
-            "burwood|camberwell|hawthorn|kew|balwyn|preston|"
-            "geelong|ballarat|bendigo|dandenong|frankston|"
-            "mornington|werribee|sunbury|craigieburn|epping|"
-            "south yarra|richmond|brunswick|northcote|footscray|"
-            "st kilda|port melbourne|south melbourne"
-        )
-        combined = combined[
-            combined["_loc"].str.contains(melb_pattern, na=False)
-        ]
+        combined = combined[combined["location"].map(is_melbourne_location)]
         print(f"📍 After Melbourne-area filter: {len(combined)} jobs")
-        combined = combined.drop(columns=["_loc"])
 
     # ── Enhanced Analysis (all 3 engines) ────────────────────────────────────
     print(f"\n🧠 Running Semantic Depth + Career Track + Clearance analysis...")

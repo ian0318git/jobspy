@@ -41,8 +41,19 @@ systemctl --user restart jobboard.service
 systemctl --user list-timers --all | grep -E 'jobscan|logrotate'
 systemctl --user is-enabled jobscan.timer jobboard-logrotate.timer   # 都要 enabled
 systemctl --user is-active  jobboard.service                          # active
-curl -s http://127.0.0.1:5000/api/search/status | python3 -m json.tool
+HOST=$(systemctl --user show jobboard.service -p Environment --value \
+       | tr ' ' '\n' | sed -n 's/^JOB_BOARD_HOST=//p')
+curl -s "http://$HOST:5000/api/search/status" | python3 -m json.tool
 ```
+
+> ⚠️ **curl 的主機必須跟 `JOB_BOARD_HOST` 一致，不能寫死 `127.0.0.1`。**
+> 這裡原本寫死 `127.0.0.1`，但本機的 drop-in
+> （`~/.config/systemd/user/jobboard.service.d/local.conf`）把它設成
+> `192.168.44.128`，所以在這台機器上跑舊指令會拿到 **HTTP 000**（連線被拒）而不是
+> 200 —— 看起來像服務掛了，其實只是 curl 敲錯門。（2026-09-29 實測：000 vs 200。）
+>
+> 上面用**動態取值**而不是把 `192.168.44.128` 寫進文件：那個 IP 是 DHCP 核發的
+> （見 drop-in 內的警告），寫死會在 IP 變動後變成第二個說謊的指令。
 
 `/api/search/status` 的 `timer.installed` 必須是 `true`。
 若為 `false`，看板會在標題列顯示「⚠️ timer 未安裝」—— 這是刻意的靜默失敗偵測器。
@@ -248,8 +259,26 @@ tail -f logs/cron_search.log
 
 ## 測試覆蓋（誠實聲明）
 
-**這個專案的自動化測試只有一支**：`tests/test_scan_lock.py`（90 項檢查）。
-其餘全部是手動驗證 —— 上面各節的「驗證」指令就是手動程序。
+**這個專案的自動化測試有兩支**：`tests/test_scan_lock.py`（90 項）與
+`tests/test_location_filter.py`（57 項）。其餘全部是手動驗證 —— 上面各節的
+「驗證」指令就是手動程序。
+
+> ⚠️ **`test_location_filter.py` 尚未接進 `tests/mutate.py`（誠實揭露）。**
+> 那個工具是單檔設計：`PROD_TARGET` / `TEST_REL` 寫死為 `job_board.py` 與
+> `tests/test_scan_lock.py`，變異函式接收單一檔案的文字，基準線校準也會去數
+> 測試檔裡的 `check(` 數量。要涵蓋 `linkedin_job_search.py` 與 `jobspy/seek/`
+> 得先擴充工具本身；而隔離副本來自 `git archive HEAD`，所以那些修正必須先
+> commit 才驗證得動。
+>
+> **這不代表那個修正沒有變異保護。** 2026-09-29 在 `/tmp` 的隔離副本上手跑過
+> 8 個等效變異，**8/8 被逮、0 存活**（逐項清單與觸發的 FAIL 數見
+> `../DECISIONS.md` 同日條目）。
+> 缺口在「工具沒接線」，不在「找不到會失敗的變異」—— 但沒接線就意味著
+> **下次改動時不會有人自動替你重跑那 8 個**。
+>
+> ⚠️ 而且那個 harness 本身也**只在 `/tmp`，沒進版控** —— 上表的讀數是當次
+> 可重現、隔天不可重現。要讓它變成真的可重跑，得把它做成 `tests/` 裡的檔案。
+> **在那之前，請把「8/8 被逮」當成一次性證據，不是可以再跑一次的保證。**
 
 ```bash
 cd /home/ian/github-project/jobspy

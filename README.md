@@ -203,10 +203,21 @@ All config lives at the top of `linkedin_job_search.py`:
 **Too many irrelevant results?**
 - Add noise patterns to `IT_NOISE_PATTERNS` in `linkedin_job_search.py`.
 - Lower `HOURS_OLD` to narrow the window.
-- Increase `MIN_SCORE` (line 721) to raise the relevance threshold.
+- Increase `MIN_SCORE` (in `main()` of `linkedin_job_search.py`) to raise the
+  relevance threshold. It is deliberately named by function, not line number —
+  this file has now had two stale line pointers (`line 721`, and `line 636-644`
+  before it), and a line number that drifts is worse than no line number.
 
 **Wrong location results?**
-- Edit the Melbourne suburb list in `linkedin_job_search.py` line 636-644.
+- Edit `MELB_AREAS` in `linkedin_job_search.py` — the Melbourne suburb list.
+  Note a location naming another state (`NSW`, `QLD`, `WA`, `SA`, `TAS`, `ACT`,
+  `NT`, or their full names) is rejected *before* that list is consulted. So a
+  suburb that also exists interstate (Richmond, Epping, Burwood) must carry its
+  state to be accepted — **unless it carries no state at all**, in which case the
+  ambiguity is accepted rather than guessed at. That is a deliberate trade-off
+  (rejecting the whole class would drop legitimate Melbourne suburbs too), not an
+  oversight: see the 2026-09-29 entry in `DECISIONS.md`, and
+  `is_melbourne_location()` in the same file.
 - Set `LOCATION` to your city.
 
 ---
