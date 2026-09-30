@@ -1,10 +1,49 @@
 #!/usr/bin/env python3
-"""變異測試：把每一項修正【改回去】，確認 tests/test_scan_lock.py 會 FAIL。
+"""變異測試：把每一項修正【改回去】，確認對應的測試檔會 FAIL。
 
     .venv/bin/python tests/mutate.py
 
-退出碼 0 = 全部變異都被逮捕（已知逃脫不算）；1 = 有變異逃脫，或有需要人看的
-INCONCLUSIVE／套用失敗。
+一個 **suite** = 一個生產檔 + 一個測試檔 + 一組變異。目前有三個：
+
+  | suite | 生產檔 | 測試檔 | 變異數 |
+  |---|---|---|---|
+  | `scan` | `job_board.py` | `tests/test_scan_lock.py` | 32 |
+  | `location-filter` | `linkedin_job_search.py` | `tests/test_location_filter.py` | 5 |
+  | `location-seek` | `jobspy/seek/__init__.py` | `tests/test_location_filter.py` | 3 |
+
+為什麼刻意限制成「一個 suite 恰好【一個】生產檔」：變異清單才能維持
+`(id, 標籤, 函式)` 三元組，不必在每一列重複寫檔名 —— 也就沒有「漏寫檔名」這種錯。
+跨檔案的修正就拆成多個 suite（上面後兩個跑同一個測試檔，但各打各的檔案，
+所以「是哪一個檔的守衛鬆了」分開看得出來）。
+
+## ⚠️ 多 suite 帶進來的新故障形狀：前一個 suite 的殘留（第十輪，實測到的）
+
+舊版只有一個 target、一個 test，每個變異都從記憶體裡的 `ORIG` 重新產生，
+所以「上一個變異還留在磁碟上」這種事**結構上不可能發生**。加了第二個 suite 之後
+它立刻發生了，而且是被守衛當場擋下來的：
+
+  當時 `location-filter` 只選了 `L1` 一個變異來跑，跑完之後它**還留在樹上**；
+  接著 `location-seek` 跑基準線，於是量到的是**別人的變異**——
+  基準線 3 項失敗，指紋正是 L1 的子字串誤收（`prestons`、`eppings`）。
+  （污染的量取決於殘留的是哪一個變異：審查員跑 `L1`–`L6` 時留下的是 `L5`，
+  基準線失敗 **13 項**。所以「基準線是紅的」還不足以讓人看出原因。）
+
+危險的地方不是它失敗了，是它**差一點不會失敗**：基準線只要剛好 0 失敗，
+`base_pass` 就會被污染成一個錯的「滿分」，接下來這個 suite 的每一列判定都拿錯的
+基準在比 —— 而且表格看起來完全正常。這正是本檔案開頭那兩個歷史教訓的形狀
+（「有修正、沒有回歸保護」與「最嚴重的變異看起來最無害」）的第三個版本。
+
+現在的規則很單純，而且是一條不變式：
+**跑任何一次測試之前，樹上必須等於 HEAD，除了正在被測的那【一個】變異。**
+由 `_restore_originals()` 在每個變異與每條基準線之前強制執行，收工時再逐檔比對
+sha256（不是 grep —— 見上面「為什麼在 /tmp 的隔離副本裡跑」那節的 2026-09-19 教訓）。
+⚠️ 這裡刻意【不寫行號】：這一段自己就會讓後面的行號位移，而寫死行號的註解
+在三次編輯之後就會指向別的東西 —— 本專案已經吃過「文件數字與現實脫鉤」的虧。
+
+退出碼 0 = 全部變異都被逮捕（已知逃脫不算）；1 = 有變異逃脫、有需要人看的
+INCONCLUSIVE／套用失敗，**或某個豁免已過期**（列在 escapes 裡卻被逮到了 ——
+第十輪審查 NIT-2 之前這一項只印警告、不影響退出碼）。2 = harness 自己的問題
+（基準線不可信、殘留、生產檔被寫入）。
 
 **為什麼一定要做這件事**：這個專案已經吃過兩次虧 ——
   * 第三輪：把 `kill_stalled_external()` 改成開頭 `return None`（整個功能死掉），
@@ -34,6 +73,34 @@ INCONCLUSIVE／套用失敗。
 差一點帶著「停滯偵測完全失效」的版本繼續往下做。
 另外：**假變異**（改到註解、不可能改變行為）永遠不會 FAIL，看起來像「逃脫」。
 看到逃脫先懷疑變異本身。
+
+## ⚠️ 第十輪：地點那 8 個變異為什麼一定要從 /tmp 搬進來
+
+2026-09-29 的地點誤收修正附了一組 8 個變異，但 harness 只活在 `/tmp`，
+`DECISIONS.md` 因此自己標註那張表是「**當次可重現、隔天不可重現**」。搬進來之後
+重跑，確認 8 列**全部逐格重現**（3/4/8/2/13/1/2/2）。
+
+⚠️ **這一段的結論被我寫錯過一次，錯誤本身比原本的結論更值得留下來（第十輪審查
+MINOR-2）。** 我第一版寫的是「第 8 列（`NON_VIC` 去 `\\b` = 8）重現不出來，
+產出原表的那一版 harness 沒有留下來」。**那是假的。** 審查員在磁碟上找到第三份
+`/tmp/run_mutations.py`（2026-09-29 23:28），它把 `NON_VIC_STATE_PATTERN` 區塊內
+**所有** `\\b` 拿掉（= 兩側），基準線是量出來的，跑出來**逐格重現原表，含那個 8**。
+
+真正發生的事不是「證據消失了」，是**我只掃到兩份就下結論說沒留下來**：
+
+  * `/tmp/mutate.py` —— 錨點 `return raw, None` 已被後續修正改掉，少一列 `M7`；
+    而且它的測試檔副本是 09-29 23:06 的舊版，**基準線現在是紅的**，所以它量到的
+    「3」是既有故障的回音，不是乾淨的對照。
+  * `/tmp/mutate_review.py` —— 寫死 `npass != 53`，而測試現在是 57 項，在基準線
+    就中止，**什麼都沒量到**（它根本沒有「給出 3」）。
+  * `/tmp/run_mutations.py` —— 就是產出原表的那一份，**它一直在那裡**。
+
+**教訓（兩層，第二層才是我真正犯的錯）**：
+  1. 「`/tmp` 有東西」不等於「那份就是對的」—— 同名檔案多份、各自量到不同答案，
+     而判斷哪一份可信本身就沒有依據。
+  2. **我宣告「證據沒留下來」的時候，並沒有把磁碟掃乾淨。** 一份被錯誤宣告為
+     「不存在」的證據，會讓下一個人停止尋找 —— 這比「找不到」更糟，因為它帶著
+     結論的權威感。要宣告某個東西不存在，得先證明你找過了，而不是找了一下。
 """
 import ast
 import atexit
@@ -45,16 +112,20 @@ import signal
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-PROD_TARGET = REPO / "job_board.py"
-TEST_REL = "tests/test_scan_lock.py"
+# ⚠️ 第十輪：`PROD_TARGET` / `TEST_REL` 兩個單一全域【已移除】—— 被測的檔案與
+# 測試檔現在是 suite 的屬性（見下方的 `SUITES`），寫在這裡只會變成第二個真相
+# 來源。移除時它們已經沒有任何引用點，所以不會有「改了一半」的殘留。
 
 # 每個變異的逾時。正常一輪約 6 秒；被逮捕的變異通常更快，但留足餘裕。
 TIMEOUT = 400
 
 # 已知會逃脫、且【已經理解為什麼】的變異（用變異 id，不是標籤字串）。
+# 第十輪：這份清單現在【只屬於 scan suite】—— suites 各自帶自己的 escapes，
+#          這個名字留著是因為它的內容與歷史理由都是 scan 的。
 #
 # 空集合才是理想狀態 —— 但把「已理解的逃脫」跟「沒被發現的覆蓋缺口」混在一起
 # 回報，等於讓這個工具失去訊號。所以：列在這裡的逃脫不影響退出碼，但一定會
@@ -107,97 +178,6 @@ def git(*args, check=True):
 
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-# ── 前置檢查：工作區必須乾淨 ────────────────────────────────────────────────
-# 判定的正確性同時取決於被測的程式【與測試本身】，所以兩個都要檢查。
-# 第五輪 MINOR-4a：原本只檢查 job_board.py，測試檔未提交時產出的表格
-# 別人重現不出來 —— 而這個專案的數字已經腐化過三次。
-_need_clean = ["job_board.py", TEST_REL]
-_dirty = [l for l in git("status", "--porcelain", *_need_clean).splitlines() if l.strip()]
-if _dirty:
-    sys.exit("✗ 下列檔案有未提交的改動，先 commit 再跑變異測試：\n   "
-             + "\n   ".join(_dirty)
-             + "\n  （否則驗證的不是 HEAD 的版本，表格別人重現不出來。）")
-
-PROD_BEFORE = sha256(PROD_TARGET)
-
-# ── 建立隔離副本：生產目錄從此不再被寫入 ────────────────────────────────────
-WORK = Path(tempfile.mkdtemp(prefix="jobspy-mutate-"))
-# ⚠️ 第九輪【自查】：清掃不能只靠下面那個 `finally` —— 它管不到 `try:` **之前**
-# 的提早結束。**基準線前置檢查的 `sys.exit(2)` 正好在那之前**，而它是最常被
-# 觸發的那條路（兩個探針都走它）。實測留下的孤兒：
-#     drwx------ /tmp/jobspy-mutate-tuvnhdx_   12:11（那次以「基準線不可信」中止）
-# 一份隔離副本 = 一份完整的 repo 複本，堆積起來還會讓人分不清哪一份是活的
-# （這一輪我自己就被兩個目錄困惑過）。
-#
-# 用 atexit 一次關掉【整類】漏，而不是在每一條 sys.exit() 前面各補一行 ——
-# 後者會隨新增的提早結束路徑而腐化，而「新增路徑時忘了補」正是這條漏的成因。
-# SIGTERM / SIGINT 另有 `_cleanup_and_die()` 明確處理（atexit 不跑在訊號上）；
-# 重複 rmtree 無害（ignore_errors=True）。
-atexit.register(lambda: shutil.rmtree(WORK, ignore_errors=True))
-try:
-    _archive = subprocess.run(["git", "archive", "HEAD"], cwd=REPO,
-                              capture_output=True, check=True).stdout
-    subprocess.run(["tar", "-x", "-C", str(WORK)], input=_archive, check=True)
-except Exception as e:  # noqa: BLE001
-    shutil.rmtree(WORK, ignore_errors=True)
-    sys.exit(f"✗ 無法建立隔離副本（git archive HEAD | tar -x）：{e}")
-
-TARGET = WORK / "job_board.py"
-TEST = WORK / TEST_REL
-if not TARGET.is_file() or not TEST.is_file():
-    shutil.rmtree(WORK, ignore_errors=True)
-    sys.exit("✗ 隔離副本不完整 —— git archive 沒有解出 job_board.py 或測試檔。")
-if sha256(TARGET) != PROD_BEFORE:
-    shutil.rmtree(WORK, ignore_errors=True)
-    sys.exit("✗ 隔離副本的 job_board.py 與工作區不一致（HEAD 與工作區不同？）")
-
-ORIG = TARGET.read_text(encoding="utf-8")
-
-# `JOBSPY_MUTATE_TEST` 是**測試鉤子**，不是設定選項（同 `JOBSPY_MUTATE_PY`）。
-# 它存在的唯一理由是讓【基準線的兩道校準】本身可以被故意觸發 —— 一個觸發不了的
-# 守衛等於沒有守衛，而「沒驗過的守衛」正是這個專案被燒最多次的形狀。
-# 驗法（三個都必須【立刻】中止，且診斷訊息要指向**正確的單一原因**）：
-#   A. 把某個 check() 移到條件底下 → 應該以「印出 N 項，但原始碼裡有 N+1 個」中止
-#   B. 讓某個 check() 失敗        → 應該以「1 項失敗」中止（**只有這一個理由**；
-#                                    rc≠0 與它同源，第九輪退回審查 NIT-1 修掉的
-#                                    就是這個重複）
-#   C. 跑完全過但 sys.exit(3)     → 應該以「rc=3」中止（零失敗時 rc 才是獨立訊息）
-#   sed 's|^check("（承上）目標必須還活著"|if False: check("（承上）目標必須還活著"|' \
-#     tests/test_scan_lock.py > /tmp/probe_test.py
-#   JOBSPY_MUTATE_TEST=/tmp/probe_test.py .venv/bin/python tests/mutate.py
-# A 也可以在檔案結尾（sys.exit(0) 之後）接一個 check()，那會同時證明它抓的是
-# 「有呼叫點卻執行不到」而不只是「基準線被改壞」。
-_TEST_OVERRIDE = os.environ.get("JOBSPY_MUTATE_TEST")
-if _TEST_OVERRIDE:
-    _ov = Path(_TEST_OVERRIDE)
-    if not _ov.is_file():
-        shutil.rmtree(WORK, ignore_errors=True)
-        sys.exit(f"✗ JOBSPY_MUTATE_TEST 指向的檔案不存在：{_ov}")
-    TEST.write_text(_ov.read_text(encoding="utf-8"), encoding="utf-8")
-
-print(f"隔離副本：{WORK}")
-print(f"生產目錄【不會被寫入】：{PROD_TARGET.name} sha256={PROD_BEFORE[:16]}…")
-print(f"起始狀態：乾淨，{len(ORIG)} bytes")
-if _TEST_OVERRIDE:
-    print(f"⚠️  測試檔已被 JOBSPY_MUTATE_TEST 覆蓋：{_TEST_OVERRIDE}"
-          "（只影響隔離副本；這不是正常的一輪）")
-print()
-
-
-def _cleanup_and_die(signum, _frame):
-    shutil.rmtree(WORK, ignore_errors=True)
-    if sha256(PROD_TARGET) != PROD_BEFORE:
-        print(f"\n✗ 收到訊號 {signum}，且生產的 job_board.py 已被改動 —— 請立刻檢查！")
-        sys.exit(2)
-    print(f"\n⚠️ 收到訊號 {signum}，已移除隔離副本（生產目錄未被寫入）")
-    sys.exit(130)
-
-
-signal.signal(signal.SIGTERM, _cleanup_and_die)
-signal.signal(signal.SIGINT, _cleanup_and_die)
-
 
 def sub_once(text, old, new, label):
     n = text.count(old)
@@ -430,6 +410,278 @@ MUTATIONS = [
          "M32")),
 ]
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 地點過濾那一組（2026-09-29 第十輪，對應 `62c5823`）
+# ══════════════════════════════════════════════════════════════════════════════
+# 分成兩個 suite 是因為它們打在不同的生產檔上，而「是哪一個檔的守衛鬆了」必須
+# 分開看得出來。兩個 suite 跑同一個測試檔 —— 這是刻意的：`test_location_filter.py`
+# 同時涵蓋「解析」（Seek 側）與「判定」（過濾器側），而突變只打其中一邊。
+#
+# 括號內的 FAIL 數是 2026-09-30 用【這個檔案】實測的（見 docstring：舊表第 8 列
+# 與重跑結果不同，原因已查明並記在 L3 的註解裡）。
+LOCATION_FILTER_MUTATIONS = [
+    ("L1", "白名單去 \\b（子字串比對復辟，3）", lambda t: sub_once(
+        t,
+        'MELB_AREA_PATTERN = "|".join(rf"\\b{area}\\b" for area in MELB_AREAS)',
+        'MELB_AREA_PATTERN = "|".join(MELB_AREAS)', "L1")),
+    ("L2", "停用州別關卡（4）", lambda t: sub_once(
+        t,
+        "    if re.search(NON_VIC_STATE_PATTERN, loc):\n        return False\n",
+        "    if False:\n        return False\n", "L2")),
+    # ⚠️ 這一列的定義是【兩側的 \b 都拿掉】，不是只拿前緣。差別很大：
+    #   兩側都拿 → 8 個 FAIL；只拿前緣 → 3 個 FAIL。舊表的 8 來自兩側版本。
+    #   留著這段註解是因為「去 \b」在字面上完全歧義，而兩種寫法的偵測力差 5 項。
+    #
+    # ⚠️ 機制【原本寫反了】（第十輪審查 MINOR-4，已實測更正）。正確的是：
+    #   · 只拿【前緣】→ pattern 變成 `(nt|wa|sa|…)\b`，會在**詞尾**命中 ——
+    #     `nt\b` 打中 "mount"、"point"（Mount Waverley、Point Cook）。這 3 項就是
+    #     `保留 'Mount Waverley…'`、`保留 'Point Cook…'`、`非 VIC 州別 'point cook'`。
+    #   · 兩側都拿 → 連**詞首**也命中 —— `wa` 打中 "watsonia"、`act` 打中 "acton"、
+    #     `sa` 打中 "salisbury"。多出來的 5 項是這些。
+    #   也就是說「要兩側都鬆掉才會被誤判」的是**詞首**的案例，不是詞尾的。
+    ("L3", "NON_VIC 去 \\b（兩側都去，8）", lambda t: sub_once(
+        t,
+        '    r"\\b(nsw|new south wales|qld|queensland|wa|western australia|"\n'
+        '    r"sa|south australia|tas|tasmania|act|australian capital territory|"\n'
+        '    r"nt|northern territory)\\b"\n',
+        '    r"(nsw|new south wales|qld|queensland|wa|western australia|"\n'
+        '    r"sa|south australia|tas|tasmania|act|australian capital territory|"\n'
+        '    r"nt|northern territory)"\n', "L3")),
+    ("L4", "白名單移除 preston（2）", lambda t: sub_once(
+        t,
+        '"hawthorn", "kew", "balwyn", "preston", "geelong", "ballarat",',
+        '"hawthorn", "kew", "balwyn", "geelong", "ballarat",', "L4")),
+    ("L5", "過濾函式永遠回 True（13）", lambda t: sub_once(
+        t,
+        "    loc = str(location).lower()\n"
+        "    if re.search(NON_VIC_STATE_PATTERN, loc):\n"
+        "        return False\n"
+        "    return bool(re.search(MELB_AREA_PATTERN, loc))",
+        "    return True", "L5")),
+]
+
+LOCATION_SEEK_MUTATIONS = [
+    ("L6", "Seek 不允許郵遞區號（1）", lambda t: sub_once(
+        t, '        r"(?:\\s+\\d{4})?$",', '        r"$",', "L6")),
+    # 這一列是【還原成修正前的原樣】—— 不是隨手寫一個壞版本，而是把
+    # `git show 62c5823^:jobspy/seek/__init__.py` 的那三行貼回來。
+    # 變異愈接近「真實可能犯的錯」，它證明的東西愈有用。
+    ("L7", "Seek 呼叫點退回 split(\",\")[0]（2）", lambda t: sub_once(
+        t,
+        "            city, state = self._parse_location(location_raw)\n"
+        "            location_obj = Location(\n"
+        "                city=city,\n"
+        "                state=state,\n",
+        "            location_obj = Location(\n"
+        '                city=location_raw.split(",")[0].strip(),\n'
+        "                state=None,\n", "L7")),
+    ("L8", "Seek fallback 捏造州別（2）", lambda t: sub_once(
+        t,
+        '    return ("" if city.lower() == "australia" else city), None',
+        '    return ("" if city.lower() == "australia" else city), "VIC"', "L8")),
+]
+
+
+@dataclass(frozen=True)
+class Suite:
+    key: str             # 報告用，也是 JOBSPY_MUTATE_SUITE 篩選時比對的值
+    title: str
+    target_rel: str      # 生產檔（相對 repo 根）
+    test_rel: str        # 測試檔（相對 repo 根）
+    mutations: tuple
+    escapes: frozenset   # 這個 suite 已知且已理解的逃脫（原本是單一全域 EXPECTED_ESCAPES）
+    expected_checks: int # 基準線必須印出的項數。改了測試就要同步改這裡，否則大聲中止。
+
+
+# ⚠️ `expected_checks` 為什麼是【宣告的常數】而不是用 AST 數呼叫點（第十輪實測）：
+#   第十輪之前，掃描鎖那條的校準是「印出的項數 == 原始碼裡的 check() 呼叫點數」，
+#   而那【只對 test_scan_lock.py 成立】—— 它是一個呼叫點對一項。新接進來的
+#   `test_location_filter.py` 是【迴圈驅動】：16 個 check() 呼叫點印出 57 項，
+#   於是那條校準一跑就中止（「印出 57 項，但原始碼裡有 16 個呼叫點」）。
+#   那不是量尺壞了，是【校準的假設不適用於這種測試檔形狀】。
+#
+#   改成宣告常數之後兩件事一起變好：
+#     1. 兩種形狀都適用（掃描鎖的 90 也是宣告值）。
+#     2. 它其實【更強】：AST 那條自己承認「抓不到有人把某個 check() 整個刪掉」
+#        （呼叫點與印出項數一起變少），而宣告值會抓到 —— 條數對不上就中止。
+#   代價是新增測試時必須一起改這個數字。這個代價是刻意選的：那正是本專案
+#   吃過兩次的虧（新增測試後變異表的 FAIL 數過期沒重跑），現在它會變成中止。
+#   AST 的呼叫點數仍然算出來並印在基準線那行，當作【下界】的合理性檢查
+#   （宣告值 < 呼叫點數 = 這個數字寫錯了）。
+SUITES = (
+    Suite("scan", "掃描鎖", "job_board.py", "tests/test_scan_lock.py",
+          tuple(MUTATIONS), frozenset(EXPECTED_ESCAPES), 90),
+    Suite("location-filter", "地點過濾器", "linkedin_job_search.py",
+          "tests/test_location_filter.py",
+          tuple(LOCATION_FILTER_MUTATIONS), frozenset(), 57),
+    Suite("location-seek", "Seek 解析", "jobspy/seek/__init__.py",
+          "tests/test_location_filter.py",
+          tuple(LOCATION_SEEK_MUTATIONS), frozenset(), 57),
+)
+
+
+# ── 前置檢查：工作區必須乾淨 ────────────────────────────────────────────────
+# 判定的正確性同時取決於被測的程式【與測試本身】，所以兩個都要檢查。
+# 第五輪 MINOR-4a：原本只檢查 job_board.py，測試檔未提交時產出的表格
+# 別人重現不出來 —— 而這個專案的數字已經腐化過三次。
+#
+# 第十輪：清單改成【從 SUITES 推導】，不是手寫。手寫清單在新增 suite 時會腐化，
+# 而腐化的症狀正是最難察覺的那一種：新 suite 的檔案沒提交也照跑，產出一張
+# 別人重現不出來的表。
+_need_clean = sorted({s.target_rel for s in SUITES} | {s.test_rel for s in SUITES})
+_dirty = [l for l in git("status", "--porcelain", *_need_clean).splitlines() if l.strip()]
+if _dirty:
+    sys.exit("✗ 下列檔案有未提交的改動，先 commit 再跑變異測試：\n   "
+             + "\n   ".join(_dirty)
+             + "\n  （否則驗證的不是 HEAD 的版本，表格別人重現不出來。）")
+
+# 每個 suite 的生產檔各記一份「跑之前」的 sha256，收工時【逐一】驗證。
+# 第十輪之前這裡是單一值（只有 job_board.py 要驗）—— 現在有三個檔要顧。
+PROD_BEFORE = {s.target_rel: sha256(REPO / s.target_rel) for s in SUITES}
+
+# ── 建立隔離副本：生產目錄從此不再被寫入 ────────────────────────────────────
+WORK = Path(tempfile.mkdtemp(prefix="jobspy-mutate-"))
+# ⚠️ 第九輪【自查】：清掃不能只靠下面那個 `finally` —— 它管不到 `try:` **之前**
+# 的提早結束。**基準線前置檢查的 `sys.exit(2)` 正好在那之前**，而它是最常被
+# 觸發的那條路（兩個探針都走它）。實測留下的孤兒：
+#     drwx------ /tmp/jobspy-mutate-tuvnhdx_   12:11（那次以「基準線不可信」中止）
+# 一份隔離副本 = 一份完整的 repo 複本，堆積起來還會讓人分不清哪一份是活的
+# （這一輪我自己就被兩個目錄困惑過）。
+#
+# 用 atexit 一次關掉【整類】漏，而不是在每一條 sys.exit() 前面各補一行 ——
+# 後者會隨新增的提早結束路徑而腐化，而「新增路徑時忘了補」正是這條漏的成因。
+# SIGTERM / SIGINT 另有 `_cleanup_and_die()` 明確處理（atexit 不跑在訊號上）；
+# 重複 rmtree 無害（ignore_errors=True）。
+atexit.register(lambda: shutil.rmtree(WORK, ignore_errors=True))
+try:
+    _archive = subprocess.run(["git", "archive", "HEAD"], cwd=REPO,
+                              capture_output=True, check=True).stdout
+    subprocess.run(["tar", "-x", "-C", str(WORK)], input=_archive, check=True)
+except Exception as e:  # noqa: BLE001
+    shutil.rmtree(WORK, ignore_errors=True)
+    sys.exit(f"✗ 無法建立隔離副本（git archive HEAD | tar -x）：{e}")
+
+_MISSING = sorted(rel for rel in _need_clean if not (WORK / rel).is_file())
+if _MISSING:
+    shutil.rmtree(WORK, ignore_errors=True)
+    sys.exit(f"✗ 隔離副本不完整 —— git archive 沒有解出：{_MISSING}")
+_MISMATCH = sorted(rel for rel, h in PROD_BEFORE.items() if sha256(WORK / rel) != h)
+if _MISMATCH:
+    shutil.rmtree(WORK, ignore_errors=True)
+    sys.exit(f"✗ 隔離副本與工作區不一致（HEAD 與工作區不同？）：{_MISMATCH}")
+
+# 每個 suite 的生產檔原文，開跑前一次讀進記憶體。每一次變異都是從這裡重新產生，
+# 所以磁碟上不會殘留任何中間狀態（第五輪的教訓，見 docstring）。
+ORIG = {s.target_rel: (WORK / s.target_rel).read_text(encoding="utf-8")
+        for s in SUITES}
+
+
+def _restore_originals():
+    """把【所有】suite 的生產檔寫回原文。
+
+    ⚠️ 第十輪新增，因為多 suite 讓一個舊 harness 不可能有的漏洞現形了：
+    舊版只有一個 target、一個 test，每個變異都從 `orig` 重新產生，所以
+    「上一個變異的殘留」根本不存在。現在兩個 suite 共用
+    `tests/test_location_filter.py`，於是【前一個 suite 的最後一個變異會留在磁碟上】
+    跑進下一個 suite 的基準線 —— 而基準線是後面每一個判定的「滿分」基準
+    （`base_pass`），基準線被污染，整個 suite 的歸因就全錯。
+
+    實測（不是推論）：這個漏洞第一次跑就讓 location-seek 的基準線失敗 3 項
+    （`prestons` / `eppings` 被子字串誤收 —— 那正是前一個 suite 的 L1「白名單去
+    \\b」的指紋）。校準守衛以「3 項失敗」大聲中止，沒有把它記成逃脫；
+    **但如果當天真個剛好是 0 失敗，它會安安靜靜地把別人的變異算在這個 suite 頭上。**
+
+    所以每一次跑測試之前都先回復【全部】的檔案，讓不變式是：
+    「樹上等於 HEAD，除了正在被測的那一個變異」。
+    """
+    for _rel, _text in ORIG.items():
+        (WORK / _rel).write_text(_text, encoding="utf-8")
+
+# `JOBSPY_MUTATE_TEST` 是**測試鉤子**，不是設定選項（同 `JOBSPY_MUTATE_PY`）。
+# 它存在的唯一理由是讓【基準線的兩道校準】本身可以被故意觸發 —— 一個觸發不了的
+# 守衛等於沒有守衛，而「沒驗過的守衛」正是這個專案被燒最多次的形狀。
+# 驗法（三個都必須【立刻】中止，且診斷訊息要指向**正確的單一原因**）：
+#   A. 把某個 check() 移到條件底下 → 應該以「印出 N 項，但原始碼裡有 N+1 個」中止
+#   B. 讓某個 check() 失敗        → 應該以「1 項失敗」中止（**只有這一個理由**；
+#                                    rc≠0 與它同源，第九輪退回審查 NIT-1 修掉的
+#                                    就是這個重複）
+#   C. 跑完全過但 sys.exit(3)     → 應該以「rc=3」中止（零失敗時 rc 才是獨立訊息）
+#   sed 's|^check("（承上）目標必須還活著"|if False: check("（承上）目標必須還活著"|' \
+#     tests/test_scan_lock.py > /tmp/probe_test.py
+#   JOBSPY_MUTATE_TEST=/tmp/probe_test.py .venv/bin/python tests/mutate.py
+# A 也可以在檔案結尾（sys.exit(0) 之後）接一個 check()，那會同時證明它抓的是
+# 「有呼叫點卻執行不到」而不只是「基準線被改壞」。
+#
+# 第十輪：測試檔不再只有一個，所以覆蓋必須指名【哪一個 suite】。預設是第一個
+# （`scan`），上面那三條驗法因此原樣可用、不必改指令。要對新的 suite 做同樣的
+# 探測就加 `JOBSPY_MUTATE_TEST_SUITE=location-filter`（指定要覆蓋【哪一個】
+# suite 的測試檔，不是「只跑那個 suite」—— 後者是 `JOBSPY_MUTATE_SUITE`）。
+_TEST_OVERRIDE = os.environ.get("JOBSPY_MUTATE_TEST")
+_SUITE_KEYS = [s.key for s in SUITES]
+
+# ⚠️ 第十輪審查 MINOR-1：這裡原本把 `JOBSPY_MUTATE_SUITE` 當成【選 suite 的篩選器】，
+#    但實作只拿它決定 `JOBSPY_MUTATE_TEST` 要覆蓋哪一個 suite 的測試檔 ——
+#    於是 README 寫著「只跑其中一個 suite」，實際跑出來還是掃描鎖那 32 個。
+#    那是本專案最常抓的形狀：**宣告 > 實際**，而且是我自己剛寫的文件。
+#
+#    修法刻意【不是】讓 `JOBSPY_MUTATE_SUITE` 兼做篩選：它的預設值是
+#    `SUITES[0].key`（scan），一旦兼做篩選，**不設任何環境變數的平常一輪就會
+#    靜靜地只跑 scan suite** —— 用一個新洞補一個舊洞。
+#    改成兩個名字講清楚各自的身分：
+#      JOBSPY_MUTATE_SUITE      要跑哪些 suite（逗號分隔，預設全部）
+#      JOBSPY_MUTATE_TEST_SUITE  `JOBSPY_MUTATE_TEST` 覆蓋【哪一個】suite 的測試檔
+_SUITE_KEYS_STR = ",".join(_SUITE_KEYS)
+_SUITE_FILTER = {k.strip() for k in
+                 os.environ.get("JOBSPY_MUTATE_SUITE", "").split(",") if k.strip()}
+_unknown = sorted(_SUITE_FILTER - set(_SUITE_KEYS))
+if _unknown:
+    shutil.rmtree(WORK, ignore_errors=True)
+    sys.exit(f"✗ JOBSPY_MUTATE_SUITE 指名了不存在的 suite：{_unknown}"
+             f"（可用：{_SUITE_KEYS_STR}）")
+
+_TEST_OVERRIDE_KEY = os.environ.get("JOBSPY_MUTATE_TEST_SUITE", _SUITE_KEYS[0])
+if _TEST_OVERRIDE_KEY not in _SUITE_KEYS:
+    shutil.rmtree(WORK, ignore_errors=True)
+    sys.exit(f"✗ JOBSPY_MUTATE_TEST_SUITE={_TEST_OVERRIDE_KEY!r} 沒有對應的 suite"
+             f"（可用：{_SUITE_KEYS_STR}）")
+_ov_suite = next(s for s in SUITES if s.key == _TEST_OVERRIDE_KEY)
+if _TEST_OVERRIDE:
+    _ov = Path(_TEST_OVERRIDE)
+    if not _ov.is_file():
+        shutil.rmtree(WORK, ignore_errors=True)
+        sys.exit(f"✗ JOBSPY_MUTATE_TEST 指向的檔案不存在：{_ov}")
+    (WORK / _ov_suite.test_rel).write_text(_ov.read_text(encoding="utf-8"),
+                                           encoding="utf-8")
+
+print(f"隔離副本：{WORK}")
+print("生產目錄【不會被寫入】：")
+for _rel in sorted(PROD_BEFORE):
+    print(f"  {_rel:32s} sha256={PROD_BEFORE[_rel][:16]}…")
+print(f"起始狀態：乾淨，{sum(len(v) for v in ORIG.values())} bytes；"
+      f"{len(SUITES)} 個 suite、{len(_need_clean)} 個檔案納入前置檢查")
+if _TEST_OVERRIDE:
+    print(f"⚠️  {_ov_suite.key} 的測試檔已被 JOBSPY_MUTATE_TEST 覆蓋："
+          f"{_TEST_OVERRIDE}（只影響隔離副本；這不是正常的一輪）")
+print()
+
+
+def _cleanup_and_die(signum, _frame):
+    shutil.rmtree(WORK, ignore_errors=True)
+    _changed = sorted(rel for rel, h in PROD_BEFORE.items()
+                      if sha256(REPO / rel) != h)
+    if _changed:
+        print(f"\n✗ 收到訊號 {signum}，且生產檔案已被改動 —— 請立刻檢查：{_changed}")
+        sys.exit(2)
+    print(f"\n⚠️ 收到訊號 {signum}，已移除隔離副本（生產目錄未被寫入）")
+    sys.exit(130)
+
+
+signal.signal(signal.SIGTERM, _cleanup_and_die)
+signal.signal(signal.SIGINT, _cleanup_and_die)
+
+
+
 # ── 基準線：先確認【沒被變異的】那一份是全綠的 ──────────────────────────────
 # 這一步量的是「量尺本身」。如果連原始碼都跑不過，後面每一個變異的 PASS/FAIL
 # 都只是同一個既有故障的回音 —— 而表格看起來一模一樣（30 列數字，長得很正常）。
@@ -445,63 +697,71 @@ def _run_suite(test_path):
             len(re.findall(r"\[FAIL\]", out)), r.returncode)
 
 
+def _calibrate(suite):
+    """跑一次【沒被變異的】那個測試檔，回傳 (base_pass, ast_checks, bad, out)。
+
+    `bad` 非空代表這把量尺不可信 —— 此時【不可以】繼續跑這個 suite 的變異，
+    因為它們的每一個讀數都只是同一個既有故障的回音，而表格看起來一模一樣。
+    """
+    test_path = WORK / suite.test_rel
+    # ── 量尺的第二道校準：印出來的項數必須等於這個 suite 宣告的項數 ──────────
+    # 第九輪【審查退回】MINOR-3。上面那個「全綠」判定只證明「沒有 FAIL」，
+    # 不證明「每一項都跑了」。反例（審查員實測）：把 L 區那項 AST 不變式整段註解掉，
+    # 基準線照樣印 `✅ 全數通過`、rc=0、0 FAIL —— 前置檢查完全放行，
+    # 而 M32 會被判成 `❌ 逃脫（無回歸保護）`。**那不是逃脫，是量尺短了一格。**
+    # 載具分不出這兩者，於是把「檢查被跳過」記成「修正沒有回歸保護」，歸因錯誤，
+    # 文件數字跟著腐化。
+    #
+    # ⚠️ 判準第十輪從「AST 呼叫點數」改成「suite 宣告的 expected_checks」——
+    #    理由與為什麼它其實更強，寫在 Suite 的定義上方（迴圈驅動的測試檔會讓
+    #    AST 那條不成立）。AST 數仍然算出來，當作宣告值的【下界】合理性檢查。
+    #
+    # 判準不用 `grep -c 'check('` 的前提沒有變 —— 同一個理由在本專案出現過很多次：
+    # **grep 會把註解與字串裡的 `check(` 算成呼叫**（本檔的說明文字就在引用它）。
+    #
+    # 這一項抓到的是「呼叫點還在、但沒被執行到」（被移到條件底下、被 return 跳過），
+    # 以及「某個 check() 被整個刪掉」—— 兩者都會讓印出項數少於宣告值。
+    ast_checks = sum(
+        1 for _n in ast.walk(ast.parse(test_path.read_text(encoding="utf-8")))
+        if isinstance(_n, ast.Call) and isinstance(_n.func, ast.Name)
+        and _n.func.id == "check")
+
+    # 基準線一定要在【乾淨的樹】上跑：前一個 suite 的殘留變異留在磁碟上的話，
+    # 這條基準線量的就是別人（見 `_restore_originals` 的實測記錄）。
+    _restore_originals()
+    out, passed, failed, rc = _run_suite(test_path)
+    bad = []
+    # ⚠️ 收尾標記有【兩個】，失敗路徑印的是「項失敗：」而不是「✅ 全數通過」。
+    # 第一版只認後者，於是「1 項失敗」會被多報一句「沒有印出收尾標記（沒跑到底）」
+    # —— 診斷訊息指向錯的原因。判定要與下面每一個變異用的 `done` 一致。
+    if "✅ 全數通過" not in out and "項失敗：" not in out:
+        bad.append("沒有印出收尾標記（沒跑到底）")
+    if failed != 0:
+        bad.append(f"{failed} 項失敗")
+    # ⚠️ rc 這一條也**只在零失敗時**才列（第九輪退回審查 NIT-1）。測試檔的收尾是
+    # `if FAILURES: … sys.exit(1)` / `else: … sys.exit(0)`，所以有 FAIL 就必然 rc≠0
+    # —— 那時再列一次 rc 只是同一件事講兩遍，讀起來像兩個獨立的理由。
+    # 零失敗而 rc≠0 才是**獨立**訊息（跑到底、0 個 FAIL、卻非零退出：收尾程式碼或
+    # atexit 出錯），那正是這裡要抓的東西。實測：探針 C（跑完全過但 sys.exit(3)）
+    # → 「90P/0F rc=3：rc=3」，單一理由。
+    if failed == 0 and rc != 0:
+        bad.append(f"rc={rc}")
+    # ⚠️ 只有在【零失敗】時才比對項數。有失敗時 `passed` 本來就會少幾項，
+    # 那時再喊「有檢查沒被執行到」是把讀者指向錯的原因（實測：1 項失敗被多報成
+    # 4 個理由，其中一句是假的）。診斷訊息的準確性與判定本身一樣重要。
+    if failed == 0 and passed != suite.expected_checks:
+        bad.append(f"印出 {passed} 項，但 {suite.key} 宣告的是 "
+                   f"{suite.expected_checks} 項 —— 有檢查沒被執行到（或測試改了而"
+                   "這個數字沒跟著改），這把量尺短了一格")
+    # 宣告值不可能小於原始碼裡的 check() 呼叫點數：每個呼叫點至少印一項。
+    # 這一條是【寫錯數字】的守衛，不是行為的守衛 —— 所以它與零失敗無關，一律檢查。
+    if suite.expected_checks < ast_checks:
+        bad.append(f"宣告 {suite.expected_checks} 項 < 原始碼的 {ast_checks} 個 "
+                   "check() 呼叫點 —— 這個宣告值本身寫錯了")
+    return passed, ast_checks, bad, out
+
+
 print(f"解譯器：{PY}")
-
-# ── 量尺的第二道校準：印出來的項數必須等於【原始碼裡的 check() 呼叫點數】 ──────
-# 第九輪【審查退回】MINOR-3。上面那個「全綠」判定只證明「沒有 FAIL」，
-# 不證明「每一項都跑了」。反例（審查員實測）：把 L 區那項 AST 不變式整段註解掉，
-# 基準線照樣印 `✅ 全數通過`、rc=0、0 FAIL —— 前置檢查完全放行，
-# 而 M32 會被判成 `❌ 逃脫（無回歸保護）`。**那不是逃脫，是量尺短了一格。**
-# 載具分不出這兩者，於是把「檢查被跳過」記成「修正沒有回歸保護」，歸因錯誤，
-# 文件數字跟著腐化。
-#
-# 判準用 AST 而不是 `grep -c 'check('` —— 同一個理由在本專案出現過很多次：
-# **grep 會把註解與字串裡的 `check(` 算成呼叫**（本檔的說明文字就在引用它）。
-#
-# 這一項抓到的是「呼叫點還在、但沒被執行到」（被移到條件底下、被 return 跳過）。
-# 抓不到的是「有人把某個 check() 整個刪掉」—— 兩邊一起變少，守衛看不出來；
-# 那一種由變異表負責（少一個守衛，就會多一個逃脫）。
-_AST_CHECKS = sum(
-    1 for _n in ast.walk(ast.parse(TEST.read_text(encoding="utf-8")))
-    if isinstance(_n, ast.Call) and isinstance(_n.func, ast.Name)
-    and _n.func.id == "check")
-
-_bout, _bp, _bf, _brc = _run_suite(TEST)
-_bad = []
-# ⚠️ 收尾標記有【兩個】，失敗路徑印的是「項失敗：」而不是「✅ 全數通過」。
-# 第一版只認後者，於是「1 項失敗」會被多報一句「沒有印出收尾標記（沒跑到底）」
-# —— 診斷訊息指向錯的原因。判定要與下面每一個變異用的 `done` 一致。
-if "✅ 全數通過" not in _bout and "項失敗：" not in _bout:
-    _bad.append("沒有印出收尾標記（沒跑到底）")
-if _bf != 0:
-    _bad.append(f"{_bf} 項失敗")
-# ⚠️ rc 這一條也**只在零失敗時**才列（第九輪退回審查 NIT-1）。測試檔的收尾是
-# `if FAILURES: … sys.exit(1)` / `else: … sys.exit(0)`，所以有 FAIL 就必然 rc≠0
-# —— 那時再列一次 rc 只是同一件事講兩遍，讀起來像兩個獨立的理由。
-# 零失敗而 rc≠0 才是**獨立**訊息（跑到底、0 個 FAIL、卻非零退出：收尾程式碼或
-# atexit 出錯），那正是這裡要抓的東西。實測：探針 C（跑完全過但 sys.exit(3)）
-# → 「90P/0F rc=3：rc=3」，單一理由。
-if _bf == 0 and _brc != 0:
-    _bad.append(f"rc={_brc}")
-# ⚠️ 只有在【零失敗】時才比對項數。有失敗時 `_bp` 本來就會少幾項，
-# 那時再喊「有檢查沒被執行到」是把讀者指向錯的原因（實測：1 項失敗被多報成
-# 4 個理由，其中一句是假的）。診斷訊息的準確性與判定本身一樣重要。
-if _bf == 0 and _bp != _AST_CHECKS:
-    _bad.append(f"印出 {_bp} 項，但原始碼裡有 {_AST_CHECKS} 個 check() 呼叫點"
-                " —— 有檢查沒被執行到，這把量尺短了一格")
-if _bad:
-    print(f"\n✗ 基準線不可信（{_bp}P/{_bf}F rc={_brc}）：{'；'.join(_bad)}")
-    print("  否則下面每一個變異都只是這個既有故障的回音，而表格會長得很正常。")
-    print("  尾巴：")
-    for _l in _bout.strip().splitlines()[-15:]:
-        print(f"    │ {_l}")
-    shutil.rmtree(WORK, ignore_errors=True)
-    sys.exit(2)
-# BASE_PASS 不是裝飾品：下面的判定全部拿它當「滿分」的基準（第九輪 MINOR-3
-# 之前它被賦值後從未讀取，那正是「宣告了但沒有做到」的最小樣本）。
-BASE_PASS = _bp
-print(f"基準線：{_bp} 項全過、0 失敗（rc=0）；"
-      f"與原始碼的 {_AST_CHECKS} 個 check() 呼叫點相符\n")
 
 # ── 兩個測試鉤子：只跑指定的變異、以及每個變異連跑 N 次 ────────────────────────
 # 第九輪【審查退回】MINOR-2 的產物。審查員把整張表重跑一次，得到 M9 = 88P/2F、
@@ -545,48 +805,115 @@ print(f"基準線：{_bp} 項全過、0 失敗（rc=0）；"
 #
 # ⚠️ **預設（`JOBSPY_MUTATE_REPEAT` 未設 ⇒ 1）下，UNSTABLE 結構上不可能出現**：
 #    `_readings` 只有一個元素，`len(set(_readings)) > 1` 恆為 False。
-#    也就是說，平常那一輪「✅ 31/32」**沒有測到任何一列的穩定性**，
-#    它只測到「這一次是這樣」。這個取捨是刻意的（整張表 33 次執行 ≈ 4m45s，
-#    乘上 REPEAT 就是線性成長），但事實必須寫出來：
+#    也就是說，平常那一輪「✅ 39/40」**沒有測到任何一列的穩定性**
+#    （掃描鎖那個 suite 自己是「✅ 31/32」），它只測到「這一次是這樣」。
+#    這個取捨是刻意的（完整一輪 = 3 個 suite 基準線 + 40 個變異 = **43 次測試執行**；
+#    ⚠️ 這個 43 是用 `strace -f -e trace=execve` 量子集 `L1,L6`（得到 4 = 2+2）
+#    再把規則套出來的，不是估的 —— 第一次量到「8」是 `git` 在 PATH 上失敗的
+#    嘗試次數，不是測試執行次數），乘上 REPEAT 就是線性成長，但事實必須寫出來：
 #    **要對某一列講「穩定」，就得明跑 REPEAT，沒有別的路徑。**
 _ONLY = {s.strip() for s in os.environ.get("JOBSPY_MUTATE_ONLY", "").split(",") if s.strip()}
 try:
     _REPEAT = max(1, int(os.environ.get("JOBSPY_MUTATE_REPEAT", "1")))
 except ValueError:
     sys.exit("✗ JOBSPY_MUTATE_REPEAT 必須是整數")
-_SELECTED = [m for m in MUTATIONS if not _ONLY or m[0] in _ONLY]
+# 第十輪：變異 id 全域唯一（M1–M32 / L1–L8），所以 _ONLY 不必指名 suite。
+# 但【suite 才是選擇的單位】：一個 suite 若一個變異都沒被選到就整個跳過，
+# 連它的基準線都不跑 —— 否則 JOBSPY_MUTATE_ONLY=L1 會連帶校準另外兩個 suite。
+_SELECTED = {}
+for _s in SUITES:
+    # suite 篩選（`JOBSPY_MUTATE_SUITE`）先過，再過變異篩選（`JOBSPY_MUTATE_ONLY`）。
+    if _SUITE_FILTER and _s.key not in _SUITE_FILTER:
+        continue
+    _sel = [m for m in _s.mutations if not _ONLY or m[0] in _ONLY]
+    if _sel:
+        _SELECTED[_s.key] = _sel
 if _ONLY and not _SELECTED:
-    sys.exit(f"✗ JOBSPY_MUTATE_ONLY={sorted(_ONLY)} 沒有對應任何變異")
-if _ONLY or _REPEAT > 1:
-    print(f"⚠️  子集模式：{len(_SELECTED)}/{len(MUTATIONS)} 個變異、每個連跑 {_REPEAT} 次"
-          "（這不是完整的一輪）\n")
+    sys.exit(f"✗ JOBSPY_MUTATE_ONLY={sorted(_ONLY)} 沒有對應任何變異"
+             + (f"（且已被 JOBSPY_MUTATE_SUITE={sorted(_SUITE_FILTER)} 限縮）"
+                if _SUITE_FILTER else ""))
+if _SUITE_FILTER and not _SELECTED:
+    sys.exit(f"✗ JOBSPY_MUTATE_SUITE={sorted(_SUITE_FILTER)} 與 "
+             f"JOBSPY_MUTATE_ONLY={sorted(_ONLY)} 的交集是空的")
+_SEL_N = sum(len(v) for v in _SELECTED.values())
+_ALL_N = sum(len(s.mutations) for s in SUITES)
+# ⚠️ 篩選【選了幾個 suite】與【跑不跑全部變異】是兩件事，要分開講：
+#    只跑 location-filter 的全部 5 個變異仍然是「完整測了那個 suite」，
+#    但它不是「完整一輪」。混淆這兩者正是本專案一直在抓的過度宣稱。
+# ⚠️ 判準要用【數出來的數量】，不是環境變數有沒有設 —— 見下面收尾那段的教訓。
+#    （第一版寫成 `bool(_SUITE_FILTER)`，那正是「用旗標推導我跑了幾項」，
+#      也就是本檔自己警告過的那件事。）
+_PARTIAL = _SEL_N != _ALL_N or _REPEAT > 1
+if _PARTIAL:
+    _why = []
+    if _SEL_N != _ALL_N:
+        _why.append(f"{_SEL_N}/{_ALL_N} 個變異、"
+                    f"{len(_SELECTED)}/{len(SUITES)} 個 suite")
+    if _SUITE_FILTER:
+        _why.append(f"suite 限縮：{sorted(_SUITE_FILTER)}")
+    if _ONLY:
+        _why.append(f"變異限縮：{sorted(_ONLY)}")
+    if _REPEAT > 1:
+        _why.append(f"每個連跑 {_REPEAT} 次")
+    print(f"⚠️  子集模式（{'、'.join(_why)}）；這不是完整的一輪\n")
 
-results = []
-try:
-    for mid, label, mutate in _SELECTED:
+
+def _run_mutations(suite, selected, results):
+    """跑一個 suite 的所有選定變異，結果 append 進 results。
+
+    每一列是 `(suite.key, mid, full, stat, verdict, kind)` —— suite 放在第一欄，
+    因為下面的收尾統計必須分辨得出「是哪個 suite 的變異逃脫了」。
+    """
+    base_pass, ast_checks, cal_bad, cal_out = _calibrate(suite)
+    if cal_bad:
+        print(f"\n✗ 【{suite.key}】基準線不可信：{'；'.join(cal_bad)}")
+        print("  否則下面每一個變異都只是這個既有故障的回音，而表格會長得很正常。")
+        print("  尾巴：")
+        for _l in cal_out.strip().splitlines()[-15:]:
+            print(f"    │ {_l}")
+        shutil.rmtree(WORK, ignore_errors=True)
+        sys.exit(2)
+    # base_pass 不是裝飾品：下面的判定全部拿它當「滿分」的基準（第九輪 MINOR-3
+    # 之前它被賦值後從未讀取，那正是「宣告了但沒有做到」的最小樣本）。
+    print(f"\n═══ {suite.title}：{suite.target_rel} ← {suite.test_rel} ═══")
+    # ⚠️ 這一行【不能】再寫「與原始碼的 N 個 check() 呼叫點相符」—— 那只對
+    # test_scan_lock.py 成立（一個呼叫點印一項）。地點那兩個 suite 用的是迴圈驅動的
+    # 測試檔，57 項由 16 個呼叫點印出，寫「相符」就是一句當場可證偽的話。
+    # 兩個數字都印，並講清楚哪個是判準、哪個是下界。
+    print(f"    基準線 {base_pass} 項全過、0 失敗（rc=0）；"
+          f"宣告值 {suite.expected_checks} 項、"
+          f"原始碼 check() 呼叫點 {ast_checks} 個（下界）")
+
+    target_path = WORK / suite.target_rel
+    test_path = WORK / suite.test_rel
+    orig = ORIG[suite.target_rel]
+    for mid, label, mutate in selected:
         full = f"{mid} {label}"
+        # 先把【所有】生產檔寫回原文，再套這一個變異（見 `_restore_originals`）。
+        # 少了這一行，前一個 suite 的殘留就會跟著跑進這一個 suite 的變異判定。
+        _restore_originals()
         try:
-            TARGET.write_text(mutate(ORIG), encoding="utf-8")
+            target_path.write_text(mutate(orig), encoding="utf-8")
         except SystemExit as e:
-            results.append((mid, full, "ANCHOR-FAIL", str(e), "BAD"))
+            results.append((suite.key, mid, full, "ANCHOR-FAIL", str(e), "BAD"))
             print(f"{full:44s} ✗ 錨點失效：{e}")
             continue
 
-        if subprocess.run([PY, "-m", "py_compile", str(TARGET)],
+        if subprocess.run([PY, "-m", "py_compile", str(target_path)],
                           capture_output=True).returncode != 0:
-            results.append((mid, full, "SYNTAX-ERR", "變異本身語法錯誤", "BAD"))
+            results.append((suite.key, mid, full, "SYNTAX-ERR", "變異本身語法錯誤", "BAD"))
             print(f"{full:44s} ✗ 變異本身語法錯誤")
             continue
 
         try:
-            r = subprocess.run([PY, str(TEST)], cwd=WORK,
+            r = subprocess.run([PY, str(test_path)], cwd=WORK,
                                capture_output=True, text=True, timeout=TIMEOUT)
         except subprocess.TimeoutExpired:
             # 逾時【不】算被逮：分不出「變異造成死鎖（=有偵測到）」與
             # 「孤兒握著管線的假卡死（=什麼都沒測到）」。第五輪 MINOR-4c：
             # 原本算成「被逮」會讓結論反轉。現在標成 INCONCLUSIVE 並讓退出碼非 0，
             # 逼人去看。
-            results.append((mid, full, f">{TIMEOUT}s TIMEOUT", "逾時，原因不明", "INCONCLUSIVE"))
+            results.append((suite.key, mid, full, f">{TIMEOUT}s TIMEOUT", "逾時，原因不明", "INCONCLUSIVE"))
             print(f"{full:44s} ⏱  逾時 {TIMEOUT}s —— INCONCLUSIVE，請查因")
             continue
 
@@ -600,7 +927,7 @@ try:
         #    不可能觸發 —— 平常那一輪並沒有驗證任何一列的穩定性。見上方說明。
         for _ in range(_REPEAT - 1):
             try:
-                _r2 = subprocess.run([PY, str(TEST)], cwd=WORK,
+                _r2 = subprocess.run([PY, str(test_path)], cwd=WORK,
                                      capture_output=True, text=True, timeout=TIMEOUT)
             except subprocess.TimeoutExpired:
                 _readings.append((-1, -1, -1))
@@ -610,7 +937,7 @@ try:
                               _r2.returncode))
         if len(set(_readings)) > 1:
             _all = " ".join(f"{p}P/{f}F" for p, f, _ in _readings)
-            results.append((mid, full, _all,
+            results.append((suite.key, mid, full, _all,
                             f"{_REPEAT} 次重跑讀數不一致 —— 有檢查不穩定，"
                             "這一列不能寫進文件", "UNSTABLE"))
             print(f"{full:44s} 🎲 {_all} —— UNSTABLE：{_REPEAT} 次重跑讀數不一致")
@@ -651,18 +978,18 @@ try:
         # 那就是量尺短了一格 —— 而下面的判定會把它記成 `❌ 逃脫（無回歸保護）`，
         # 歸因錯誤（真正的原因是「檢查沒被執行」，不是「修正沒有守衛」）。
         # 這裡把它拉出來當 INCONCLUSIVE，逼人去看。
-        if done and passed + failed != BASE_PASS:
-            results.append((mid, full, f"{passed}P/{failed}F rc={rc}",
-                            f"總項數 {passed + failed} ≠ 基準線 {BASE_PASS}"
+        if done and passed + failed != base_pass:
+            results.append((suite.key, mid, full, f"{passed}P/{failed}F rc={rc}",
+                            f"總項數 {passed + failed} ≠ 基準線 {base_pass}"
                             "（檢查被跳過？）", "INCONCLUSIVE"))
-            print(f"{full:44s} ⚠️  總項數 {passed + failed} ≠ 基準線 {BASE_PASS}"
+            print(f"{full:44s} ⚠️  總項數 {passed + failed} ≠ 基準線 {base_pass}"
                   f" —— INCONCLUSIVE，不是逃脫，請查因")
             continue
         if not done:
             # 多印出實際的 P/F 與最後幾行，讓「崩在哪」一眼可見 ——
             # 否則唯一的線索是一個看起來很正常的 `32P/0F`。
             tail_lines = [l for l in out.strip().splitlines()[-4:]]
-            results.append((mid, full, f"{passed}P/{failed}F rc={rc}",
+            results.append((suite.key, mid, full, f"{passed}P/{failed}F rc={rc}",
                             "測試檔未跑完（崩潰？）—— 這不是逃脫", "INCONCLUSIVE"))
             print(f"{full:44s} ⚠️  測試檔【未跑完】({passed}P/{failed}F "
                   f"rc={rc}) —— INCONCLUSIVE，不是逃脫，請查因")
@@ -674,34 +1001,96 @@ try:
             verdict, kind = "✅ 被逮", "CAUGHT"
         else:
             verdict, kind = "❌ 逃脫（無回歸保護）", "ESCAPED"
-        results.append((mid, full, f"{passed}P/{failed}F rc={rc}", verdict, kind))
+        results.append((suite.key, mid, full, f"{passed}P/{failed}F rc={rc}", verdict, kind))
         print(f"{full:44s} {passed:>2}P / {failed:>2}F  rc={rc}  {verdict}")
+
+results = []
+residue = []
+try:
+    for suite in SUITES:
+        if suite.key in _SELECTED:
+            _run_mutations(suite, _SELECTED[suite.key], results)
+    # ── 殘留檢查（第十輪新增）────────────────────────────────────────────
+    # docstring 說「磁碟上不會殘留任何中間狀態」。多 suite 之後那句話【需要被檢查】
+    # 才成立：`_restore_originals` 在每個變異之前跑，所以迴圈結束時最後一個變異
+    # 還在樹上。把樹寫回原文，然後逐檔比對 sha256 —— 這是有牙齒的版本。
+    #
+    # ⚠️ 為什麼不是 grep（docstring 45-47 行的歷史教訓）：上一版的殘留檢查是
+    # `grep -c 'MUTANT\|if True:'`，而 M8 的變異是一個裸的 `return None`，
+    # **grep 不到**，差一點帶著壞掉的版本繼續往下做。雜湊比對沒有這個盲點。
+    # ⚠️ 這一段【證明什麼、不證明什麼】要講清楚，因為第一版兩邊都寫錯了：
+    #
+    #   第一版：先還原、再比對。看似在驗殘留，其實還原之後樹上就是 ORIG 的文字，
+    #           而「ORIG == HEAD」在開跑前已經查過了 —— 比對變成一句不可能失敗的
+    #           宣告，正是本專案最常抓的那種「宣告 > 實際」。
+    #   第二版：先比對、再還原。變成**每一輪都必然亮紅燈** —— 迴圈結束時最後一個
+    #           變異本來就還躺在樹上，那是設計如此（`_restore_originals` 就是為此
+    #           存在的），不是故障。一個每次都響的警報等於沒有警報。
+    #
+    # 正確的定位是：這一段驗的是【還原機制本身有沒有漏掉檔案】。
+    # 先還原，再拿 PROD_BEFORE 逐檔比對；如果 `_restore_originals()` 漏了某個
+    # target（例如新 suite 的 target 沒進 ORIG），那個檔案會保持變異狀態而被抓到。
+    # 它【不】證明「跑完當下樹是乾淨的」—— 那從來不是不變式，也不需要是：
+    # 真正的中間狀態保護來自 `_restore_originals()` 在每個變異之前執行。
+    #
+    # 這個守衛【驗過會響】（2026-09-30，不是「應該會響」）：把探針 repo 的
+    # `_restore_originals()` 改成跳過 `linkedin_job_search.py`，跑
+    # `JOBSPY_MUTATE_ONLY=L1,L4` → 印出
+    # `✗ 隔離副本還原後仍有殘留：['linkedin_job_search.py']`、退出碼 2，
+    # 而且同一輪的三個生產檔 sha256 全部不變（正確地把「WORK 有殘留」與
+    # 「生產檔被寫入」分成兩件事）。
+    _restore_originals()
+    residue = sorted(rel for rel, h in PROD_BEFORE.items()
+                     if sha256(WORK / rel) != h)
 finally:
     shutil.rmtree(WORK, ignore_errors=True)
 
 # ── 收工驗證：生產目錄必須毫髮無傷 ──────────────────────────────────────────
 print("\n" + "=" * 80)
-PROD_AFTER = sha256(PROD_TARGET)
-print(f"生產檔案驗證：sha256 {'不變 ✓' if PROD_AFTER == PROD_BEFORE else '★已改變★'}"
-      f"  {PROD_AFTER[:16]}…")
-if PROD_AFTER != PROD_BEFORE:
+PROD_AFTER = {rel: sha256(REPO / rel) for rel in PROD_BEFORE}
+for _rel in sorted(PROD_BEFORE):
+    _same = PROD_AFTER[_rel] == PROD_BEFORE[_rel]
+    print(f"生產檔案驗證：{_rel:32s} sha256 "
+          f"{'不變 ✓' if _same else '★已改變★'}  {PROD_AFTER[_rel][:16]}…")
+_changed = sorted(rel for rel in PROD_BEFORE if PROD_AFTER[rel] != PROD_BEFORE[rel])
+if _changed:
     # ⚠️ 這個警告有兩個成因，而且【處置相反】：
-    #   (a) 真的外洩 —— 某個變異寫進了生產檔。要救：`git checkout -- job_board.py`。
-    #   (b) 有人在這一輪跑的期間【自己編輯了】job_board.py。要救：什麼都別做，
+    #   (a) 真的外洩 —— 某個變異寫進了生產檔。要救：`git checkout -- <檔案>`。
+    #   (b) 有人在這一輪跑的期間【自己編輯了】那個檔。要救：什麼都別做，
     #       你的編輯是對的，這一輪的數字不能用而已。
     # 原本這裡直接印「請立刻 git checkout」—— 那會把 (b) 的情況下使用者剛寫好的
     # 工作【整批刪掉】。一個偵測器不該在只知道「檔案變了」的時候，建議一個
     # 會刪掉未提交工作的動作。所以先讓人自己看一眼。
-    print("✗ 生產的 job_board.py 在這一輪期間被改動了！")
+    #
+    # 第十輪：從單檔推廣成【逐一驗證】。清單用 _changed 而不是寫死檔名 ——
+    # 上面那句 `git checkout -- job_board.py` 在只有一個檔時是對的，三個檔時
+    # 會讓人在修好一個之後以為修完了。
+    print(f"✗ 生產檔案在這一輪期間被改動了：{_changed}")
     print("  先看 diff 再決定 —— 【不要】反射性地 git checkout：")
-    print("    git diff --stat job_board.py")
-    print("  · 變異外洩 → 只有突變的幾行，救法：git checkout -- job_board.py")
+    print(f"    git diff --stat {' '.join(_changed)}")
+    print(f"  · 變異外洩 → 只有突變的幾行，救法：git checkout -- {' '.join(_changed)}")
     print("  · 你自己在跑的期間編輯過 → 你的編輯是對的，這一輪的數字作廢，重跑即可")
+    sys.exit(2)
+if residue:
+    # 這一條是【載具自己的】故障，不是被測程式的：樹寫回原文之後仍有差異，
+    # 代表還原機制本身漏了一個檔案（新 suite 的 target 忘了進 ORIG？）。
+    # 印出來而不是只放進殘留清單 —— 不然它會安靜地讓下一輪的判定失真。
+    print(f"✗ 隔離副本還原後仍有殘留：{residue}")
+    print("  這是 harness 的問題，不是被測程式的 —— 檢查 Suite.target_rel 與 ORIG。")
     sys.exit(2)
 print(f"隔離副本已移除：{not WORK.exists()}")
 
-for _mid, full, stat, verdict, _kind in results:
-    print(f"  {full:44s} {stat:>18s}  {verdict}")
+# 表格依 suite 分組印，每一列都掛著它的 suite key —— 「這一行屬於哪個 suite」
+# 是讀這張表時最容易搞錯的一件事（三個 suite 的變異全印進同一個 results）。
+_ESCAPES = {s.key: s.escapes for s in SUITES}
+print()
+for _s in SUITES:
+    _rows = [r for r in results if r[0] == _s.key]
+    if not _rows:
+        continue
+    print(f"── {_s.title}（{_s.target_rel} ← {_s.test_rel}）──")
+    for _sk, _mid, full, stat, verdict, _kind in _rows:
+        print(f"  {full:44s} {stat:>18s}  {verdict}")
 print("=" * 80)
 
 # ⚠️⚠️ 這個 tuple 是「這一列不能拿來下結論」的完整集合。第九輪加入 UNSTABLE 時
@@ -712,38 +1101,51 @@ print("=" * 80)
 # 明明整列被判「不能寫進文件」，結論行卻說它被逮捕了。原因：UNSTABLE 不在這個
 # tuple 裡 → 既不算 bad 也不算 escaped → 直接落到下面的成功路徑。
 # 教訓：**新增一種判定時，要去找所有「分類」的地方，不是只加到產生它的地方。**
-bad = [r for r in results if r[4] in ("BAD", "INCONCLUSIVE", "UNSTABLE")]
-escaped = [r for r in results if r[4] == "ESCAPED"]
-known = [r for r in escaped if r[0] in EXPECTED_ESCAPES]
-new = [r for r in escaped if r[0] not in EXPECTED_ESCAPES]
-stale = [r for r in results if r[4] == "CAUGHT" and r[0] in EXPECTED_ESCAPES]
+# ⚠️ 第十輪：results 的每一列多了一欄 suite key，所以下面每一個索引都往後移一格
+# （kind 從 r[4] 變 r[5]，變異 id 從 r[0] 變 r[1]）。豁免也從單一全域
+# EXPECTED_ESCAPES 變成【每個 suite 各自一份】—— 否則 L 系列的 id 要跟 M 系列
+# 共用同一張豁免表，而「哪一組的豁免過期了」就分不出來。
+bad = [r for r in results if r[5] in ("BAD", "INCONCLUSIVE", "UNSTABLE")]
+escaped = [r for r in results if r[5] == "ESCAPED"]
+known = [r for r in escaped if r[1] in _ESCAPES[r[0]]]
+new = [r for r in escaped if r[1] not in _ESCAPES[r[0]]]
+stale = [r for r in results if r[5] == "CAUGHT" and r[1] in _ESCAPES[r[0]]]
 
 if known:
-    print(f"\nℹ️  {len(known)} 個【已知且已理解】的逃脫（見 EXPECTED_ESCAPES 與 DECISIONS.md）：")
-    for _mid, full, _s, v, _k in known:
-        print(f"   - {full}  {v}")
+    print(f"\nℹ️  {len(known)} 個【已知且已理解】的逃脫"
+          "（見各 suite 的 escapes 與 DECISIONS.md）：")
+    for _sk, _mid, full, _s, v, _k in known:
+        print(f"   - [{_sk}] {full}  {v}")
 
 if stale:
     # 豁免過期 = 有人補了測試。留著它會讓「已知逃脫」清單變成裝飾品。
-    print(f"\n⚠️  {len(stale)} 個豁免【已過期】（這些變異現在被逮到了，請從 "
-          f"EXPECTED_ESCAPES 移除）：")
-    for _mid, full, _s, _v, _k in stale:
-        print(f"   - {full}")
+    #
+    # ⚠️ 第十輪審查 NIT-2：這裡原本【只印警告，退出碼不受影響】。那正是上面
+    # 1094-1101 行記著的同一個缺陷形狀 ——「加了守衛，但守衛不會讓任何東西失敗」。
+    # 實測（審查員造的）：把 L1 塞進 location-filter 的 escapes，跑 ONLY=L1 →
+    # 先印「⚠️ 1 個豁免【已過期】」，下一行照樣「✅ 1/1 個變異被逮捕，無逃脫」，
+    # **EXIT=0**。一份不會讓任何東西失敗的守衛，跟沒有一樣；而它的說明文字
+    # 還宣稱自己在防止清單腐化 —— 那是「宣告 > 實際」的標準樣本。
+    # 現在它與 `new`／`bad` 一起讓退出碼變 1（見下方）。
+    print(f"\n⚠️  {len(stale)} 個豁免【已過期】（這些變異現在被逮到了，請從該 suite "
+          f"的 escapes 移除）：")
+    for _sk, _mid, full, _s, _v, _k in stale:
+        print(f"   - [{_sk}] {full}")
 
 if bad:
     print(f"\n⚠️  {len(bad)} 個變異無法判定（不影響結論的正確性，但代表這一輪不完整）：")
-    for _mid, full, stat, v, _k in bad:
-        print(f"   - {full}  {stat}  {v}")
+    for _sk, _mid, full, stat, v, _k in bad:
+        print(f"   - [{_sk}] {full}  {stat}  {v}")
 
 if new:
     print(f"\n⚠️  {len(new)} 個變異沒有被逮捕（＝那項修正沒有回歸保護）：")
-    for _mid, full, _s, v, _k in new:
-        print(f"   - {full}  {v}")
+    for _sk, _mid, full, _s, v, _k in new:
+        print(f"   - [{_sk}] {full}  {v}")
 
-if new or bad:
+if new or bad or stale:
     sys.exit(1)
 
-# ⚠️ 子集模式（JOBSPY_MUTATE_ONLY）下，這裡的 N 是**子集大小**，不是 32。
+# ⚠️ 子集模式（JOBSPY_MUTATE_ONLY）下，這裡的 N 是**子集大小**，不是全部。
 # 不加標記的話，這一行讀起來跟完整一輪的結論一模一樣 —— 那正是本專案
 # 反覆被燒的形狀（把抽樣讀成性質）。所以子集一律在結論行上自我標示。
 #
@@ -751,12 +1153,14 @@ if new or bad:
 # 推導式每次都建一個新 list，身分檢查恆不成立。也就是說「防謊報的那一行」
 # 本身在完整一輪時會謊報【子集】。
 # 教訓與 M13 那段同源：**別用身分／存在與否去推導「我跑了幾項」，直接數。**
-# 用 len(_SELECTED) != len(MUTATIONS) 是從資料推導，不依賴任何旗標。
-_is_subset = len(_SELECTED) != len(MUTATIONS)
-_subset = (f"【子集：{len(_SELECTED)}/{len(MUTATIONS)} 個變異"
+# 第十輪：_SELECTED 變成 dict（key = suite），所以改成比總數 _SEL_N / _ALL_N
+# —— 仍然是從資料推導，不依賴任何旗標。
+_is_subset = _SEL_N != _ALL_N
+_subset = (f"【子集：{_SEL_N}/{_ALL_N} 個變異、"
+           f"{len(_SELECTED)}/{len(SUITES)} 個 suite"
            + (f"、每個連跑 {_REPEAT} 次" if _REPEAT > 1 else "") + "】") if _is_subset else ""
 print(f"\n✅ {len(results) - len(known)}/{len(results)} 個變異被逮捕"
       + (f"，{len(known)} 個為已知逃脫" if known else "，無逃脫") + _subset)
 if _is_subset:
-    print("   ⚠️ 這不是完整的一輪，不要把這一行當成 32 個變異的結論。")
+    print(f"   ⚠️ 這不是完整的一輪，不要把這一行當成 {_ALL_N} 個變異的結論。")
 sys.exit(0)
