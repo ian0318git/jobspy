@@ -32,5 +32,20 @@ logs/
 # 留著追蹤只會讓 git status 永遠 dirty，失去訊號價值。
 # 遺失的後果已確認可接受：回退到 SCHEDULE_DEFAULT，其 times 同為 06:00/22:00，
 # 唯一差異 interval_hours 在 mode="times" 下不會被讀取。
-# 注意：.job_statuses.json 相反，那是真實求職資料，刻意保留追蹤（等於免費備份）。
 .job_board_schedule.json
+
+# ── 求職追蹤資料（2026-09-30 改為不追蹤）────────────────────────────────────
+# 被推翻的原註解（2026-08-19 起，隨 .job_board_schedule.json 那條一起寫下）：
+#   # 注意：.job_statuses.json 相反，那是真實求職資料，刻意保留追蹤（等於免費備份）。
+#
+# 2026-09-30 改弦更張，原因只有一個：**這個 repo 是 PUBLIC**。
+# 於是「免費備份」與「公開你的求職紀錄」變成同一件事的兩種講法 ——
+# 內容含雇主 URL、Applied/Rejected/Interview 狀態、以及薪資期望的註記。
+# 當時已公開約 6 週（2026-08-19 進版控，只有 2 個 commit 動過它）。
+#
+# 保留在磁碟上、只是不進版控。job_board.py 有 os.path.exists 護欄且存檔時會重寫，
+# 所以取消追蹤不影響服務；git status 也不再永遠 dirty。
+# ⚠️ 這不等於資料從公開網路上消失：已推上去的那一版仍在 git 歷史裡，
+#    且 raw.githubusercontent.com 的 URL 仍可讀取。
+# ⚠️ 備份需求沒有消失，只是不該由公開 repo 承擔 —— 請改用私人位置。
+.job_statuses.json
