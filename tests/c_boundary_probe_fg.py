@@ -46,6 +46,8 @@ def die(msg):
 # `scheduler_loop()` 直接 return，每次執行都會印 `[scheduler] … DISABLED`），而且
 # 面板端也拒絕把 `enabled` 重新武裝（job_board.py:2204）。它擋的是「有人手改
 # `.job_board_schedule.json` **又**開了內部排程器」那個組合 —— 留著是保守，不是防線。
+# 三條拒絕路徑的**負向對照**在 `tests/guard_controls.sh`：它把探針與 job_board.py
+# 複製進隔離假樹、用假 systemctl 造出 active，一行指令可複查，不碰生產環境。
 _state_p = REPO / "logs/search_state.json"
 _sched_p = REPO / ".job_board_schedule.json"
 if _state_p.exists():
