@@ -7,7 +7,7 @@
 
   | suite | 生產檔 | 測試檔 | 變異數 |
   |---|---|---|---|
-  | `scan` | `job_board.py` | `tests/test_scan_lock.py` | 52 |
+  | `scan` | `job_board.py` | `tests/test_scan_lock.py` | 53 |
   | `location-filter` | `linkedin_job_search.py` | `tests/test_location_filter.py` | 5 |
   | `location-seek` | `jobspy/seek/__init__.py` | `tests/test_location_filter.py` | 3 |
 
@@ -625,6 +625,19 @@ MUTATIONS = [
          '            _log("[watchdog] 查詢 jobscan.service 狀態失敗 → 目前為 未知，"\n'
          '                 "沒有可終止的掃描")\n',
          "M52")),
+    # ── 第十三輪審查 NIT-2：把 m-2 的【裁決本身】也釘住 ──────────────────────
+    # M50–M52 守的是措辭。措辭之所以重要，是因為它描述的【行為】是
+    # 「查詢失敗 → 落回 PID 路徑 → 可能真的開槍」。這條變異直接把那個行為改掉：
+    # 採 reviewer 當年提的選項 (甲)（`act is None` 就 return None，不落 PID 路徑）。
+    # 若 NIT-6 只是測字串，它會逃脫；reviewer 已用同樣的改動驗過會 4 項 FAIL。
+    ("M53", "【第十三輪 NIT-2】查詢失敗改採選項（甲）：不落 PID 路徑（m-2 裁決被推翻）",
+     lambda t: sub_once(
+         t,
+         '        elif act is None:\n',
+         '        elif act is None:\n'
+         '            _record_stall_verdict(False, "查不到 unit 狀態，不接手")\n'
+         '            return None\n',
+         "M53")),
 ]
 
 
