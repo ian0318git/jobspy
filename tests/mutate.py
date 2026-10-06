@@ -7,7 +7,7 @@
 
   | suite | 生產檔 | 測試檔 | 變異數 |
   |---|---|---|---|
-  | `scan` | `job_board.py` | `tests/test_scan_lock.py` | 32 |
+  | `scan` | `job_board.py` | `tests/test_scan_lock.py` | 48 |
   | `location-filter` | `linkedin_job_search.py` | `tests/test_location_filter.py` | 5 |
   | `location-seek` | `jobspy/seek/__init__.py` | `tests/test_location_filter.py` | 3 |
 
@@ -573,6 +573,53 @@ MUTATIONS = [
          '            "read_ok": False,\n',
          '',
          "M48")),
+    # ── 第十二輪退回（MAJOR-1）：C-1 的【機率版】───────────────────────────
+    # (c) 修好的是「整輪都沒讀到」；這一條打的是「讀到了，但是上一輪的位元組」。
+    # run_scan.sh 先取鎖、才 : > "$LIVE"，中間隔 4.6–15.4ms（n=18 實測）。
+    # watcher 每 5s 一個 tick，落進去（約 0.1%）就會 reset（offset=0、read_ok=False）
+    # 之後立刻讀到【舊的位元組】→ read_ok 在這一輪還沒產出任何東西時就被設成 True，
+    # 而截斷的 resync 只清 lines/offset/pending、不清 read_ok。
+    # 變異 = 把 offset 退回 0（第十二輪之前的行為），也就是讓「讀到舊位元組」重新
+    # 具備把 read_ok 設成 True 的能力。
+    # ⚠️ 這一條【必然】要抓得到，因為它對應的是真的會 SIGKILL 一個健康掃描的路徑：
+    #    負向對照實測（只退回這一行）→ 5 項 FAIL，且 syscall 清單裡真的有
+    #    systemctl --user kill --signal=SIGKILL jobscan.service。
+    ("M49", "【第十二輪 MAJOR-1】offset 退回 0（窗口內讀到的上一輪位元組算成本輪證據）",
+     lambda t: sub_once(
+         t,
+         '            "offset": _follow_from,\n',
+         '            "offset": 0,\n',
+         "M49")),
+    # ── 第十二輪 MINOR-2：把不確定講成結論的日誌 ────────────────────────────
+    # 這三條變異改的是【措辭】不是行為，看起來像瑣事 —— 但 MINOR-2 的裁決本體就是
+    # 措辭：舊句「不接手」在 _jobscan_unit_props() 裡是真的（它回 (None, None)），
+    # 放到整條路徑上就是假的 —— 呼叫端在 act is None 時落到 PID 路徑，
+    # 而那裡有自己的 cmdline 身分檢查與自己的存活閘門，**會真的開槍**。
+    # 留著那句就是製造另一種「把不確定講成結論」。
+    # 所以守它的方式不能是「原始碼裡有沒有那個字串」（那是測字串），NIT-6 是跑完整條
+    # 路徑、斷言日誌與【真的開槍】同時成立。下面三條各自拿掉其中一句的修正。
+    ("M50", "【第十二輪 MINOR-2】systemctl 非零退出那句退回『不接手』",
+     lambda t: sub_once(
+         t,
+         '        _log(f"[watchdog] 查詢 jobscan.service 狀態失敗（exit={r.returncode}），"\n'
+         '             f"無法確認 unit 在不在跑")\n',
+         '        _log(f"[watchdog] 查詢 jobscan.service 狀態失敗（exit={r.returncode}），不接手")\n',
+         "M50")),
+    ("M51", "【第十二輪 MINOR-2】systemctl 叫不起來那句退回『不接手』",
+     lambda t: sub_once(
+         t,
+         '        _log(f"[watchdog] 查詢 jobscan.service 狀態失敗（{e}），"\n'
+         '             f"無法確認 unit 在不在跑")\n',
+         '        _log(f"[watchdog] 查詢 jobscan.service 狀態失敗（{e}），不接手")\n',
+         "M51")),
+    ("M52", "【第十二輪 MINOR-2】呼叫端那句退回『沒有可終止的掃描』（宣稱我們不知道的事）",
+     lambda t: sub_once(
+         t,
+         '            _log("[watchdog] 查詢 jobscan.service 狀態失敗 → 無法確認 unit 在不在跑，"\n'
+         '                 "改走 PID 路徑（並受 cmdline 身分檢查）")\n',
+         '            _log("[watchdog] 查詢 jobscan.service 狀態失敗 → 目前為 未知，"\n'
+         '                 "沒有可終止的掃描")\n',
+         "M52")),
 ]
 
 
@@ -667,7 +714,7 @@ class Suite:
 #   那不是量尺壞了，是【校準的假設不適用於這種測試檔形狀】。
 #
 #   改成宣告常數之後兩件事一起變好：
-#     1. 兩種形狀都適用（掃描鎖的 90 也是宣告值）。
+#     1. 兩種形狀都適用（掃描鎖的 142 也是宣告值）。
 #     2. 它其實【更強】：AST 那條自己承認「抓不到有人把某個 check() 整個刪掉」
 #        （呼叫點與印出項數一起變少），而宣告值會抓到 —— 條數對不上就中止。
 #   代價是新增測試時必須一起改這個數字。這個代價是刻意選的：那正是本專案
@@ -676,7 +723,7 @@ class Suite:
 #   （宣告值 < 呼叫點數 = 這個數字寫錯了）。
 SUITES = (
     Suite("scan", "掃描鎖", "job_board.py", "tests/test_scan_lock.py",
-          tuple(MUTATIONS), frozenset(EXPECTED_ESCAPES), 128),
+          tuple(MUTATIONS), frozenset(EXPECTED_ESCAPES), 142),
     Suite("location-filter", "地點過濾器", "linkedin_job_search.py",
           "tests/test_location_filter.py",
           tuple(LOCATION_FILTER_MUTATIONS), frozenset(), 57),
@@ -787,7 +834,8 @@ _SUITE_KEYS = [s.key for s in SUITES]
 
 # ⚠️ 第十輪審查 MINOR-1：這裡原本把 `JOBSPY_MUTATE_SUITE` 當成【選 suite 的篩選器】，
 #    但實作只拿它決定 `JOBSPY_MUTATE_TEST` 要覆蓋哪一個 suite 的測試檔 ——
-#    於是 README 寫著「只跑其中一個 suite」，實際跑出來還是掃描鎖那 32 個。
+#    於是 README 寫著「只跑其中一個 suite」，實際跑出來還是掃描鎖那 32 個
+#    （32 是第十輪當時的數目，不是現在的 —— 現行見檔頭的表）。
 #    那是本專案最常抓的形狀：**宣告 > 實際**，而且是我自己剛寫的文件。
 #
 #    修法刻意【不是】讓 `JOBSPY_MUTATE_SUITE` 兼做篩選：它的預設值是

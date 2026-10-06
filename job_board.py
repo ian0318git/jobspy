@@ -840,10 +840,18 @@ def _jobscan_unit_props():
             env={**os.environ, "LC_ALL": "C"},
         )
     except (OSError, subprocess.SubprocessError) as e:
-        _log(f"[watchdog] 查詢 jobscan.service 狀態失敗，不接手: {e}")
+        # [第十二輪 MINOR-2] 這裡原本寫「不接手」。那是對的【對本函式】而言（本函式
+        # 回 (None, None)），但看整條路徑就是錯的：呼叫端在 act is None 時會落到
+        # PID 路徑，而那裡有自己的 cmdline 身分檢查與自己的存活閘門 —— **可能真的
+        # 動手**。於是同一秒的日誌會先說「不接手」再說「改走 PID 路徑」，然後真的
+        # 殺掉一個行程。留下那句就是在製造另一種「把不確定講成結論」。
+        # 這一句只描述【這次查詢的結果】，由呼叫端負責講接下來怎麼走。
+        _log(f"[watchdog] 查詢 jobscan.service 狀態失敗（{e}），"
+             f"無法確認 unit 在不在跑")
         return None, None
     if r.returncode != 0:
-        _log(f"[watchdog] 查詢 jobscan.service 狀態失敗（exit={r.returncode}），不接手")
+        _log(f"[watchdog] 查詢 jobscan.service 狀態失敗（exit={r.returncode}），"
+             f"無法確認 unit 在不在跑")
         return None, None
     props = {}
     for line in r.stdout.splitlines():
@@ -1196,6 +1204,28 @@ def _reset_external_follow(state):
     # 放在臨界區【之前】：_record_stall_verdict 不碰 _EXTERNAL，不需要鎖，
     # 先清掉也讓「判定」與「新一輪開始」在時間上不會交錯。
     _record_stall_verdict(False, "新的一輪剛開始，watchdog 尚未對它作出判定")
+    # [第十二輪 MAJOR-1] 從【偵測當下的水位】開始讀，不是從 0。
+    #
+    # 為什麼：run_scan.sh 的順序是「先取鎖（lock 可見）→ 才 : > "$LIVE" 截斷」，
+    # 中間隔著好幾毫秒（實測 4.6–15.4ms）。watcher 每 5 秒一個 tick，若某個 tick
+    # 剛好落在那個窗口裡，它會先 _reset_external_follow()（read_ok=False、offset=0），
+    # 緊接著 _follow_live_log() 讀到的卻是【上一輪留下的位元組】—— 於是 read_ok
+    # 在【新的一輪還沒產出任何東西】的時候就被設成 True。
+    # 新的一輪若整輪寫不進去（#16 的 C 段），截斷時的 resync 只清 lines/offset/pending、
+    # 不清 read_ok，於是整輪 read_ok 都是 True，900 秒後三個條件全部滿足 →
+    # SIGKILL 掉一個健康掃描。【(c) 的洞就在這裡，機率約 5ms/5s。】
+    #
+    # 修法：把「本輪的證據」定義成【晚於偵測水位的位元組】。水位之後才長出來的
+    # 內容才算這一輪的產出；水位之前的位元組（= 上一輪的殘留）一律不算。
+    # 截斷造成的 size < off resync 照舊（那條路徑會把 lines 一起清掉）。
+    #
+    # 代價（誠實記錄）：偵測前已寫入的頭幾行不會進主控台預覽，也不計為存活證據。
+    # 所以在這個窗口裡開跑、且 5 秒內就卡死的掃描會落到 (c) 拒絕 —— 方向是安全的那邊
+    # （漏殺，晚 5 小時逾時），而且只有落在窗口裡（約 0.1%）才會發生。
+    try:
+        _follow_from = os.path.getsize(JOBSCAN_LIVE)
+    except OSError:
+        _follow_from = 0
     with SEARCH_LOCK:
         _EXTERNAL.update({
             "active": True,
@@ -1205,7 +1235,7 @@ def _reset_external_follow(state):
             "started_at": state.get("started_at"),
             "lines": [],
             "pending": "",
-            "offset": 0,
+            "offset": _follow_from,
             "last_read_at": time.monotonic(),
             # 新的一輪 = 我們對它還【一個字都沒讀到】。這個旗標是 C-1 的閘門依據：
             # 沒有它就分不出「掃描真的卡死」與「看板自己的讀取路徑壞掉」。
@@ -1286,6 +1316,11 @@ def _follow_live_log():
             # 讀到【非空】的內容才算「本輪讀得到」。這是 read_ok 唯一的設定點，
             # 刻意與 last_read_at 綁在同一個 if 裡：兩者都只在真的收到資料時前進，
             # 所以「read_ok 為真」等價於「last_read_at 有被本輪推過至少一次」。
+            #
+            # [第十二輪 MAJOR-1] 「讀到東西」還不夠，必須是【本輪的東西】。
+            # 保證來自 offset 的起點：_reset_external_follow() 把它設在偵測當下的
+            # 水位，所以這裡讀到的位元組必定晚於偵測（見該函式的四段說明）。
+            # 少了那個起點，下面這一行就會把【上一輪殘留的位元組】當成本輪的證據。
             _EXTERNAL["read_ok"] = True
 
 

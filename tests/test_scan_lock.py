@@ -2065,6 +2065,175 @@ try:
 finally:
     os.unlink(_c1_live.name)
 
+# ═══ MAJOR-1（第十二輪）：讀到的位元組是【上一輪】的 ══════════════════════════
+#
+# 這是 C-1 的機率版，也是本輪退回的主因。現場是：
+#
+#   run_scan.sh：先取鎖（lock 可見）→ …4.6–15.4ms… → : > "$LIVE" 截斷
+#   watcher   ：每 5 秒一個 tick
+#
+# 若某個 tick 落在那個窗口裡，它會先 _reset_external_follow()（read_ok=False），
+# 緊接著 _follow_live_log() 讀到的卻是【上一輪留下的位元組】→ read_ok=True。
+# 新的一輪若整輪寫不進去（#16 的 C 段），截斷造成的 resync 只清
+# lines/offset/pending、【不清 read_ok】→ 整輪 read_ok 恆為 True →
+# (a)(b)(c) 三個條件同時成立 → SIGKILL 掉一個健康掃描。
+#
+# 修法：_reset_external_follow() 把 offset 設在【偵測當下的水位】，位元組必須
+# 晚於偵測才算本輪的證據。下面這一節就是那個窗口的縮時重演。
+
+_c12_live = tempfile.NamedTemporaryFile("w", suffix=".log", delete=False)
+_c12_live.write("上一輪留下的輸出：這一行【不是】新的一輪寫的\n")
+_c12_live.close()
+try:
+    with mock.patch.object(jb, "JOBSCAN_LIVE", _c12_live.name):
+        jb._reset_external_follow({"run_id": "window_round", "trigger": "systemd-timer",
+                                   "started_at": None})
+        check("【MAJOR-1】偵測當下的水位必須成為 offset 的起點（不是 0）",
+              jb._EXTERNAL["offset"] == os.path.getsize(_c12_live.name),
+              f"offset={jb._EXTERNAL['offset']} 檔案大小={os.path.getsize(_c12_live.name)}")
+        # 窗口重演：截斷還沒發生，同一個 tick 緊接著跟讀
+        jb._follow_live_log()
+        check("【MAJOR-1】窗口內讀到的【上一輪位元組】不得被當成本輪的證據",
+              jb._EXTERNAL["read_ok"] is False, f"得到={jb._EXTERNAL['read_ok']!r}")
+        # 接著才截斷（run_scan.sh 的 : > "$LIVE"）並產出內容 → 這時才算本輪的
+        with open(_c12_live.name, "w") as f:
+            f.write("新的一輪開始產出\n第二行\n")
+        jb._follow_live_log()
+        check("【MAJOR-1】（對照）截斷後新寫的內容【必須】被算成本輪的證據",
+              jb._EXTERNAL["read_ok"] is True, f"得到={jb._EXTERNAL['read_ok']!r}")
+finally:
+    os.unlink(_c12_live.name)
+
+# 旗標對了還不夠 —— 要一路走到【不送出 SIGKILL】才算數。
+# 這一節把窗口現場整個搬進整合路徑：先讓 _reset_external_follow 在舊內容還在時
+# 偵測到新的一輪（read_ok=False，正確），然後用「目標很老、idle 超過門檻」
+# 去呼叫真正的 kill_stalled_external()。舊版在這裡會因為 read_ok=True 而開槍。
+_c12_syscalls = []
+
+
+def _fake_run_c12(cmd, **kw):
+    _c12_syscalls.append(cmd)
+    if "ExecMainStartTimestampMonotonic" in cmd:
+        return _FakeRunKill(stdout=_unit_stdout("activating", 99999))
+    return _FakeRunKill()
+
+
+_c12_live2 = tempfile.NamedTemporaryFile("w", suffix=".log", delete=False)
+_c12_live2.write("上一輪留下的輸出\n")
+_c12_live2.close()
+try:
+    with mock.patch.object(jb, "JOBSCAN_LIVE", _c12_live2.name):
+        jb._reset_external_follow({"run_id": "window_gate", "trigger": "systemd-timer",
+                                   "started_at": None})
+        jb._follow_live_log()          # ← 窗口：讀到的是上一輪的位元組
+        with mock.patch.object(jb, "read_jobscan_state",
+                               return_value={"phase": "running", "pid": 999999,
+                                             "run_id": "window_gate",
+                                             "trigger": "systemd-timer"}):
+            with mock.patch.object(jb, "_external_idle_seconds", return_value=_F7_IDLE):
+                with mock.patch.object(jb, "_we_hold_scan_lock", return_value=False):
+                    with mock.patch.object(jb.subprocess, "run", side_effect=_fake_run_c12):
+                        _c12_res = _REAL_KILL_EXTERNAL()
+finally:
+    os.unlink(_c12_live2.name)
+check("【MAJOR-1】窗口情境下必須拒絕動手（否則就是 C-1 的機率版重演）",
+      _c12_res is None, f"回傳={_c12_res!r}")
+check("【MAJOR-1】且不得送出任何 kill —— 這一項在修好 offset 之前會失敗",
+      [c for c in _c12_syscalls if "kill" in c] == [], f"實際呼叫={_c12_syscalls}")
+check("【MAJOR-1】拒絕理由必須指向讀取路徑（不是『目標太年輕』——它很老）",
+      "從未從 live log 讀到任何輸出" in jb._STALL_VERDICT["note"],
+      f"判定={jb._STALL_VERDICT['note']!r}")
+
+
+# ═══ NIT-6（第十二輪）：systemctl 查詢失敗 → 落回 PID 路徑的契約 ════════════════
+#
+# [第十二輪 MINOR-2] 把 _jobscan_unit_props() 的兩句「不接手」改成
+# 「無法確認 unit 在不在跑」。改的是【措辭】，但措辭在這裡是有後果的：
+# 「不接手」是對本函式成立、對整條路徑不成立的敘述 —— 呼叫端在 act is None 時
+# 會落到 PID 路徑，那裡有自己的 cmdline 身分檢查與自己的存活閘門，**可能真的開槍**。
+# 同一秒的日誌先說「不接手」、再說「改走 PID 路徑」、然後真的殺掉一個行程，
+# 就是另一種「把不確定講成結論」。
+#
+# 所以這一項不能只斷言「原始碼裡有那個字串」（那是測字串，不是測行為），
+# 而是把整條路徑跑完，一次釘住三件事：
+#   (1) 日誌說的是「無法確認」，不是「不接手」；
+#   (2) 它【真的】落到 PID 路徑（有那行「改走 PID 路徑」）；
+#   (3) 在身分與存活閘門都過的時候，它【真的】殺掉那個行程。
+# 第 (3) 點是重點：它證明「不接手」是錯的敘述。若哪天有人把 m-2 的裁決改回去
+# （查詢失敗就真的不接手），第 (3) 點會立刻失敗。
+print("=== NIT-6. 第十二輪：systemctl 查詢失敗後落回 PID 路徑 ===")
+
+
+class _FakeRunFail:
+    """systemctl 回非零、stdout 空 —— 「查詢失敗」，不是「unit 不在跑」。
+
+    定義在這裡（第一次使用處），後面的 H5 也用它。
+    """
+    returncode = 1
+    stdout = ""
+
+
+_n6_victim = spawn(sys.executable, "-c", "import time; time.sleep(600)",
+                              "/tmp/linkedin_job_search.py")
+time.sleep(0.5)
+_n6_pid = _n6_victim.pid
+_n6_syscalls = []
+_n6_log = io.StringIO()
+
+
+def _fake_run_n6(cmd, **kw):
+    _n6_syscalls.append(cmd)
+    # 關鍵：這是【查詢失敗】，不是「unit 不在跑」。兩者在舊版共用同一句話。
+    return _FakeRunFail()
+
+
+# 前提宣告（同 F7a）：本輪讀得到輸出，idle 才代表「目標沉默多久」。
+jb._EXTERNAL["read_ok"] = True
+
+with mock.patch.object(jb, "read_jobscan_state",
+                       return_value={"phase": "running", "pid": _n6_pid,
+                                     "run_id": "unit_fail_fallback",
+                                     "trigger": "systemd-timer"}):
+    with mock.patch.object(jb, "_external_idle_seconds", return_value=_F7_IDLE):
+        with mock.patch.object(jb, "_target_runtime_seconds", return_value=_F7_AGE):
+            with mock.patch.object(jb, "_we_hold_scan_lock", return_value=False):
+                with mock.patch.object(jb.subprocess, "run", side_effect=_fake_run_n6):
+                    with contextlib.redirect_stdout(_n6_log):
+                        _n6_fired = _REAL_KILL_EXTERNAL()
+_n6_out = _n6_log.getvalue()
+
+check("systemctl 查詢失敗時，日誌必須說『無法確認 unit 在不在跑』",
+      "無法確認 unit 在不在跑" in _n6_out, f"日誌={_n6_out!r}")
+check("（承上）且【不得】說「不接手」—— 那對整條路徑是假的（它可能真的動手）",
+      "不接手" not in _n6_out, f"日誌={_n6_out!r}")
+check("（承上）且必須真的落到 PID 路徑",
+      "改走 PID 路徑" in _n6_out, f"日誌={_n6_out!r}")
+check("（承上）身分與存活閘門都過時必須真的開槍 —— 這一項證明『不接手』是錯的敘述",
+      _n6_fired is not None and str(_n6_pid) in _n6_fired
+      and "unit_fail_fallback" in _n6_fired,
+      f"回傳={_n6_fired!r}（PID 路徑的回傳格式是 'PID <pid>… (run_id=…)'）")
+check("（承上）目標必須真的死亡",
+      wait_dead(_n6_victim, 5), f"poll={_n6_victim.poll()}")
+check("（承上）PID 路徑不得對 systemd 送出任何 kill（查詢失敗就沒有可信的 unit 對象）",
+      [c for c in _n6_syscalls if "kill" in c] == [], f"實際呼叫={_n6_syscalls}")
+
+# ⚠️ MINOR-2 改的是【兩行】日誌，上面那組只走到「systemctl 回非零」那一行。
+# 另一行（systemctl 根本叫不起來 → OSError）在補這一節之前【沒有任何測試覆蓋】：
+# 全套 grep 不到任何讓 show 拋例外的測試。只守兩行中的一行，正是本專案反覆出現的
+# 「修正一個缺陷時把另一個缺陷的覆蓋一起弄丟」—— 所以另一行也補一條。
+_n6_log2 = io.StringIO()
+with mock.patch.object(jb.subprocess, "run",
+                       side_effect=OSError("systemctl 不存在")):
+    with contextlib.redirect_stdout(_n6_log2):
+        _st6x, _rt6x = jb._jobscan_unit_props()
+_n6_out2 = _n6_log2.getvalue()
+check("systemctl 叫不起來（OSError）時，日誌同樣必須說『無法確認』且不得說『不接手』",
+      "無法確認 unit 在不在跑" in _n6_out2 and "不接手" not in _n6_out2,
+      f"日誌={_n6_out2!r}")
+check("（承上）且必須回 (None, None)（查詢失敗不是『unit 不在跑』）",
+      (_st6x, _rt6x) == (None, None), f"得到={(_st6x, _rt6x)!r}")
+
+
 # H4：fail closed —— 判定不出來的時候必須倒向【不殺】，不是倒向放行。
 # SIGKILL 不可逆，所以「不確定」的唯一安全方向是拒絕。
 _h_dead = subprocess.Popen([sys.executable, "-c", "pass"])
@@ -2132,11 +2301,7 @@ check("（防禦）idle 未達門檻時必須拒絕，即使 runtime 很大",
 # [第十輪審查 NIT-1] 查詢已合併成一次，回應是 `key=value` 逐行解析。這裡要把
 # 【state 與 runtime 互相獨立】也測到 —— ActiveState 正常但時間戳壞掉時，
 # state 必須仍然拿得到，因為呼叫端對「unit 不在跑」與「查詢失敗」的處理不同。
-class _FakeRunFail:
-    returncode = 1
-    stdout = ""
-
-
+# （`_FakeRunFail` 定義在 NIT-6 那一節，那是它的第一次使用處。）
 for _bad in ("", "activating\n", "0\n", "n/a\n", "ActionState=typo\n"):
     with mock.patch.object(jb.subprocess, "run",
                            side_effect=lambda *a, _s=_bad, **k: _FakeRunKill(stdout=_s)):
