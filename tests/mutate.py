@@ -186,6 +186,20 @@ def sub_once(text, old, new, label):
     return text.replace(old, new)
 
 
+# ── kill_stalled_external 開頭那一段 ─────────────────────────────────────────
+# M8（整個函式 no-op）與 M29（只拿掉持鎖前置檢查）共用這個錨點。
+# 2026-10-06 第十輪退回時，那一行 `return None` 前面多插了一次
+# `_record_stall_verdict(...)`，於是【兩個變異同時 ANCHOR-FAIL】——
+# harness 把它們列成「無法判定」，而不是靜靜地當成通過。抽成常數之後，
+# 以後再改那段只會有一個地方要跟著動。
+_HOLD_GATE_ANCHOR = (
+    '    if _we_hold_scan_lock():\n'
+    '        _record_stall_verdict(False, "掃描鎖在我們手上（互斥），沒有外部掃描")\n'
+    '        return None\n'
+    '    idle = _external_idle_seconds()\n'
+)
+
+
 # (id, 標籤, 變異函式)。id 與標籤分開，讓 EXPECTED_ESCAPES 綁在明確的 id 上，
 # 而不是從標籤字串切出第一個詞（否則任何以 "M13" 開頭的新標籤都會被自動豁免）。
 MUTATIONS = [
@@ -198,8 +212,14 @@ MUTATIONS = [
     ("M3", "拿掉 errors=replace", lambda t: sub_once(
         t, '                errors="replace",\n', "", "M3")),
     ("M4", "拿掉 phase 閘門", lambda t: sub_once(
-        t, '    if state.get("phase") != "running":\n        return None\n\n    run_id, trigger, pid',
-        "    run_id, trigger, pid", "M4")),
+        t,
+        '''    if state.get("phase") != "running":
+        _record_stall_verdict(
+            False, f"state 自稱 {state.get('phase')!r}，不是進行中的掃描")
+        return None
+
+''',
+        "", "M4")),
     ("M5", "拿掉 cmdline 身分檢查", lambda t: sub_once(
         t, "        if _pid_is_our_scan(pid):\n", "        if True:\n", "M5")),
     ("M6", "拿掉 ActiveState 前置檢查", lambda t: sub_once(
@@ -211,12 +231,15 @@ MUTATIONS = [
         t, '    if state.get("phase") != "running":\n        # 來源不明的鎖持有者',
         '    if False:\n        # 來源不明的鎖持有者', "M7")),
     ("M8", "kill_stalled_external 整個 no-op", lambda t: sub_once(
-        t, "    if _we_hold_scan_lock():\n        return None\n    idle = _external_idle_seconds()\n",
-        "    return None\n    if _we_hold_scan_lock():\n        return None\n    idle = _external_idle_seconds()\n",
-        "M8")),
+        t, _HOLD_GATE_ANCHOR, "    return None\n" + _HOLD_GATE_ANCHOR, "M8")),
     ("M9", "拿掉 TOCTOU 重檢", lambda t: sub_once(
-        t, "    if _we_hold_scan_lock():\n        return None\n\n    target = None\n",
-        "    target = None\n", "M9")),
+        t,
+        '''    if _we_hold_scan_lock():
+        _record_stall_verdict(False, "動手前我們取得了掃描鎖，放棄（TOCTOU 重檢）")
+        return None
+
+''',
+        "", "M9")),
     ("M10", "_pid_is_our_scan 退回子字串比對", lambda t: sub_once(
         t,
         '    exe = os.path.basename(argv[0])\n    if exe == "run_scan.sh":\n        return True\n',
@@ -361,9 +384,8 @@ MUTATIONS = [
     # SIGKILL —— 那正是 F4 當初的近失事故。它現在能被安全地測，就是 MINOR-1 的價值。
     ("M29", "拿掉 kill_stalled_external 的持鎖前置檢查（可能殺掉自己的掃描）",
      lambda t: sub_once(
-         t,
-         "    if _we_hold_scan_lock():\n        return None\n    idle = _external_idle_seconds()\n",
-         "    idle = _external_idle_seconds()\n", "M29")),
+         t, _HOLD_GATE_ANCHOR,
+         '    idle = _external_idle_seconds()\n', "M29")),
 
     # MINOR-2：把消毒整個拿掉，退回「讀取端直接對值呼叫 .get()」的狀態。
     # 這正是審查員證實的那個不可達守衛 —— 症狀是每 30 秒一行的
@@ -429,27 +451,28 @@ MUTATIONS = [
     ("M34", "只拿掉 systemd 路徑的存活閘門（回復 06:01 誤殺）",
      lambda t: sub_once(
          t,
-         '            refusal = _stall_gate_refusal(\n'
-         '                _jobscan_unit_runtime_seconds(), idle, "jobscan.service")\n',
-         '            refusal = None\n'
-         '            _stall_gate_refusal(\n'
-         '                _jobscan_unit_runtime_seconds(), idle, "jobscan.service")\n',
+         '            refusal = _stall_gate_refusal(unit_runtime, idle, "jobscan.service")\n',
+         '            refusal = None\n',
          "M34")),
     ("M35", "只拿掉 PID 路徑的存活閘門（手動掃描失去唯一的存活判準）",
      lambda t: sub_once(
          t,
          '            refusal = _stall_gate_refusal(\n'
          '                _target_runtime_seconds(pid), idle, f"pid={pid}")\n',
-         '            refusal = None\n'
-         '            _stall_gate_refusal(\n'
-         '                _target_runtime_seconds(pid), idle, f"pid={pid}")\n',
+         '            refusal = None\n',
          "M35")),
-    ("M36", "存活閘門邊界差一格（< 改成 <=）",
+    ("M36", "存活閘門邊界差一格（runtime < idle 改成 <=）",
      lambda t: sub_once(
          t,
-         '    if runtime < SEARCH_STALL_TIMEOUT:\n',
-         '    if runtime <= SEARCH_STALL_TIMEOUT:\n',
+         '    if runtime < idle:\n',
+         '    if runtime <= idle:\n',
          "M36")),
+    # ⚠️ 第十輪退回時這一條【逃脫過一次】，原因值得記下來。
+    # 它原本把「runtime 未知」替換成 `runtime = SEARCH_STALL_TIMEOUT + 1`(=901)。
+    # 舊判準是拿固定門檻比，901 >= 900 就會放行，所以測得出來。
+    # 判準改成拿 idle 比之後，901 配上任何真實的 idle（門檻以上、可能是好幾小時）
+    # 都會被拒絕 —— 替換本身不再造成 fail-open，測試自然就抓不到了。
+    # 這是【變異沒有跟著判準一起更新】。改成忠實版本：直接假裝目標已經夠老。
     ("M37", "查不出年齡時倒向放行而不是拒絕（fail open）",
      lambda t: sub_once(
          t,
@@ -457,7 +480,7 @@ MUTATIONS = [
          '        return (f"[watchdog] 無法判定 {what} 已跑多久 → 不動手"\n'
          '                f"（state 自稱卡死，但無法排除是看板自己的讀取時鐘過期）")\n',
          '    if runtime is None:\n'
-         '        runtime = SEARCH_STALL_TIMEOUT + 1\n',
+         '        runtime = idle + 1\n',      # 假裝目標已經跑得比沉默時間還久
          "M37")),
     ("M38", "/proc/<pid>/stat 取錯欄位（starttime 索引 19 → 18）",
      lambda t: sub_once(
@@ -468,9 +491,56 @@ MUTATIONS = [
     ("M39", "systemd 的微秒沒換算成秒（runtime 恆為大負數 → 矯正成不殺）",
      lambda t: sub_once(
          t,
-         '    return time.monotonic() - start_us / 1_000_000\n',
-         '    return time.monotonic() - start_us\n',
+         '    return state, time.monotonic() - start_us / 1_000_000\n',
+         '    return state, time.monotonic() - start_us\n',
          "M39")),
+
+    # ── 第十輪審查退回（MAJOR-1 / MINOR-2 / NIT-1 / NIT-4）─────────────────────
+    # 這幾條守的是【第一版修法自己種下的缺陷】：
+    #   M40 判準拿固定門檻比而不是拿 idle 比 → 誤殺只是延後到 T+900s
+    #   M41/M42 時鐘基準不一致的兩種方向（少算 = 偏嚴、多算 = 偏鬆/fail-open）
+    #   M43 判定被後面的分支蓋掉 → UI 看不到真正的結論
+    #   M44 ActiveState 解析失效 → systemd 分支整個不執行
+    #   M45 非零退出被照單全收 → 拿垃圾值去比大小
+    ("M40", "【第十輪 MAJOR-1】判準退回固定門檻（runtime < SEARCH_STALL_TIMEOUT）",
+     lambda t: sub_once(
+         t,
+         '    if runtime < idle:\n',
+         '    if runtime < SEARCH_STALL_TIMEOUT:\n',
+         "M40")),
+    ("M41", "【第十輪 MINOR-2】拿掉 BOOTTIME→MONOTONIC 的校正（suspend 後偏鬆）",
+     lambda t: sub_once(
+         t,
+         '    return uptime - start_ticks / hz - max(0.0, boottime_minus_monotonic)\n',
+         '    return uptime - start_ticks / hz\n',
+         "M41")),
+    ("M42", "【第十輪 MINOR-2】校正方向搞反（改成加上 suspend 總量）",
+     lambda t: sub_once(
+         t,
+         '    return uptime - start_ticks / hz - max(0.0, boottime_minus_monotonic)\n',
+         '    return uptime - start_ticks / hz + max(0.0, boottime_minus_monotonic)\n',
+         "M42")),
+    ("M43", "【第十輪 NIT-4】watchdog 判定改成後講後贏（前面的結論被蓋掉）",
+     lambda t: sub_once(
+         t,
+         '        if verdict is None:\n'
+         '            verdict = (stalled, note)\n',
+         '        verdict = (stalled, note)\n',
+         "M43")),
+    ("M44", "【第十輪 NIT-1】ActiveState 解析失效（systemd 分支永遠不執行）",
+     lambda t: sub_once(
+         t,
+         '    state = props.get("ActiveState") or None\n',
+         '    state = None\n',
+         "M44")),
+    ("M45", "【第十輪 NIT-1】systemctl 非零退出被照單全收（fail open）",
+     lambda t: sub_once(
+         t,
+         '    if r.returncode != 0:\n'
+         '        _log(f"[watchdog] 查詢 jobscan.service 狀態失敗（exit={r.returncode}），不接手")\n'
+         '        return None, None\n',
+         '',
+         "M45")),
 ]
 
 
@@ -574,7 +644,7 @@ class Suite:
 #   （宣告值 < 呼叫點數 = 這個數字寫錯了）。
 SUITES = (
     Suite("scan", "掃描鎖", "job_board.py", "tests/test_scan_lock.py",
-          tuple(MUTATIONS), frozenset(EXPECTED_ESCAPES), 104),
+          tuple(MUTATIONS), frozenset(EXPECTED_ESCAPES), 116),
     Suite("location-filter", "地點過濾器", "linkedin_job_search.py",
           "tests/test_location_filter.py",
           tuple(LOCATION_FILTER_MUTATIONS), frozenset(), 57),

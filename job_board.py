@@ -794,48 +794,94 @@ def _pid_is_our_scan(pid):
     return False
 
 
-def _jobscan_unit_runtime_seconds():
-    """jobscan.service 這一輪【實際已經跑】的秒數；無法判斷回 None。
+def _jobscan_unit_props():
+    """一次問完 jobscan.service 的 (ActiveState, 已跑秒數)；任一項拿不到就是 None。
+
+    state 與 runtime 拿不到是【獨立】的兩件事，呼叫端必須分得出來：
+    state 有值但不是 active/activating → unit 不在跑，沒有對象可終止；
+    state 為 None → 查詢失敗，此時【不該動手】（送的是不可逆的 SIGKILL）。
 
     權威來源是 systemd：unit 自己知道它是何時被啟動的，不受看板自己的
     _EXTERNAL 狀態陳舊影響 —— 那正是 2026-10-06 事故的成因，見
     kill_stalled_external 的存活閘門。
 
     「無法判斷」與「確定在跑」必須區分：查詢失敗、unit 從未啟動、值為空或
-    非正數，一律回 None。呼叫端據此【不動手】—— 要送的是不可逆的 SIGKILL。
+    非正數，runtime 一律回 None。
 
     已實測 Python 的 time.monotonic() 與 systemd 的
     ExecMainStartTimestampMonotonic 同源（皆為 CLOCK_MONOTONIC、以開機為零點）：
     2026-10-06 量到 systemd=565101006333µs、python=566406154284µs，差 1305.1s，
     與掃描行程的 etime 21:45 相符。VM 的 suspend 不會讓兩者分歧，因為
     CLOCK_MONOTONIC 在 suspend 期間本來就不前進，兩邊一致地不計入。
+    （PID 路徑就不是這樣了 —— 那裡讀的是 CLOCK_BOOTTIME 家族，見
+    _target_runtime_seconds 的校正。兩條路徑的 runtime 都與 idle 同基準。）
+
+    [第十輪審查 NIT-1] 原本這是【兩次】獨立的 systemctl show（ActiveState 一次、
+    ExecMainStartTimestampMonotonic 一次）。兩次之間 unit 可能剛好結束或重啟，
+    於是「狀態說在跑」與「啟動時間」來自不同世代，算出來的 runtime 沒有意義
+    （方向是往偏小偏、閘門會拒絕，所以安全，但日誌會說謊）。一次問完沒有這個縫。
     """
     try:
-        out = subprocess.run(
+        r = subprocess.run(
             ["systemctl", "--user", "show", "jobscan.service",
-             "-p", "ExecMainStartTimestampMonotonic", "--value"],
+             "-p", "ActiveState",
+             "-p", "ExecMainStartTimestampMonotonic"],
             capture_output=True, text=True, timeout=10,
             env={**os.environ, "LC_ALL": "C"},
-        ).stdout.strip()
-        start_us = int(out)
-    except (OSError, subprocess.SubprocessError, ValueError):
-        return None
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        _log(f"[watchdog] 查詢 jobscan.service 狀態失敗，不接手: {e}")
+        return None, None
+    if r.returncode != 0:
+        _log(f"[watchdog] 查詢 jobscan.service 狀態失敗（exit={r.returncode}），不接手")
+        return None, None
+    props = {}
+    for line in r.stdout.splitlines():
+        key, sep, val = line.partition("=")
+        if sep:
+            props[key.strip()] = val.strip()
+    state = props.get("ActiveState") or None
+    try:
+        start_us = int(props["ExecMainStartTimestampMonotonic"])
+    except (KeyError, ValueError):
+        return state, None
     if start_us <= 0:
-        return None
-    return time.monotonic() - start_us / 1_000_000
+        return state, None
+    return state, time.monotonic() - start_us / 1_000_000
 
 
 def _target_runtime_seconds(pid):
     """目標掃描行程【已經跑了】的秒數；無法判斷回 None。
 
     讀 /proc/<pid>/stat 第 22 欄 starttime（自開機起的 clock tick 數），再對照
-    /proc/uptime —— 兩者同源，不涉及跨時鐘換算。
+    /proc/uptime —— 兩者同源（都是 CLOCK_BOOTTIME 家族：kernel 的
+    fs/proc/uptime.c 用 ktime_get_boottime_ts64()、stat 用 task->start_boottime），
+    彼此換算不跨時鐘。
+
+    ⚠️ 這個「同屬 BOOTTIME」的歸屬是讀 kernel 實作得到的，【本機無法用實驗區分】——
+    沒有 suspend 時 BOOTTIME 與 MONOTONIC 完全相等（2026-10-06 實測差 0.000s）。
+    所以下面的校正【無法在本機被觀察到有沒有效】，只能靠 H1b 用假的 BOOTTIME 驗。
+
+    【但與 idle 的比較會跨時鐘】idle 來自 time.monotonic()，那是 CLOCK_MONOTONIC，
+    而 CLOCK_BOOTTIME 比它多算了 suspend 的時間。不校正的話，機器 suspend 一次就
+    會讓 runtime 憑空變大 → 閘門偏鬆 → 正是 2026-10-06 事故要根除的那個方向。
+    所以下面扣掉【開機至今的 suspend 總量】(= BOOTTIME - MONOTONIC)。
+
+    扣掉總量得到的是真實 MONOTONIC 年齡的【下界】：該行程生命期內發生的 suspend
+    一定 <= 開機至今的總量，所以 runtime 偏小 → 閘門偏嚴 → 拒絕動手。
+    這是刻意的：要送的是不可逆的 SIGKILL，不確定必須倒向不殺。
+    本機從未 suspend（2026-10-06 實測 BOOTTIME - MONOTONIC = 0.000s，uptime 6.6 天），
+    所以校正量為零，不改變現行行為。
+
+    CLOCK_BOOTTIME 取不到（非 Linux 的 Python）時回 None → 閘門拒絕動手。又是
+    同一個方向：算不出來就不要殺。
 
     為什麼 PID 路徑用這招而不是問 systemd：手動 `./run_scan.sh`（trigger=manual）
     在沒有 systemd 的環境下也必須能用，所以這條路徑【不准】依賴 systemctl。
     tests/test_scan_lock.py 有兩條測試在守這個約束（第五輪 F4b 與 F7a）。
     反過來說，systemd 路徑就該用 systemd 的答案 —— 那裡要收的是整個 cgroup，
-    而 wrapper 被 SIGKILL 後 /proc 就查不到了，unit 的啟動時間仍然有效。
+    而 wrapper 被 SIGKILL 後 /proc 就查不到了，unit 的啟動時間仍然有效，而且
+    ExecMainStartTimestampMonotonic 本來就是 CLOCK_MONOTONIC，不需要校正。
 
     實測：3.0s 的行程算出 3.01s；掃描 bash（etime 23:06）算出 1386.2s。
     """
@@ -847,12 +893,14 @@ def _target_runtime_seconds(pid):
         start_ticks = int(fields[19])          # 第 22 欄；扣掉 pid 與 comm 後索引 19
         with open("/proc/uptime") as f:
             uptime = float(f.read().split()[0])
-    except (OSError, ValueError, IndexError):
+        boottime_minus_monotonic = (
+            time.clock_gettime(time.CLOCK_BOOTTIME) - time.monotonic())
+    except (OSError, ValueError, IndexError, AttributeError):
         return None
     hz = os.sysconf("SC_CLK_TCK")
     if hz <= 0:
         return None
-    return uptime - start_ticks / hz
+    return uptime - start_ticks / hz - max(0.0, boottime_minus_monotonic)
 
 
 def _stall_gate_refusal(runtime, idle, what):
@@ -868,18 +916,63 @@ def _stall_gate_refusal(runtime, idle, what):
     pid 就是那一輪的 bash —— 所以 cmdline 身分檢查擋不住。問題不在「殺錯對象」，
     在「憑一個過期的時鐘斷定對方卡死」。
 
-    判準刻意用「不可能」而非「可疑」：一個行程不可能沉默得比自己存在的時間還久。
+    判準刻意用「不可能」而非「可疑」，而且【必須拿 idle 當比較對象】：
+      (a) idle 要真的超過門檻 —— 沉默不夠久就不叫卡死；
+      (b) runtime 要 >= idle —— 一個行程不可能沉默得比自己存在的時間還久。
+
+    ⚠️【第十輪審查 MAJOR-1】(b) 原本寫成 `runtime < SEARCH_STALL_TIMEOUT`，
+    拿的是【固定門檻】而不是 idle。呼叫端唯一的保證是 idle > 900，於是實際生效的
+    判準退化成「runtime >= 900 且 idle > 900」—— 而 stale 的 idle 可以是好幾小時。
+    結果是閘門會放行殺掉一個【只跑了 900 秒】的健康掃描：事故機制原封不動，
+    誤殺只是從 T+16s 延後到 T+900s，而 900s 正落在 19–23 分鐘掃描的常態區間內。
+    更糟的是當時的測試把 `_stall_gate_refusal(900, 99999) is None` 寫成必須成立，
+    等於在【為錯的判準背書、並擋住正確的修法】。現在那條改成必須【拒絕】。
+
+    (a) 在呼叫端已經先擋過一次（idle <= SEARCH_STALL_TIMEOUT 就 return None）。
+    這裡再驗一次是防禦性的：本函式是純函式，不該假設呼叫端永遠先過濾。
+
     runtime 拿不到一律不動手 —— 要送的是不可逆的 SIGKILL，不確定必須倒向不殺。
     真正卡死的掃描仍有 systemd 的 TimeoutStartSec=5h 當退路（DECISIONS.md 風險 #7）。
+
+    【本修法的代價，誠實記錄】改拿 idle 當比較對象之後，閘門就【依賴
+    _follow_live_log() 真的有在讀目標的 live log】。若它因故讀不到（例如讀錯檔），
+    真的卡死的掃描會因為 idle 一直贏過 runtime 而永遠不被 watchdog 收掉，
+    只剩 5 小時逾時這條退路。這是拿「可回收性」換「不誤殺」，方向是刻意選的：
+    誤殺會殺掉健康掃描並讓當天的資料整個缺一輪，漏殺只是晚五小時。
     """
     if runtime is None:
         return (f"[watchdog] 無法判定 {what} 已跑多久 → 不動手"
                 f"（state 自稱卡死，但無法排除是看板自己的讀取時鐘過期）")
-    if runtime < SEARCH_STALL_TIMEOUT:
-        return (f"[watchdog] 拒絕動手：{what} 只跑了 {runtime:.0f}s，"
-                f"短於門檻 {SEARCH_STALL_TIMEOUT}s —— 不可能已沉默 {idle:.0f}s，"
+    if idle <= SEARCH_STALL_TIMEOUT:
+        return (f"[watchdog] 拒絕動手：{what} 只沉默 {idle:.0f}s，"
+                f"未達門檻 {SEARCH_STALL_TIMEOUT}s")
+    if runtime < idle:
+        return (f"[watchdog] 拒絕動手：{what} 只存在 {runtime:.0f}s，"
+                f"短於它被宣稱沉默的 {idle:.0f}s —— 不可能，"
                 f"判定為 last_read_at 過期而非掃描卡死")
     return None
+
+
+# ── watchdog 對外部掃描的【最後一次判定】（第十輪審查 NIT-4）────────────────────
+# UI 原本自己用 `ext_idle > SEARCH_STALL_TIMEOUT` 判斷「疑似卡死」—— 和修正前的
+# watchdog 是【同一個弱判準】。兩者於是會對同一件事講不同的話：看板說卡死、
+# watchdog 說不殺（因為目標根本還沒跑那麼久）。2026-10-06 06:01–11:00 那五個
+# 小時的畫面上就是這樣，301 行「拒絕動手」旁邊掛著「疑似卡死」。
+# 卡死與否由 watchdog 判定（_stall_gate_refusal 是唯一判準），UI 只負責顯示。
+# 代價：watchdog 每 60 秒才跑一次，所以 UI 要老實說出這是【幾秒前的判定】。
+_STALL_VERDICT = {"at": None, "stalled": False, "note": "watchdog 尚未判定"}
+
+
+def _record_stall_verdict(stalled, note):
+    """記下 watchdog 這一輪對外部掃描的判定。
+
+    整個 dict 【一次換掉】（rebind），不是逐鍵改寫。逐鍵改寫的話，UI 剛好讀在中間
+    就會看到「新的 at 配舊的 note」—— 畫面說卡死、tooltip 說沒卡死。那正是 NIT-4
+    要根除的那種自相矛盾，不該在新修法裡以另一種形式復活。
+    （CPython 的單一名稱綁定是原子的：讀者要嘛看到整組舊值、要嘛看到整組新值。）
+    """
+    global _STALL_VERDICT
+    _STALL_VERDICT = {"at": time.monotonic(), "stalled": bool(stalled), "note": note}
 
 
 def kill_stalled_external():
@@ -891,9 +984,14 @@ def kill_stalled_external():
     # 鎖在我們手上就沒有「外部掃描」這回事（互斥）。防禦性檢查：即使
     # _EXTERNAL["active"] 因故沒被清掉，也絕不對著自己的掃描動手。
     if _we_hold_scan_lock():
+        _record_stall_verdict(False, "掃描鎖在我們手上（互斥），沒有外部掃描")
         return None
     idle = _external_idle_seconds()
     if idle is None or idle <= SEARCH_STALL_TIMEOUT:
+        _record_stall_verdict(
+            False,
+            f"尚未超過門檻（沉默 {idle:.0f}s / 門檻 {SEARCH_STALL_TIMEOUT}s）"
+            if idle is not None else "讀不到 last_read_at，無從判定")
         return None
     state = read_jobscan_state() or {}
 
@@ -908,6 +1006,8 @@ def kill_stalled_external():
     # 情境（wrapper 被 SIGKILL → EXIT trap 不會執行 → state 永遠停在 running）
     # 不受影響，照樣會被這裡終止。
     if state.get("phase") != "running":
+        _record_stall_verdict(
+            False, f"state 自稱 {state.get('phase')!r}，不是進行中的掃描")
         return None
 
     run_id, trigger, pid = state.get("run_id"), state.get("trigger"), state.get("pid")
@@ -922,7 +1022,21 @@ def kill_stalled_external():
     # 但沒有歸零 —— 要歸零得把鎖一路持有到訊號送出為止，而 systemctl 是阻塞呼叫，
     # 那會製造更嚴重的問題（整個 watchdog 卡住、連自己的掃描都放不掉）。
     if _we_hold_scan_lock():
+        _record_stall_verdict(False, "動手前我們取得了掃描鎖，放棄（TOCTOU 重檢）")
         return None
+
+    # 各分支把判定寫進這裡；函式尾端【統一記錄一次】。
+    # 不用「上一輪記過就跳過」那種寫法 —— 那樣第一輪之後的判定會永遠停在舊值。
+    verdict = None
+
+    def _set_verdict(stalled, note):
+        """先講先贏。systemd 分支的存活判定比 PID 分支的身分判定更貼近「卡死與否」
+        這個問題，不該被後續分支蓋掉 —— H3 就是這樣：systemd 分支正確地以
+        「只存在 16s」拒絕，若讓後面的 PID 分支覆寫，UI 只會看到「cmdline 不符」，
+        『掃描並不卡死』這個真正的結論反而消失了。"""
+        nonlocal verdict
+        if verdict is None:
+            verdict = (stalled, note)
 
     target = None
     if trigger == "systemd-timer":
@@ -933,25 +1047,16 @@ def kill_stalled_external():
         # 「已終止 jobscan.service」這筆假成功紀錄 —— 那比不殺更糟，因為它會讓下一個
         # 追查事故的人以為停滯偵測正常運作過（正是本案要根除的那種靜默謊言）。
         # 對照：oneshot 執行期間的狀態是 activating，不是 active，兩者都要接受。
-        try:
-            act = subprocess.run(
-                ["systemctl", "--user", "show", "jobscan.service",
-                 "-p", "ActiveState", "--value"],
-                capture_output=True, text=True, timeout=10,
-                env={**os.environ, "LC_ALL": "C"},
-            ).stdout.strip()
-        except (OSError, subprocess.SubprocessError) as e:
-            act = ""
-            _log(f"[watchdog] 查詢 jobscan.service 狀態失敗，不接手: {e}")
+        act, unit_runtime = _jobscan_unit_props()
         if act in ("active", "activating", "reloading"):
             # 存活閘門（2026-10-06 事故）。這條分支原本【只有】「unit 在跑嗎」的
             # 檢查，沒有任何存活判準 —— 06:01:09 那 16 秒的健康掃描就是死在這裡。
             # 這裡用 unit 自己的啟動時間：要收的是整個 cgroup，而 wrapper 被
             # SIGKILL 之後 /proc 就查不到了，systemd 的答案仍然有效。
-            refusal = _stall_gate_refusal(
-                _jobscan_unit_runtime_seconds(), idle, "jobscan.service")
+            refusal = _stall_gate_refusal(unit_runtime, idle, "jobscan.service")
             if refusal:
                 _log(refusal)
+                _set_verdict(False, refusal)
             else:
                 try:
                     r = subprocess.run(
@@ -961,8 +1066,17 @@ def kill_stalled_external():
                     )
                     if r.returncode == 0:
                         target = f"jobscan.service (run_id={run_id})"
+                        _set_verdict(True,
+                                   f"jobscan.service 已沉默 {idle:.0f}s "
+                                   f"且存在 {unit_runtime:.0f}s，判定卡死並終止")
+                    else:
+                        # 送出 kill 但 systemd 說沒成功。這【不能】記成「已終止」——
+                        # 2026-09-19 實測過對 inactive unit 送 kill 會回 0 卻什麼也沒殺，
+                        # 反向的假成功同樣是靜默謊言。
+                        _set_verdict(False, f"systemctl kill 回傳 {r.returncode}，未確認終止")
                 except (OSError, subprocess.SubprocessError) as e:
                     _log(f"[watchdog] systemctl kill 失敗: {e}")
+                    _set_verdict(False, f"systemctl kill 失敗: {e}")
         else:
             _log(f"[watchdog] jobscan.service 目前為 {act or '未知'}，"
                  f"沒有可終止的掃描 → 改走 PID 路徑（並受 cmdline 身分檢查）")
@@ -977,15 +1091,27 @@ def kill_stalled_external():
                 _target_runtime_seconds(pid), idle, f"pid={pid}")
             if refusal:
                 _log(refusal)
+                _set_verdict(False, refusal)
             else:
                 killed = _kill_tree(pid)
                 if killed:
                     target = f"PID {', '.join(str(p) for p in killed)} (run_id={run_id})"
+                    _set_verdict(True, f"pid={pid} 已沉默 {idle:.0f}s，判定卡死並終止")
+                else:
+                    _set_verdict(False, f"pid={pid} 沒有任何行程被終止")
         else:
             _log(f"[watchdog] 拒絕對 pid={pid} 動手：cmdline 不屬於 jobspy 掃描"
                  f"（state 可能來自上一輪，pid 已被回收）")
+            _set_verdict(False, "cmdline 不屬於 jobspy 掃描，不動手")
     if target is None:
+        # 沉默超時、但沒有任何一個對象被終止。把這個結論寫進 _STALL_VERDICT，
+        # UI 才不會在旁邊唱反調說掃描卡死了。
+        _record_stall_verdict(
+            *(verdict or (False, "沉默超時，但沒有可終止的對象（未動手）")))
         return None
+    # 真的動手了就是卡死 —— 這條蓋過前面任何分支的保守判定（例如 systemd 分支
+    # 判定 unit 太年輕、改走 PID 路徑後卻真的殺掉了）。
+    _record_stall_verdict(True, f"已沉默 {idle:.0f}s，判定卡死並終止 {target}")
     _external_note(f"🛑 外部掃描已 {idle / 60:.1f} 分鐘無輸出，判定卡死，終止 {target}")
     return target
 
@@ -1250,12 +1376,22 @@ def get_search_status():
             "output_lines": own_lines, "stalled": False,
         }
     elif ext_active:
+        # [第十輪審查 NIT-4] 這裡原本是自算的 `ext_idle > SEARCH_STALL_TIMEOUT` ——
+        # 和修正前的 watchdog 同一個弱判準，於是會出現「看板說疑似卡死、watchdog
+        # 同時在拒絕動手」的分裂畫面。卡死與否改由 watchdog 判定（它才有
+        # _stall_gate_refusal 這個唯一判準），這裡只做顯示。
+        # 誠實揭露：watchdog 每 60 秒才判一次，所以這是【幾秒前的判定】，
+        # 前端要把 verdict_age 一起顯示，不能假裝它是即時的。
         status = {
             "running": True, "external": True, "trigger": ext_trigger,
             "run_id": ext_id or f"external:{ext_start}", "exit_code": None,
             "start_time": ext_start, "output": ext_out,
             "output_lines": ext_lines,
-            "stalled": bool(ext_idle and ext_idle > SEARCH_STALL_TIMEOUT),
+            "stalled": _STALL_VERDICT["stalled"],
+            "stall_note": _STALL_VERDICT["note"],
+            "stall_verdict_age": (time.monotonic() - _STALL_VERDICT["at"]
+                                  if _STALL_VERDICT["at"] is not None else None),
+            "idle_seconds": ext_idle,
         }
     else:
         # 閒置時仍要回報「最近一次是哪一輪」，否則前端的換檔偵測會失去依據。
@@ -2506,7 +2642,16 @@ async function pollSearchStatus(){
     if(s.running){
       icon.textContent='⏳';
       txt.textContent=s.external?`External scan running (${s.trigger||'system'})...`:'Search running...';
-      if(s.stalled) txt.textContent+=' — 疑似卡死';
+      // 卡死與否由 watchdog 判定（_STALL_VERDICT），前端【不得】自己拿無輸出秒數猜 ——
+      // 那會出現「畫面說卡死、journal 裡 watchdog 每 60 秒說一次拒絕動手」的分裂。
+      // 判定最多 60 秒舊，所以要老實標出它是幾秒前的判定。
+      if(s.stalled){
+        txt.textContent+=' — 已判定卡死，watchdog 將終止';
+      }else if(s.stall_verdict_age!==null&&s.stall_verdict_age!==undefined&&s.idle_seconds>900){
+        const _va=Math.floor(s.stall_verdict_age);
+        txt.textContent+=` — 已 ${Math.floor(s.idle_seconds/60)}m 無輸出，但 watchdog 判定未卡死（${_va}s 前的判定）`;
+        if(s.stall_note) txt.title=s.stall_note;
+      }
       if(s.start_time){const secs=Math.floor((Date.now()-new Date(s.start_time).getTime())/1000);elapsed.textContent=`(${Math.floor(secs/60)}m ${secs%60}s)`;}
       btn.disabled=true; btn.innerHTML='<span class="spinner"></span> Running...'; panel.classList.add('open');
       sawRunning=true; if(s.run_id) runIdSeen=s.run_id;
