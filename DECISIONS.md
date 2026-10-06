@@ -2,6 +2,149 @@
 
 重要決策紀錄 — 依專案工作流程要求更新。
 
+## 2026-10-06 — watchdog 殺掉一輪只跑了 16 秒的健康掃描
+
+**症狀：** 10-06 06:00 的排程掃描沒有產出。使用者回報「今天早上的沒有跑」。
+
+**實際發生的事**（systemd journal，權威來源，與看板自己的日誌無關）：
+
+```
+06:00:53  Starting jobscan.service - Embedded job scan...
+06:01:09  jobscan.service: Sent signal SIGKILL to main process 3957692 (bash) on client request.
+06:01:09  jobscan.service: Main process exited, code=killed, status=9/KILL
+06:01:09  Failed to start jobscan.service
+```
+
+**掃描有啟動，運作正常，16 秒後被自己的看板殺掉。**
+
+### 缺陷本體：拿【自己的讀取時鐘】當對方卡死的依據
+
+`kill_stalled_external()` 的停滯判準是 `idle = _external_idle_seconds()`，
+而 `_EXTERNAL["last_read_at"]` 記的是**看板最後一次從 `search_current.log`
+讀到新內容**的時刻（`job_board.py` 的 `_follow_live_log()`，且只在
+`if chunk:` 時更新）。那是**看板的時鐘**，不是**目標已經跑多久**。
+
+兩者在正常情況同步。但只要 `_EXTERNAL` 因故停在上一輪的狀態
+（`active=True`、`last_read_at` 凍結在舊掃描結束那一刻），**新掃描一開始，
+idle 就會憑空變成好幾小時**。
+
+### 為什麼身分檢查擋不住
+
+`kill_stalled_external()` 有兩條動手路徑，防護等級不對等：
+
+| 路徑 | 觸發條件 | 動手前的檢查 | 10-06 06:01 的結果 |
+|---|---|---|---|
+| systemd | `trigger == "systemd-timer"` 且 ActiveState ∈ {active, activating, reloading} | **只有「unit 在跑嗎」，沒有任何存活判準** | **無條件 SIGKILL** |
+| PID | 上一條沒成立時 | `_pid_is_our_scan(pid)`（argv 結構比對） | — |
+
+06:01 當時 `jobscan.service` 是 **activating**（掃描剛開始），所以走的是
+systemd 路徑。而**當時 state 檔是新的** —— 被殺的 pid `3957692` 就是那一輪的
+bash —— 所以**就算把 PID 路徑的身分檢查搬過來也擋不住**。
+
+> 問題不在「殺錯對象」，在「憑一個過期的時鐘斷定對方卡死」。
+
+這一節不是推理，是日誌自己講出來的：同日 10:58–11:01，service 處於 `failed`
+（06:01 那次留下的），watchdog 改走 PID 路徑，**每次都正確拒絕**：
+
+```
+[10:58:13] [watchdog] 拒絕對 pid=3957692 動手：cmdline 不屬於 jobspy 掃描
+```
+
+**同一支 watchdog，一條路徑有護欄、另一條沒有。** 護欄在哪裡有效，日誌說得很清楚。
+
+### 未坐實的部分（刻意不下結論）
+
+`_EXTERNAL` 為什麼會停在 `active=True` 且 `last_read_at` 凍結 8 小時。
+
+線索指向 `_lock_held()` 回 `None`（`_jobscan_watch_tick()` 對 `held is None`
+的分支是「維持現狀」，不寫任何日誌）：06:01 → 11:01 這五小時，watcher
+**一行都沒印**，連 `外部掃描結束` 都沒有（該行計數為 0）。正常輪次都是成對出現的：
+
+```
+10-04 那輪：[06:00:42] 偵測到外部掃描 → [06:19:47] 外部掃描結束 exit=0
+10-05 那輪：[06:00:55] 偵測到外部掃描 → [06:20:45] 外部掃描結束 exit=0
+```
+
+唯獨 **10-05 22:00 那輪（硬碟爆掉那輪）兩個都沒有**，watcher 從那時起就沒再
+正常記錄過。時間上吻合。
+
+**但 `job_board.log` 在 `[06:01:09]` 之前是空的**（檔案第一行就是那一筆，
+且是 `拒絕對 pid=...` —— 同一次 tick 的前半行 `jobscan.service 目前為 X`
+被切掉）。**那個破洞我無法解釋**，所以不把它接進上面的因果鏈。
+
+**修法不依賴這個謎團。** 要修的是結構缺陷，不是那條特定路徑。
+
+### 修法：存活閘門
+
+動手前先取【**目標自身**的年齡】。一個行程不可能沉默得比自己存在的時間還久 ——
+這是「不可能」，不是「可疑」，所以可以據此拒絕。
+
+| 路徑 | 年齡來源 | 為什麼是它 |
+|---|---|---|
+| systemd | `ExecMainStartTimestampMonotonic` | 要收的是整個 cgroup；wrapper 被 SIGKILL 後 `/proc` 查不到，unit 的啟動時間仍然有效 |
+| PID | `/proc/<pid>/stat` 第 22 欄 `starttime` | **不碰 systemd** —— 手動 `./run_scan.sh` 在沒有 systemd 的環境也要能用（第五輪 F4b／F7a 守著的約束） |
+
+拿不到年齡**一律不動手**：要送的是不可逆的 SIGKILL，不確定必須倒向不殺。
+真正卡死的掃描仍有 systemd 的 `TimeoutStartSec=5h` 當退路（見本檔風險 #7）。
+
+**修正前必須先驗證兩個時鐘假設**，不能假設：
+
+- Python `time.monotonic()` 與 systemd 的 `ExecMainStartTimestampMonotonic` 同源
+  → 實測 systemd=`565101006333µs`、python=`566406154284µs`，差 `1305.1s`，
+  與掃描行程的 `etime 21:45` 相符 ✓
+- `/proc/<pid>/stat` 的欄位索引 → 實測 3.0s 的行程算出 `3.01s`；
+  掃描 bash（`etime 23:06`）算出 `1386.2s` ✓
+
+### 追加：這次修正一度弄丟了兩個既有的覆蓋
+
+變異測試當場抓到。加入閘門後，**M5（拿掉 cmdline 身分檢查）與 M6（拿掉
+ActiveState 前置檢查）從「被逮」變成「逃脫」**：
+
+| 變異 | 加閘門前 | 加閘門後（未補測試） | 補完測試後 |
+|---|---|---|---|
+| M5 | 88P/2F ✅ | **104P/0F ❌ 逃脫** | 102P/2F ✅ |
+| M6 | 88P/2F ✅ | **104P/0F ❌ 逃脫** | 102P/2F ✅ |
+
+原因是閘門跑在它們前面，而測試用的目標（剛 spawn 的行程、假的 `"inactive\n"`）
+**年齡都很年輕**，閘門先一步拒絕，後面的檢查就再也沒有機會被執行到。
+
+修法是讓那兩條測試的目標**年齡夠老**，把閘門讓開，後面的檢查才重新變成
+load-bearing。這與本檔反覆出現的模式同形：**修一個缺陷的時候，把另一個缺陷的
+覆蓋一起弄丟** —— 差別只在這次是變異測試抓到的，不是使用者。
+
+### 驗證
+
+```
+完整一輪：46/47 個變異被逮捕，1 個為已知逃脫（M13，第十輪已記錄）
+新增變異：M33–M39，七個刻意分開的失效模式
+  M33 閘門整個失效          M34 只有 systemd 路徑鬆掉    M35 只有 PID 路徑鬆掉
+  M36 邊界差一格（< → <=）  M37 fail open               M38 欄位索引取錯
+  M39 微秒沒換算成秒
+全部被逮 ✅
+```
+
+`tests/test_scan_lock.py` 新增 H 節（H1–H5），用**真實的 `/proc` 與真實的時鐘**
+重演 06:01 劇本。H3 直接斷言「unit 只跑了 16s 時不得送出 `systemctl kill`」，
+執行時印出：
+
+```
+[watchdog] 拒絕動手：jobscan.service 只跑了 16s，短於門檻 900s
+           —— 不可能已沉默 1000s，判定為 last_read_at 過期而非掃描卡死
+```
+
+**F7a／F7b 的前提被改掉了，這件事要講清楚。** 它們原本用**0.5 秒前才 spawn
+的行程**配上 mock 出來的巨大 idle，然後斷言「必須開槍」—— 那**正是事故的機制
+本身**，不是它的反面。現在前提改為明寫（把「目標已經很老」直接餵進去），
+正向覆蓋不變，但不再靠一個荒謬的狀態來成立。
+
+### 同日其他事故（各自獨立）
+
+| | |
+|---|---|
+| 10-05 22:00 掃描 | 硬碟滿（`run_scan.sh: line 63: printf: write error: No space left on device`），死於搜尋中途，**systemd 記為 `Finished`（exit 0）** —— 靜默失敗。待修，見 #16 |
+| 磁碟 | 回收 ollama + open-webui 全家，`3.4G → 32G`（97% → 66%）。不可重建的 12MB（`webui.db` 對話紀錄、`uploads`、ollama 的 `id_ed25519`）已備份至 `~/.local/share/docker-volumes-backup-20261006/` |
+| 10-06 06:00 掃描 | 已於 11:01:59 補跑完成（`run_id=20261006_110159`，23 分鐘，exit 0，40 筆） |
+
 ## 2026-09-30 — `.job_statuses.json` 取消追蹤：備份的前提變了
 
 **決策：** `git rm --cached .job_statuses.json`，並加入 `.gitignore`。檔案留在磁碟上，不進版控。
