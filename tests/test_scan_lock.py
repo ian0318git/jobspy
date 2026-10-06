@@ -1987,9 +1987,18 @@ check("runtime 未知 + idle 只剛過門檻 → 仍必須拒絕（捏造預設�
 check("【MAJOR-1】runtime 剛好到門檻、卻被宣稱沉默遠久於此 → 必須拒絕",
       jb._stall_gate_refusal(jb.SEARCH_STALL_TIMEOUT, 99999, "x") is not None,
       f"得到={jb._stall_gate_refusal(jb.SEARCH_STALL_TIMEOUT, 99999, 'x')!r}")
-check("【MAJOR-1】runtime=16s、idle=5 小時（06:01 事故的實際數字）→ 必須拒絕",
-      jb._stall_gate_refusal(16, 5 * 3600, "x") is not None,
-      f"得到={jb._stall_gate_refusal(16, 5 * 3600, 'x')!r}")
+# 這一條是事故現場的定量重演。兩個數字的來源要分開講清楚：
+#   runtime = 16s  ——【實測】systemd journal：06:00:53.390 Starting →
+#                     06:01:09.774 Sent signal SIGKILL，即 16.4 秒。
+#   idle    = 8 小時 ——【推估】last_read_at 自 10-05 22:00（live log 從那時起
+#                     就寫不進去，見 DECISIONS.md 的 #16 一節）凍結到 06:01。
+#                     當初沒有把 idle 當下的值記下來，所以這是界定了端點的推估，
+#                     不是量測。5 小時是【看板卡在「疑似卡死」的持續時間】
+#                     （06:01→11:01），不是當時的 idle，別把兩者搞混。
+# 判準的有效性不依賴這個數字：runtime=16s 配上【任何】大於門檻的 idle 都必須拒絕。
+check("【MAJOR-1】runtime=16s（journal 實測）、idle=8 小時（推估，見上）→ 必須拒絕",
+      jb._stall_gate_refusal(16, 8 * 3600, "x") is not None,
+      f"得到={jb._stall_gate_refusal(16, 8 * 3600, 'x')!r}")
 
 # 邊界：判準改成拿 idle 當比較對象之後，[恰好相等] 與 [差一秒] 兩個方向都要釘住。
 # 這一組同時守住「矯正成永不開火」—— 真的卡死的掃描（runtime >= idle）必須放行。
