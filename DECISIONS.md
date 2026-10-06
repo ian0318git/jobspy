@@ -128,9 +128,12 @@ load-bearing。這與本檔反覆出現的模式同形：**修一個缺陷的時
 執行時印出：
 
 ```
-[watchdog] 拒絕動手：jobscan.service 只跑了 16s，短於門檻 900s
-           —— 不可能已沉默 1000s，判定為 last_read_at 過期而非掃描卡死
+[watchdog] 拒絕動手：jobscan.service 只存在 16s，短於它被宣稱沉默的 1000s
+           —— 不可能，判定為 last_read_at 過期而非掃描卡死
 ```
+
+> ⚠️ 這段訊息在第十輪退回時改過。原本是「只跑了 16s，短於**門檻 900s**」——
+> 那個措辭正是 MAJOR-1 的破口：它承認閘門比的是固定門檻，不是 idle。見下一節。
 
 **F7a／F7b 的前提被改掉了，這件事要講清楚。** 它們原本用**0.5 秒前才 spawn
 的行程**配上 mock 出來的巨大 idle，然後斷言「必須開槍」—— 那**正是事故的機制
@@ -144,6 +147,301 @@ load-bearing。這與本檔反覆出現的模式同形：**修一個缺陷的時
 | 10-05 22:00 掃描 | 硬碟滿（`run_scan.sh: line 63: printf: write error: No space left on device`），死於搜尋中途，**systemd 記為 `Finished`（exit 0）** —— 靜默失敗。待修，見 #16 |
 | 磁碟 | 回收 ollama + open-webui 全家，`3.4G → 32G`（97% → 66%）。不可重建的 12MB（`webui.db` 對話紀錄、`uploads`、ollama 的 `id_ed25519`）已備份至 `~/.local/share/docker-volumes-backup-20261006/` |
 | 10-06 06:00 掃描 | 已於 11:01:59 補跑完成（`run_id=20261006_110159`，23 分鐘，exit 0，40 筆） |
+
+---
+
+## 2026-10-06（續）— 第十輪退回：第一版修法自己種下的缺陷
+
+**Senior Reviewer 對 `bfe8532` 判定【不通過】。** 這一節記錄退回的內容與修法，
+以及一件值得單獨記下來的事：**第一版的閘門比它自己宣稱的不變式還弱，而我自己
+的測試在為那個弱判準背書。**
+
+### MAJOR-1：判準拿固定門檻比，而不是拿 idle 比
+
+`_stall_gate_refusal()` 的 docstring 寫著：
+
+> 判準刻意用「不可能」而非「可疑」：**一個行程不可能沉默得比自己存在的時間還久。**
+
+但程式碼寫的是：
+
+```python
+if runtime < SEARCH_STALL_TIMEOUT:      # 900 —— 固定門檻
+```
+
+呼叫端 `kill_stalled_external()` 唯一的保證是 `idle > SEARCH_STALL_TIMEOUT`。
+所以**實際生效的判準**是「`runtime >= 900` **且** `idle > 900`」，不是
+「`runtime >= idle`」。審查者給的判準表：
+
+| runtime | idle | 舊判準 | 後果 |
+|---|---|---|---|
+| 16s | 1000s | 拒絕 ✅ | 06:01 事故擋住了 |
+| 900s | 3600s | **放行** ❌ | **殺掉一個只跑了 15 分鐘的健康掃描** |
+| 1200s | 3600s | **放行** ❌ | 同上 |
+
+stale 的 idle 可以是好幾小時，而 900 秒正落在這份掃描 19–23 分鐘的常態區間內。
+**事故的機制原封不動，誤殺只是從 T+16s 延後到 T+900s。**
+
+審查者用日誌坐實了這不是理論：`job_board.log` 裡有 **301 行**
+「idle > 900 且 state 自稱 running」，持續 5 小時 —— 那個狀態下，
+只要目標年齡一過 900 秒，舊閘門就會放行。
+
+### 最刺的一點：我的測試在擋正確的修法
+
+審查者把判準改成 `runtime < idle` 之後跑全套，結果是 **103 PASS / 1 FAIL**，
+唯一失敗的是我自己寫的那一條：
+
+```python
+check("（對照）閘門對恰好達標的 runtime 必須放行",
+      jb._stall_gate_refusal(jb.SEARCH_STALL_TIMEOUT, 99999, "x") is None)
+```
+
+**它把「runtime=900 卻被宣稱沉默 99999 秒 → 放行」寫成必須成立。**
+那不是漏掉覆蓋，是**為錯的判準背書**。該條已翻轉為必須【拒絕】。
+
+### 修法
+
+```python
+if idle <= SEARCH_STALL_TIMEOUT:      # (a) 沉默確實夠久
+    return "…未達門檻…"
+if runtime < idle:                    # (b) 行程不可能沉默得比自己存在還久
+    return "…短於它被宣稱沉默的 N 秒…"
+return None
+```
+
+**(b) 才是吃掉「讀取時鐘過期」的那一條，而它必須拿 idle 當比較對象。**
+(a) 在呼叫端已經擋過一次，這裡再驗一次是防禦性的（本函式是純函式，
+不該假設呼叫端永遠先過濾）。
+
+**代價（誠實記錄）：** 改拿 idle 當比較對象之後，閘門就**依賴
+`_follow_live_log()` 真的有在讀目標的 live log**。若它因故讀不到（例如讀錯檔），
+真的卡死的掃描會因為 idle 一直贏過 runtime 而永遠不被 watchdog 收掉，
+只剩 5 小時逾時這條退路。這是拿**可回收性**換**不誤殺**，方向是刻意選的：
+誤殺會殺掉健康掃描並讓當天的資料整個缺一輪，漏殺只是晚五小時。
+
+### MINOR-2：PID 路徑與 idle 不同時鐘
+
+`/proc/uptime`（kernel `fs/proc/uptime.c` 用 `ktime_get_boottime_ts64()`）與
+`/proc/<pid>/stat` 的 `starttime`（`task->start_boottime`）同屬 **CLOCK_BOOTTIME**，
+而 `idle` 來自 `time.monotonic()`（**CLOCK_MONOTONIC**）。
+BOOTTIME 比 MONOTONIC 多算了 suspend 的時間 → suspend 一次就讓 runtime 憑空變大
+→ 閘門偏鬆 → **fail-open，正是本案要根除的方向**。
+
+修法：扣掉 `BOOTTIME - MONOTONIC`（開機至今的 suspend 總量）。扣總量得到的是
+真實 MONOTONIC 年齡的**下界**（該行程生命期內的 suspend 一定 <= 開機至今的總量），
+所以偏嚴 → 倒向不殺。
+
+**實測：本機該差值為 0.000s**（`uptime` 6.6 天、零 suspend 累計）：
+
+```
+/proc/uptime        = 569,280.530
+time.monotonic()    = 569,280.535
+CLOCK_BOOTTIME      = 569,280.535
+```
+
+也就是說**這個缺陷在這台機器上從未發生過**。正因如此才非寫測試不可 ——
+校正寫得對不對，在這個環境上永遠看不出來。H1b 用假的 `CLOCK_BOOTTIME`
+（多 3600 秒）驗證校正真的被扣掉。
+
+> ⚠️ 這筆測量與 `[[vm-clock-jumps]]` 的記載不符：記憶裡寫「頻繁 suspend/resume」，
+> 但 BOOTTIME − MONOTONIC = 0 表示**開機以來一次 suspend 都沒有**。
+> 時鐘跳動另有原因（NTP 修正或其他），這一節的測量不支持 suspend 假說。
+
+### NIT 的處理
+
+| | 內容 | 處置 |
+|---|---|---|
+| NIT-1 | 兩次 `systemctl show`（ActiveState / 啟動時間）之間 unit 可能結束或重啟，狀態與啟動時間來自不同世代 | 合併成一次查詢，逐行解析 `key=value`；順帶補上非零退出的 fail-closed 檢查 |
+| NIT-2 | H3 只斷言「沒送出 kill」，閘門若在更早處短路照樣通過 | 加驗閘門真的被問過、且拒絕理由是「太年輕」 |
+| NIT-3 | 把 procfs 根參數化，讓真實路徑的 ALLOW 方向也能測 | **不做**（理由見下） |
+| NIT-4 | UI 自己用 `idle > 900` 猜「疑似卡死」，和 watchdog 講不同的話 | 改由 watchdog 判定並記錄，UI 只顯示 |
+
+**NIT-3 不做的理由**：它想買的是「ALLOW 方向用真實行程測」，但在新判準下
+那條路**根本到不了** —— 一個真實的年輕行程不可能同時滿足 `runtime >= idle`
+且 `idle > 900`。為了只在測試裡用的縫去改產品路徑，換不到原本要的東西。
+ALLOW 方向由 F7a/F7b 餵入 age 覆蓋（真實端到端會殺掉一個真的行程）。
+
+**NIT-4 值得多說一句**：06:01–11:00 那五小時的畫面上是「疑似卡死」，
+而同一段時間的 journal 裡 watchdog 每 60 秒說一次「拒絕動手」。
+**同一個系統對同一件事講兩種話**，正是本案要根除的那種不一致。
+現在卡死與否只有一個判準（`_stall_gate_refusal`），由 watchdog 判定並寫進
+`_STALL_VERDICT`，UI 只負責顯示，而且老實標出這是**幾秒前的判定**（watchdog 每
+60 秒才跑一次，不能假裝它是即時的）。
+
+### 驗證
+
+```
+tests/test_scan_lock.py   116 項全數通過（新增 12 項）
+變異測試新增 M40–M45，六條獨立失效模式：
+  M40 判準退回固定門檻（MAJOR-1 的回歸）   M41 拿掉時鐘校正
+  M42 校正方向搞反（fail-open 的方向）      M43 判定被後面的分支蓋掉
+  M44 ActiveState 解析失效                 M45 非零退出被照單全收
+M34–M39 因程式碼形狀改變而更新
+```
+
+### ⚠️ 第一次跑變異測試時，抓到這一輪【自己弄丟的覆蓋】
+
+三件事，全部要記下來 —— 這正是本檔反覆出現的「修一個缺陷時把另一個缺陷的
+覆蓋一起弄丟」，只是這次是 harness 抓到的，不是使用者：
+
+| | 症狀 | 原因 | 處置 |
+|---|---|---|---|
+| M4 / M8 / M9 / M29 | **ANCHOR-FAIL**（4 條既有變異無法套用） | 全都錨在 `kill_stalled_external` 開頭，而我在那裡插了 `_record_stall_verdict` | 更新錨點；M8 與 M29 共用同一段，抽成 `_HOLD_GATE_ANCHOR` 常數 |
+| M39 | ANCHOR-FAIL | 回傳值從 `return time.monotonic() - …` 變成 `return state, time.monotonic() - …` | 更新錨點 |
+| M37 | **逃脫**（無回歸保護） | 見下 | 改寫變異 + 補兩條測試 |
+
+**M4/M8/M9/M29 那一格是這次最重要的收穫**：harness 把它們列為「無法判定」，
+而不是靜默地當成通過。少了這個設計，這一輪就會帶著**四條消失的覆蓋**送去審查，
+而且沒有任何訊號。
+
+**M37 逃脫的機制值得單獨講。** 它把「runtime 未知」替換成
+`runtime = SEARCH_STALL_TIMEOUT + 1`（= 901）：
+
+- **舊判準**（拿固定門檻比）：901 >= 900 → 放行 → fail-open，測得到 ✅
+- **新判準**（拿 idle 比）：901 配上任何真實的 idle（門檻以上、可能是好幾小時）
+  都會被拒絕 —— **替換本身不再造成 fail-open**，測試自然抓不到 ❌
+
+這是**變異沒有跟著判準一起更新**。改成忠實版本 `runtime = idle + 1`
+（直接假裝目標已經夠老）。同時在測試端補兩條，因為原本那條
+`_stall_gate_refusal(None, 99999) is not None` **不足以證明 fail-closed** ——
+「未知 → 拒絕」與「被偷偷換成 901 → 也拒絕」兩種情況它都會通過：
+
+```
+runtime 未知時必須走「無法判定」那條分支，不得用預設值代替
+runtime 未知 + idle 只剛過門檻 → 仍必須拒絕（捏造預設值會在此穿幫）
+```
+
+### 未完成事項
+
+- **修法還沒生效。** 執行中的看板 `MainPID=4094877`、
+  `ExecMainStartTimestamp=2026-10-06 11:01:37`，早於本次 commit。
+  **今晚 22:00 的排程掃描仍然跑舊碼。** 需要在不執行掃描的時段
+  `systemctl --user restart jobboard.service`。
+- `run_scan.sh` 的磁碟滿靜默失敗（#16）—— 已修，見下一節。
+
+## 2026-10-06（續）— #16：硬碟寫滿時 run_scan.sh 的四段靜默失敗
+
+**錨點：** 10-05 22:00 那一輪掃描（`run_id=20261005_220014`、pid 3730474）在硬碟
+寫滿的情況下被 systemd 記為 `Finished`（exit 0），但看板從頭到尾不知道它存在過。
+
+### 證據鏈（日誌逐行，不是推理）
+
+`logs/cron_search.log-2026-10-06`（輪替後未壓縮、仍留著）第 875–889 行：
+
+```
+875: [jobscan] 22:00:14 20261005_220014 START trigger=systemd-timer pid=3730474 timeout=18000s
+876: /home/ian/github-project/jobspy/run_scan.sh: line 63: printf: write error: No space left on device
+877: ========================================================================
+...  （掃描照常進行，一個職缺都沒少）
+889: tee: /home/ian/github-project/jobspy/logs/search_current.log: No space left on device
+...  （搜尋繼續）
+```
+
+四段失敗，彼此獨立：
+
+| # | 位置 | 現象 | 後果 |
+|---|---|---|---|
+| **A** | `write_state running ""`（舊 line 135；錯誤出自 line 63 的 `printf`） | 回非零，**呼叫端沒檢查**；`&&` 短路使 `mv` 根本沒執行 | state 檔**從頭到尾沒寫成** → 看板看不到這一輪 |
+| **B** | 同上 | 失敗的暫存檔沒有被清掉 | 留下 0 byte 的 `logs/search_state.json.3730474`（**至今還在磁碟上**） |
+| **C** | `tee "$LIVE"` | **第一次寫入就失敗** | `search_current.log` 整輪是空的 → 看板的 `_follow_live_log()` 讀不到任何 chunk → **`last_read_at` 不更新** |
+| **D** | `exit "${PIPESTATUS[0]}"` | 只看爬蟲的退出碼（0），tee 的非零被丟掉 | systemd 記 `Finished`；五小時後只剩逾時這條退路 |
+
+第 876 行出現在橫幅（877 行）**之前** —— 這證明出錯的是 line 135 的
+`write_state running`，不是 EXIT trap 的收尾。順帶一提，那一輪的逐字稿檔本身
+也在第 949 行被 ENOSPC 截斷在一行中間、沒有結尾換行，**沒有 END 行**。
+
+### 與第十輪 MAJOR-1 的關係：把「未坐實」補上一半
+
+第十輪那節的「未坐實的部分」寫著：`_EXTERNAL` 為什麼會停在 `active=True` 且
+`last_read_at` 凍結 8 小時，無法解釋。
+
+**C 段坐實了其中一半。** `last_read_at` 的更新條件是「`_follow_live_log()` 讀到
+非空的 chunk」，而 22:00 那一輪的 `search_current.log` 從頭到尾是空的。
+**只要 live log 是空的，`last_read_at` 就不可能前進。** 凍結的讀取時鐘於是有了
+具體、有日誌佐證的成因 —— 不再只是「時間上吻合」。
+
+**仍然未坐實的另一半：`_EXTERNAL["active"]` 為什麼是 True。**
+`_external_idle_seconds()` 在 `active` 為 False 時回 None（`job_board.py:686`），
+而 06:01 的閘門確實算出一個大於門檻的 idle —— 所以當時 `active` 必為 True。
+但 watcher 對 22:00 那一輪**連「偵測到外部掃描」都沒印**。這兩件事我對不起來，
+**不把它接進因果鏈**。（修法一樣不依賴它：第十輪的閘門是結構修正。）
+
+> 附帶更正：第十輪把「5 小時」放在 idle 的位置是錯的。5 小時是**看板卡在
+> 「疑似卡死」的持續時間**（06:01→11:01），不是當時的 idle。事故的 runtime
+> 是 **16.4 秒**（systemd journal 實測：06:00:53.390 Starting → 06:01:09.774
+> Sent signal SIGKILL），idle 是**推估的 8 小時**（`last_read_at` 自 22:00 凍結）
+> —— 當初沒把 idle 當下的值記下來。`tests/test_scan_lock.py` 的對應斷言已改正並
+> 在註解裡分開標明哪個是實測、哪個是推估。
+
+### 四項修正
+
+1. **`write_state()` 給回傳值。** 失敗時 `logerr` + `rm -f "$tmp"` + `return 1`。
+   沒有錯誤處理的原子寫入只是「寫入」，不是「原子寫入」。
+2. **開跑時 `write_state running` 失敗 → 放棄本輪**（`exit 1`，掃描根本不會啟動）。
+   這條從「判斷題」升級成核心，理由就是 A 段：看不見的掃描不只沒資料，它會凍結
+   看板的讀取時鐘，而凍結的時鐘正是 06:01 誤殺的判準。
+   **代價說明白**：若只是 state 檔的權限問題（磁碟其實有空間），這一輪本來可能
+   跑得出結果，現在會被放棄。接受 —— `run_scan.sh` 既有的 line 52-56／72-75
+   已經立下同一條原則：環境前置條件不成立就大聲失敗。
+   同理，`: > "$LIVE"` 失敗也放棄本輪（跟讀基準不成立就不要掃）。
+3. **`finish()` 收尾失敗 → 明示 `exit 1`。** EXIT trap 的退出碼**不會**自動變成
+   腳本的退出碼（實測：body `exit 7` + trap 最後一道指令 `false` → 仍是 7）。
+   少了這行，收尾失敗會被 systemd 記成成功。`rc` 已非零時不覆寫（143 更該被看見）。
+4. **tee 的退出碼一起看。** 爬蟲的失敗優先（那是資料缺口的根因），但 tee 的失敗
+   不再被吞掉。`/dev/full` 實測：`tee /dev/full` → rc=1。
+
+### 第一版修法自己踩到的坑（實測出來，未進 commit）
+
+第一版寫成：
+
+```bash
+_scan_rc="${PIPESTATUS[0]}"
+_tee_rc="${PIPESTATUS[1]}"        # ← 這一行會炸
+```
+
+**第一道賦值敘述本身就會把 `PIPESTATUS` 重設成只有 1 個元素**，於是第二行在
+`set -u` 之下直接 `PIPESTATUS[1]: unbound variable` 中止整個腳本 ——
+每一輪掃描都會失敗。實測：
+
+```
+$ bash -c 'set -u; sh -c "exit 3" | sh -c "exit 7"
+           a="${PIPESTATUS[0]}"; b="${PIPESTATUS[1]}"'
+bash: PIPESTATUS[1]: unbound variable
+```
+
+改成單一敘述抓整個陣列才正確：`_rcs=("${PIPESTATUS[@]}")`。
+**這個坑值得留在文件裡** —— 它是一個「兩行看起來都對、但第一行殺死第二行」的例子，
+而且只有在 `set -u` 之下才會從「讀到空值」升級成「中止腳本」。
+
+### 驗證
+
+新增 `tests/test_run_scan.sh`（21 項；bash 黑箱驅動，用 `JOBSCAN_*` 鉤子跑**同一條
+生產路徑**，每個案例各自在 mktemp 沙箱裡，完全不碰生產檔）：
+
+```
+$ bash tests/test_run_scan.sh     →  ✅ 全數通過（21 項）
+```
+
+**負向對照（區辨力實測）**：把 HEAD 版的 `run_scan.sh` 抓回來跑同一套 ——
+**21 項中 11 項失敗**，正是針對 A/B/C/D 四段的那幾項（退出碼、爬蟲有沒有跑、
+有無 ERROR 訊息、tee 的 exit_code）。其餘 10 項是兩版都必須成立的不變式
+（正常路徑、退出碼傳遞、不留屍體），用途是防止未來改壞，**不具區辨力** ——
+兩者已在測試檔頭分開標註，不再混為一談。
+
+**揭露的覆蓋限制**（同樣寫在測試檔頭）：
+
+1. 本套件**沒有納入 `tests/mutate.py`** —— 該工具目前只認 Python 目標
+   （`job_board.py`、`linkedin_job_search.py`）。上面那 11 項的區辨力是用 HEAD 版
+   對照實測出來的，**不是變異測試驗出來的**。
+2. 真正的 ENOSPC 現場是「`open` 成功建立了 0 byte 檔、之後寫入才失敗」。
+   重現它需要一個真的滿了的檔案系統（mount 小 tmpfs 要 root），所以測試改用
+   唯讀目錄代替 —— 那條路徑下 `open` 就先失敗、根本不會產生屍體，兩版皆過。
+   **真正的 ENOSPC 屍體路徑未被自動化測試覆蓋**，只靠 `rm -f "$tmp"` 以建構方式保證。
+
+### 生效方式（與 #15 不同，這點要分清楚）
+
+`run_scan.sh` 是**每一輪重新 exec** 的，所以本節的修正在**下一次掃描就自動生效，
+不需要重啟任何服務**。相對地 #15 的修正在 `job_board.py` 裡，那是常駐行程，
+**必須重啟看板才會生效**（見上一節的未完成事項）。
 
 ## 2026-09-30 — `.job_statuses.json` 取消追蹤：備份的前提變了
 

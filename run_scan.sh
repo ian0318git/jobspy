@@ -57,12 +57,28 @@ command -v flock >/dev/null 2>&1 || { logerr "$RUN_ID ERROR: 找不到 flock 指
 
 # 原子寫入：先寫暫存檔再 mv（同一檔案系統上的 rename 是原子的），
 # 讀者永遠只會看到完整的 JSON，不會讀到寫到一半的內容。
+#
+# 【回傳值有意義】0 = 確實落到 STATE 上。呼叫端【必須】檢查。
+# 2026-10-06 事故（10-05 22:00 那一輪，run_id=20261005_220014）：
+#   磁碟滿 → line 63 的 printf 回非零 → `&&` 短路 → mv 不執行 → 呼叫端沒檢查
+#   → 整輪掃描在 state 檔裡【不存在】。看板看不到這一輪，而現場留下一個 0 byte 的
+#   logs/search_state.json.3730474（那個 pid 就是那一輪的 wrapper，屍體至今還在）。
+# 沒有錯誤處理的原子寫入只是「寫入」，不是「原子寫入」。
 write_state() {   # $1=phase(running|finished)  $2=exit_code 或空字串
     local tmp="$STATE.$$" fin
     if [ "$1" = running ]; then fin=null; else fin="\"$(date +%Y-%m-%dT%H:%M:%S)\""; fi
-    printf '{"run_id":"%s","trigger":"%s","phase":"%s","pid":%s,"exit_code":%s,"started_at":"%s","finished_at":%s}\n' \
-        "$RUN_ID" "$TRIGGER" "$1" "$$" "${2:-null}" "$STARTED_AT" "$fin" > "$tmp" \
-        && mv -f "$tmp" "$STATE"
+    if ! printf '{"run_id":"%s","trigger":"%s","phase":"%s","pid":%s,"exit_code":%s,"started_at":"%s","finished_at":%s}\n' \
+            "$RUN_ID" "$TRIGGER" "$1" "$$" "${2:-null}" "$STARTED_AT" "$fin" > "$tmp"; then
+        logerr "$RUN_ID ERROR: 寫入 state 暫存檔失敗（磁碟滿？）: $tmp"
+        rm -f "$tmp"                      # 不留 0 byte 屍體，免得騙過後續排查
+        return 1
+    fi
+    if ! mv -f "$tmp" "$STATE"; then
+        logerr "$RUN_ID ERROR: 置換 state 檔失敗: $tmp -> $STATE"
+        rm -f "$tmp"
+        return 1
+    fi
+    return 0
 }
 
 # fd 9 持有鎖，shell 活著鎖就活著。python 子程序會繼承這個 fd，
@@ -117,8 +133,16 @@ fi
 STARTED_AT="$(date +%Y-%m-%dT%H:%M:%S)"
 # $? 以參數傳入而非在函式內讀取：local 會改寫 $?，在函式內讀會拿到錯誤的值。
 finish() {
-    log "$RUN_ID END exit=$1"
-    write_state finished "$1"
+    local rc="$1"
+    log "$RUN_ID END exit=$rc"
+    if ! write_state finished "$rc"; then
+        logerr "$RUN_ID ERROR: 收尾時無法寫入 state（$STATE）—— 這一輪的結束狀態沒有留下紀錄"
+        # 必須【明示 exit】。EXIT trap 的退出碼不會自動變成腳本的退出碼：2026-10-06
+        # 實測 body `exit 7` + trap 最後一道指令 `false` → 腳本仍然是 7。少了這一行，
+        # state 寫入失敗會被 systemd 記成 Finished，而那正是本案要根除的靜默失敗。
+        # rc 已非零時不覆寫 —— 訊號中斷（143）比收尾失敗更該被看見。
+        if [ "$rc" -eq 0 ]; then exit 1; fi
+    fi
 }
 trap 'finish $?' EXIT
 # 訊號語意（2026-09-19 實測）：
@@ -132,13 +156,55 @@ trap 'finish $?' EXIT
 trap 'exit 143' TERM INT
 
 log "$RUN_ID START trigger=$TRIGGER pid=$$ timeout=${HARD_TIMEOUT}s"
-write_state running ""
 
-: > "$LIVE"                   # 截斷：看板的 follower 從 offset 0 開始跟讀
+# state 寫不進去就【不要掃】。2026-10-06 的結論：看不見的掃描是最糟的結果。
+# 10-05 22:00 那一輪就是這樣：state 沒寫成 → 看板不知道它在跑 → 也讀不到它的
+# live log（tee 同時因磁碟滿而失敗）→ last_read_at 凍結。而一個凍結的讀取時鐘，
+# 正是 watchdog 在 06:01:09 用 SIGKILL 殺掉一個只跑了 16.4 秒的掃描的直接原因
+# （systemd 自己的紀錄：06:00:53.390 Starting → 06:01:09.774 Sent signal SIGKILL；
+# 見 DECISIONS.md 第十輪 MAJOR-1）。看不見的掃描不只沒資料，還會連鎖造成誤殺。
+#
+# 代價說明白：若只是 state 檔的權限問題（磁碟其實有空間），這一輪本來可能跑得出
+# 結果，現在會被放棄。接受這個代價 —— 本檔開頭 line 52-56、72-75 已經立下同一條
+# 原則：環境前置條件不成立就大聲失敗，不要留下「日誌看起來正常」的假象。
+if ! write_state running ""; then
+    logerr "$RUN_ID ERROR: 無法寫入 state（$STATE），放棄本輪 —— 不產生看板看不見的掃描"
+    exit 1
+fi
+
+# 截斷：看板的 follower 從 offset 0 開始跟讀。與 state 同一個道理 —— 做不到就
+# 不要掃。跟讀基準不成立時，看板讀到的內容會與這一輪錯位，而錯位的跟讀正是
+# 上面那條「凍結的 last_read_at」的另一半。
+if ! : > "$LIVE"; then
+    logerr "$RUN_ID ERROR: 無法截斷 live log: $LIVE（權限？磁碟？）"
+    exit 1
+fi
 
 set -o pipefail
 # -u：不緩衝，行即時到達 LIVE 與 systemd 的 append 日誌
 # tee 的 stdout 由 systemd append 到 logs/cron_search.log（完整逐字稿）
 timeout --signal=TERM --kill-after=60s "$HARD_TIMEOUT" \
     "$PY" -u "$SCRIPT" 2>&1 | tee "$LIVE"
-exit "${PIPESTATUS[0]}"
+# PIPESTATUS 必須【一次抓完】。這裡有個實際踩過的坑：分兩道敘述寫
+#     _scan_rc="${PIPESTATUS[0]}"; _tee_rc="${PIPESTATUS[1]}"
+# 第一道【賦值敘述本身就會把 PIPESTATUS 重設】成只有 1 個元素，於是第二道在
+# `set -u` 之下直接 "PIPESTATUS[1]: unbound variable" 中止整個腳本 ——
+# 每一輪掃描都會以失敗收場（2026-10-06 實測）。改用單一敘述抓整個陣列。
+#
+# 2026-10-06 事故：舊版只看 PIPESTATUS[0]（爬蟲回 0）就 exit 0，於是 systemd 記
+# Finished —— 而實際上 tee 在那一輪【第一次寫入就失敗】（log 第 889 行
+# "tee: .../logs/search_current.log: No space left on device"），
+# search_current.log 整輪是空的 → 看板的 _follow_live_log() 一個字都讀不到 →
+# last_read_at 不更新 → 六小時後誤殺下一輪掃描。tee 的失敗是這條鏈的第一環，
+# 卻被 exit "${PIPESTATUS[0]}" 丟掉了。
+# 注意 set -o pipefail 不會改變這件事：它只影響 `$?`，不影響 PIPESTATUS 的內容
+# （2026-10-06 實測）。
+_rcs=("${PIPESTATUS[@]}")
+_scan_rc="${_rcs[0]}"
+_tee_rc="${_rcs[1]:-0}"
+if [ "$_scan_rc" -ne 0 ]; then exit "$_scan_rc"; fi   # 爬蟲自己的失敗優先，那是資料缺口的根因
+if [ "$_tee_rc" -ne 0 ]; then
+    logerr "$RUN_ID ERROR: tee 寫入失敗（exit=$_tee_rc）—— $LIVE 不完整，看板無法跟讀"
+    exit "$_tee_rc"
+fi
+exit 0
