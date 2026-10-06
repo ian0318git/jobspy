@@ -625,25 +625,36 @@ def _fake_run2(cmd, **kw):
     return _FakeRun()
 
 
+# ⚠️【第十一輪 C-1 加入後，存活閘門【兩個】前提都要明講，少一個就會讓 M5 逃脫】
+#
+# 這裡要測的是「目標確實很老【而且】cmdline 不符 → 唯一擋在中間的是身分檢查」。
+# 所以在呼叫之前，存活閘門的兩個條件都必須先被滿足，否則閘門會先一步拒絕，
+# 身分檢查就再也沒有機會被執行到 —— 覆蓋當場消失：
+#   1. runtime >= idle（目標夠老）→ 由下面的 _target_runtime_seconds patch 提供
+#   2. ever_read（本輪讀得到輸出）→ 由下面這一行提供
+#
+# 第十輪只宣告了 (1)，於是加進 (c) 之後 M5（拿掉 cmdline 身分檢查）【當場逃脫】——
+# 突變測試跑出來是 127P/0F rc=0。這與第十輪 M5/M6 逃脫是同一種病，只是換了一個
+# 條件。修法也一樣：把前提宣告補齊，讓被測的那道檢查重新變成 load-bearing。
+#
+# 而且拒絕理由要【指名】是身分檢查拒絕的，不能只看「沒有開槍」—— 後者會被任何
+# 一道先抵達的閘門滿足。
+jb._EXTERNAL["read_ok"] = True
+
 with mock.patch.object(jb, "read_jobscan_state",
                        return_value={"phase": "running", "pid": bystander.pid,
                                      "run_id": "recycled", "trigger": "manual"}):
     with mock.patch.object(jb, "_external_idle_seconds",
                            return_value=_F7_IDLE):
-        # ⚠️【2026-10-06】這一行是【身份檢查的覆蓋】能不能成立的前提。
-        # bystander 是剛 spawn 的年輕行程，真實年齡只有零點幾秒 —— 不把年齡餵成
-        # 「已經很老」，存活閘門就會先一步拒絕，於是 cmdline 身分檢查再也沒有機會
-        # 被執行到。變異測試當場證明過：M5（拿掉 cmdline 身分檢查）在有閘門、
-        # 沒有這行的情況下【全身而退】。
-        #
-        # 這一項測的是「目標確實很老【而且】cmdline 不符」── 那時唯一擋在中間的
-        # 就是身分檢查本身。閘門自己的判準由 section H 用真實 /proc 測。
         with mock.patch.object(jb, "_target_runtime_seconds",
                                return_value=_F7_AGE):
             with mock.patch.object(jb, "_we_hold_scan_lock", return_value=False):
                 with mock.patch.object(jb.subprocess, "run", side_effect=_fake_run2):
                     killed2 = _REAL_KILL_EXTERNAL()
 check("phase=running 但 cmdline 不符時仍須拒絕", killed2 is None, f"回傳={killed2!r}")
+check("（承上）而且拒絕的理由必須是【身分檢查】，不是被前面某道閘門順便擋掉"
+      "（否則拿掉身分檢查也測不出來 —— M5 就是這樣逃脫過一次）",
+      "cmdline" in jb._STALL_VERDICT["note"], f"判定={jb._STALL_VERDICT['note']!r}")
 # 同 F4b：`poll()` 緊接在 SIGKILL 之後是 race，會讓 M5 的數字漂移。有界等待。
 check("旁觀者仍未被殺", not wait_dead(bystander, 0.5))
 check("PID 路徑不得呼叫 systemctl（那是 systemd 分支的事）",

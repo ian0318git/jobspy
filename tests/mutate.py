@@ -676,7 +676,7 @@ class Suite:
 #   （宣告值 < 呼叫點數 = 這個數字寫錯了）。
 SUITES = (
     Suite("scan", "掃描鎖", "job_board.py", "tests/test_scan_lock.py",
-          tuple(MUTATIONS), frozenset(EXPECTED_ESCAPES), 127),
+          tuple(MUTATIONS), frozenset(EXPECTED_ESCAPES), 128),
     Suite("location-filter", "地點過濾器", "linkedin_job_search.py",
           "tests/test_location_filter.py",
           tuple(LOCATION_FILTER_MUTATIONS), frozenset(), 57),
