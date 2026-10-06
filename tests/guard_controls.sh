@@ -11,7 +11,8 @@
 #     bash tests/guard_controls.sh
 #
 # 預期輸出：A–E 版 4 個對照（1 個放行 + 3 個 rc=2）、F/G 版 3 個拒絕對照，
-# 最後兩支在真環境各跑一次（rc=0）。任何一格不符就 exit 1。
+# 一格敏感度對照（把第三道護欄停用後必須放行），最後兩支用真 systemctl 各跑一次
+# （rc=0）。任何一格不符就 exit 1（並印出該格捕捉到的輸出尾巴，不讓診斷被丟掉）。
 set -u
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -41,7 +42,11 @@ run() {
   local out rc
   out="$(PATH="$path" "$PY" "$TREE/tests/$probe" 2>&1)"; rc=$?
   if [ "$rc" != "$want" ]; then
-    printf '  ✗ %-46s rc=%s（期望 %s）\n' "$name" "$rc" "$want"; FAIL=1; return
+    printf '  ✗ %-46s rc=%s（期望 %s）\n' "$name" "$rc" "$want"
+    # 只印 rc 會把探針自己那句診斷丟掉（第十八輪 reviewer 的觀察）。例如在真實掃描
+    # 進行中跑，1/4 會如實變成 rc=2，這時要看得到「jobscan.service 正在執行」。
+    printf '%s\n' "$out" | tail -2 | sed 's/^/      │ /'
+    FAIL=1; return
   fi
   if [ -n "$want_msg" ] && ! printf '%s' "$out" | grep -qF "$want_msg"; then
     printf '  ✗ %-46s rc 對但訊息不含「%s」\n' "$name" "$want_msg"; FAIL=1; return
@@ -67,7 +72,15 @@ safe; schedon
           run "2/3 排程 enabled=true → 拒絕"      "$PATH" c_boundary_probe_fg.py 2 "排程器可能真的去掃描"
 safe;     run "3/3 jobscan.service active → 拒絕" "$TREE/bin:$PATH" c_boundary_probe_fg.py 2 "jobscan.service 正在執行"
 
-echo "== 真環境（護欄全過，探針要能跑完）=="
+echo "== 敏感度對照：4/4 那一格真的是在測第三道護欄嗎？ =="
+# 只把假樹複本裡的第三道護欄改成「永不成立」，其餘一個字都不動。同一組條件下若
+# 仍然 rc=2，就表示那一格的 rc=2 是別的原因造成的 —— 那個對照等於什麼都沒測到。
+# （第十八輪 reviewer 在他那邊手動做過這個對照；這裡把它內建成固定的一格。）
+sed -i 's/\.stdout\.strip() == "active"/.stdout.strip() == "__disabled__"/' "$TREE/tests/c_boundary_probe.py"
+run "護欄停用後 → 放行（證明 4/4 測的是它）" "$TREE/bin:$PATH" c_boundary_probe.py 0
+cp "$REPO/tests/c_boundary_probe.py" "$TREE/tests/"   # 還原複本，後面的格子要用原版
+
+echo "== 真 systemctl、不掛 stub（跑的是假樹裡的複本；護欄全過時要能跑完）=="
 safe
 run "A–E 版 rc=0"  "$PATH" c_boundary_probe.py 0
 run "F/G 版 rc=0"  "$PATH" c_boundary_probe_fg.py 0
