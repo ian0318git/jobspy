@@ -794,6 +794,94 @@ def _pid_is_our_scan(pid):
     return False
 
 
+def _jobscan_unit_runtime_seconds():
+    """jobscan.service 這一輪【實際已經跑】的秒數；無法判斷回 None。
+
+    權威來源是 systemd：unit 自己知道它是何時被啟動的，不受看板自己的
+    _EXTERNAL 狀態陳舊影響 —— 那正是 2026-10-06 事故的成因，見
+    kill_stalled_external 的存活閘門。
+
+    「無法判斷」與「確定在跑」必須區分：查詢失敗、unit 從未啟動、值為空或
+    非正數，一律回 None。呼叫端據此【不動手】—— 要送的是不可逆的 SIGKILL。
+
+    已實測 Python 的 time.monotonic() 與 systemd 的
+    ExecMainStartTimestampMonotonic 同源（皆為 CLOCK_MONOTONIC、以開機為零點）：
+    2026-10-06 量到 systemd=565101006333µs、python=566406154284µs，差 1305.1s，
+    與掃描行程的 etime 21:45 相符。VM 的 suspend 不會讓兩者分歧，因為
+    CLOCK_MONOTONIC 在 suspend 期間本來就不前進，兩邊一致地不計入。
+    """
+    try:
+        out = subprocess.run(
+            ["systemctl", "--user", "show", "jobscan.service",
+             "-p", "ExecMainStartTimestampMonotonic", "--value"],
+            capture_output=True, text=True, timeout=10,
+            env={**os.environ, "LC_ALL": "C"},
+        ).stdout.strip()
+        start_us = int(out)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    if start_us <= 0:
+        return None
+    return time.monotonic() - start_us / 1_000_000
+
+
+def _target_runtime_seconds(pid):
+    """目標掃描行程【已經跑了】的秒數；無法判斷回 None。
+
+    讀 /proc/<pid>/stat 第 22 欄 starttime（自開機起的 clock tick 數），再對照
+    /proc/uptime —— 兩者同源，不涉及跨時鐘換算。
+
+    為什麼 PID 路徑用這招而不是問 systemd：手動 `./run_scan.sh`（trigger=manual）
+    在沒有 systemd 的環境下也必須能用，所以這條路徑【不准】依賴 systemctl。
+    tests/test_scan_lock.py 有兩條測試在守這個約束（第五輪 F4b 與 F7a）。
+    反過來說，systemd 路徑就該用 systemd 的答案 —— 那裡要收的是整個 cgroup，
+    而 wrapper 被 SIGKILL 後 /proc 就查不到了，unit 的啟動時間仍然有效。
+
+    實測：3.0s 的行程算出 3.01s；掃描 bash（etime 23:06）算出 1386.2s。
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            raw = f.read().decode("utf-8", "replace")
+        # comm（第 2 欄）可能含空白與括號，取【最後一個】')' 之後再切欄才安全。
+        fields = raw[raw.rindex(")") + 2:].split()
+        start_ticks = int(fields[19])          # 第 22 欄；扣掉 pid 與 comm 後索引 19
+        with open("/proc/uptime") as f:
+            uptime = float(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+    hz = os.sysconf("SC_CLK_TCK")
+    if hz <= 0:
+        return None
+    return uptime - start_ticks / hz
+
+
+def _stall_gate_refusal(runtime, idle, what):
+    """存活閘門。允許動手回 None，否則回【該寫進日誌的拒絕理由】。
+
+    【缺陷本體（2026-10-06 事故）】上面算出的 idle 量的是【看板自己的讀取時鐘】
+    (last_read_at)，不是【目標已經跑多久】。兩者在正常情況同步，但 _EXTERNAL
+    只要因故停在上一輪的狀態（active=True、last_read_at 凍結在舊掃描結束那刻），
+    新掃描一開始 idle 就會憑空變成好幾小時。
+
+    2026-10-06 06:00:53 啟動的掃描就是這樣死的：06:01:09 被 SIGKILL，只活了 16 秒
+    （systemd journal: "on client request"）。當時 state 檔是【新的】—— 被殺的
+    pid 就是那一輪的 bash —— 所以 cmdline 身分檢查擋不住。問題不在「殺錯對象」，
+    在「憑一個過期的時鐘斷定對方卡死」。
+
+    判準刻意用「不可能」而非「可疑」：一個行程不可能沉默得比自己存在的時間還久。
+    runtime 拿不到一律不動手 —— 要送的是不可逆的 SIGKILL，不確定必須倒向不殺。
+    真正卡死的掃描仍有 systemd 的 TimeoutStartSec=5h 當退路（DECISIONS.md 風險 #7）。
+    """
+    if runtime is None:
+        return (f"[watchdog] 無法判定 {what} 已跑多久 → 不動手"
+                f"（state 自稱卡死，但無法排除是看板自己的讀取時鐘過期）")
+    if runtime < SEARCH_STALL_TIMEOUT:
+        return (f"[watchdog] 拒絕動手：{what} 只跑了 {runtime:.0f}s，"
+                f"短於門檻 {SEARCH_STALL_TIMEOUT}s —— 不可能已沉默 {idle:.0f}s，"
+                f"判定為 last_read_at 過期而非掃描卡死")
+    return None
+
+
 def kill_stalled_external():
     """終止卡死的外部掃描。回傳被終止對象的說明；未達門檻或無對象回 None。
 
@@ -856,16 +944,25 @@ def kill_stalled_external():
             act = ""
             _log(f"[watchdog] 查詢 jobscan.service 狀態失敗，不接手: {e}")
         if act in ("active", "activating", "reloading"):
-            try:
-                r = subprocess.run(
-                    ["systemctl", "--user", "kill", "--signal=SIGKILL", "jobscan.service"],
-                    capture_output=True, text=True, timeout=10,
-                    env={**os.environ, "LC_ALL": "C"},
-                )
-                if r.returncode == 0:
-                    target = f"jobscan.service (run_id={run_id})"
-            except (OSError, subprocess.SubprocessError) as e:
-                _log(f"[watchdog] systemctl kill 失敗: {e}")
+            # 存活閘門（2026-10-06 事故）。這條分支原本【只有】「unit 在跑嗎」的
+            # 檢查，沒有任何存活判準 —— 06:01:09 那 16 秒的健康掃描就是死在這裡。
+            # 這裡用 unit 自己的啟動時間：要收的是整個 cgroup，而 wrapper 被
+            # SIGKILL 之後 /proc 就查不到了，systemd 的答案仍然有效。
+            refusal = _stall_gate_refusal(
+                _jobscan_unit_runtime_seconds(), idle, "jobscan.service")
+            if refusal:
+                _log(refusal)
+            else:
+                try:
+                    r = subprocess.run(
+                        ["systemctl", "--user", "kill", "--signal=SIGKILL", "jobscan.service"],
+                        capture_output=True, text=True, timeout=10,
+                        env={**os.environ, "LC_ALL": "C"},
+                    )
+                    if r.returncode == 0:
+                        target = f"jobscan.service (run_id={run_id})"
+                except (OSError, subprocess.SubprocessError) as e:
+                    _log(f"[watchdog] systemctl kill 失敗: {e}")
         else:
             _log(f"[watchdog] jobscan.service 目前為 {act or '未知'}，"
                  f"沒有可終止的掃描 → 改走 PID 路徑（並受 cmdline 身分檢查）")
@@ -873,9 +970,17 @@ def kill_stalled_external():
         # 第二層：即使 state 自稱 running，pid 也可能在我們讀它之後被回收。送不可逆的
         # SIGKILL 前用 cmdline 確認身分，不符合就只留一行 log、不動手。
         if _pid_is_our_scan(pid):
-            killed = _kill_tree(pid)
-            if killed:
-                target = f"PID {', '.join(str(p) for p in killed)} (run_id={run_id})"
+            # 存活閘門（2026-10-06 事故）。手動掃描（trigger="manual"）會跳過
+            # systemd 分支直接走到這裡，所以在這條路徑上它是【唯一】的存活判準。
+            # 來源用 /proc 而不是 systemd，維持這條路徑對 systemd 的獨立性。
+            refusal = _stall_gate_refusal(
+                _target_runtime_seconds(pid), idle, f"pid={pid}")
+            if refusal:
+                _log(refusal)
+            else:
+                killed = _kill_tree(pid)
+                if killed:
+                    target = f"PID {', '.join(str(p) for p in killed)} (run_id={run_id})"
         else:
             _log(f"[watchdog] 拒絕對 pid={pid} 動手：cmdline 不屬於 jobspy 掃描"
                  f"（state 可能來自上一輪，pid 已被回收）")

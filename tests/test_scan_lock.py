@@ -620,9 +620,19 @@ with mock.patch.object(jb, "read_jobscan_state",
                                      "run_id": "recycled", "trigger": "manual"}):
     with mock.patch.object(jb, "_external_idle_seconds",
                            return_value=jb.SEARCH_STALL_TIMEOUT + 100):
-        with mock.patch.object(jb, "_we_hold_scan_lock", return_value=False):
-            with mock.patch.object(jb.subprocess, "run", side_effect=_fake_run2):
-                killed2 = _REAL_KILL_EXTERNAL()
+        # ⚠️【2026-10-06】這一行是【身份檢查的覆蓋】能不能成立的前提。
+        # bystander 是剛 spawn 的年輕行程，真實年齡只有零點幾秒 —— 不把年齡餵成
+        # 「已經很老」，存活閘門就會先一步拒絕，於是 cmdline 身分檢查再也沒有機會
+        # 被執行到。變異測試當場證明過：M5（拿掉 cmdline 身分檢查）在有閘門、
+        # 沒有這行的情況下【全身而退】。
+        #
+        # 這一項測的是「目標確實很老【而且】cmdline 不符」── 那時唯一擋在中間的
+        # 就是身分檢查本身。閘門自己的判準由 section H 用真實 /proc 測。
+        with mock.patch.object(jb, "_target_runtime_seconds",
+                               return_value=jb.SEARCH_STALL_TIMEOUT + 100):
+            with mock.patch.object(jb, "_we_hold_scan_lock", return_value=False):
+                with mock.patch.object(jb.subprocess, "run", side_effect=_fake_run2):
+                    killed2 = _REAL_KILL_EXTERNAL()
 check("phase=running 但 cmdline 不符時仍須拒絕", killed2 is None, f"回傳={killed2!r}")
 # 同 F4b：`poll()` 緊接在 SIGKILL 之後是 race，會讓 M5 的數字漂移。有界等待。
 check("旁觀者仍未被殺", not wait_dead(bystander, 0.5))
@@ -705,9 +715,20 @@ with mock.patch.object(jb, "read_jobscan_state",
                                      "run_id": "pos_manual", "trigger": "manual"}):
     with mock.patch.object(jb, "_external_idle_seconds",
                            return_value=jb.SEARCH_STALL_TIMEOUT + 100):
-        with mock.patch.object(jb, "_we_hold_scan_lock", return_value=False):
-            with mock.patch.object(jb.subprocess, "run", side_effect=_fake_run_pos):
-                fired = _REAL_KILL_EXTERNAL()
+        # ⚠️【2026-10-06 存活閘門加入後，這一行變成必要的前提宣告】
+        # victim 是上面剛 spawn 的行程，真實年齡只有 0.5 秒。在加入閘門之前，
+        # 「idle > 900」就足以動手 —— 而那正是 06:01:09 誤殺一輪 16 秒健康掃描的
+        # 機制本身：測試的 mock 構造出一個「只存在 0.5 秒卻被判定沉默 1000 秒」
+        # 的荒謬狀態，然後斷言必須開槍。
+        #
+        # 閘門把這件事擋下來了，所以正向覆蓋必須明講前提：這裡要測的是
+        # 「【目標確實已經跑了足夠久】且身分相符時必須動手」，因此把 runtime
+        # 直接餵進去。真正的 /proc 判準由 section H 的 H1/H3 用真實行程測。
+        with mock.patch.object(jb, "_target_runtime_seconds",
+                               return_value=jb.SEARCH_STALL_TIMEOUT + 100):
+            with mock.patch.object(jb, "_we_hold_scan_lock", return_value=False):
+                with mock.patch.object(jb.subprocess, "run", side_effect=_fake_run_pos):
+                    fired = _REAL_KILL_EXTERNAL()
 check("卡死且身分相符時【必須】動手（否則就是矯正成不殺）",
       fired is not None and "pos_manual" in fired, f"回傳={fired!r}")
 check("（承上）PID 路徑不得順便去動 systemctl",
@@ -723,9 +744,26 @@ class _FakeRunKill:
     returncode = 0
     stdout = "activating\n"
 
+    def __init__(self, stdout=None):
+        if stdout is not None:
+            self.stdout = stdout
+
 
 def _fake_run3(cmd, **kw):
+    """假的 systemctl。必須【認得新指令】——
+
+    2026-10-06 加入存活閘門後，systemd 分支動手前會先問
+    `ExecMainStartTimestampMonotonic`。舊版的假替身對所有指令都回 "activating\\n"，
+    閘門拿去 int() 就失敗 → 拒絕動手 → 正向測試全滅。
+
+    這裡刻意不用 mock.patch 把 _jobscan_unit_runtime_seconds 換掉：讓閘門的
+    換算邏輯（µs → monotonic 秒）走真實程式碼，只在【資料來源】這一層造假。
+    宣告 unit 已經跑了「門檻 + 100 秒」，所以閘門必須放行。
+    """
     syscalls3.append(cmd)
+    if "ExecMainStartTimestampMonotonic" in cmd:
+        age_us = int((time.monotonic() - (jb.SEARCH_STALL_TIMEOUT + 100)) * 1_000_000)
+        return _FakeRunKill(stdout=f"{age_us}\n")
     return _FakeRunKill()
 
 
@@ -759,9 +797,27 @@ class _FakeRunIdle:
     returncode = 0
     stdout = "inactive\n"      # 生產 unit 的真實狀態：沒有掃描在跑
 
+    def __init__(self, stdout=None):
+        if stdout is not None:
+            self.stdout = stdout
+
 
 def _fake_run4(cmd, **kw):
+    """假 systemctl —— 必須【分別】回答 ActiveState 與存活閘門的查詢。
+
+    ⚠️【2026-10-06】這裡原本對所有指令一律回 "inactive\\n"。加入存活閘門後，
+    那個值會被拿去 int() 而失敗 → 閘門先一步拒絕 → ActiveState 前置檢查再也
+    沒有機會被執行到。變異測試當場證明過：M6（拿掉 ActiveState 前置檢查）
+    在這情況下【全身而退】。
+
+    這一項測的是「unit 確實不在跑【而且】目標年齡已經夠老」—— 那時唯一擋在
+    中間的就是 ActiveState 檢查本身（對 inactive unit 送 kill 會回 0 卻什麼也
+    沒殺，照單全收就會留下假成功紀錄）。閘門自己的判準由 section H 測。
+    """
     syscalls4.append(cmd)
+    if "ExecMainStartTimestampMonotonic" in cmd:
+        age_us = int((time.monotonic() - (jb.SEARCH_STALL_TIMEOUT + 100)) * 1_000_000)
+        return _FakeRunIdle(stdout=f"{age_us}\n")
     return _FakeRunIdle()
 
 
@@ -1768,6 +1824,107 @@ check(
     _m_net_alert and _m_json_alert,
     f"連線失敗有警報={_m_net_alert} 非JSON回應有警報={_m_json_alert}",
 )
+
+# ═══ H. 2026-10-06 事故：拿【自己的讀取時鐘】當對方卡死的依據 ════════════════
+#
+# 事故經過（systemd journal 為證）：
+#   06:00:53  Starting jobscan.service...
+#   06:01:09  Sent signal SIGKILL to main process 3957692 (bash) on client request.
+#   06:01:09  Failed to start jobscan.service
+#
+# 一輪只跑了 16 秒的健康掃描被這支 watchdog 殺掉。當時 state 檔是【新的】——
+# 被殺的 pid 就是那一輪的 bash —— 所以下面的 cmdline 身分檢查擋不住：
+# 問題不在「殺錯對象」，在「憑一個過期的時鐘斷定對方卡死」。
+# idle 量的是 last_read_at（看板最後一次讀到內容），不是目標已經跑多久。
+#
+# F7 那組正向測試【構造不出】這個情境，反而是它的反面：用剛 spawn 的行程
+# 配上 mock 出來的巨大 idle，斷言必須開槍 —— 那正是事故的機制本身。
+# 所以這一節改用【真實的 /proc 與真實的時鐘】把兩件事分開測：
+#   擋不擋得住「年輕卻被宣稱卡死」的目標 ← 事故本體（H1–H3）
+#   放不放行「真的跑了很久」的目標       ← 由 F7a/F7b 守住，不能矯正成不殺
+print("=== H. 2026-10-06 事故：存活閘門（idle 不得超過目標自身的年齡）===")
+
+# H1：閘門的資料來源對【真實行程】必須算得準，否則後面全是空的。
+_h_victim = spawn(sys.executable, "-c", "import time; time.sleep(600)",
+                               "/tmp/linkedin_job_search.py")
+time.sleep(0.6)
+_h_age = jb._target_runtime_seconds(_h_victim.pid)
+check("_target_runtime_seconds 對真實行程必須算出接近其 etime 的年齡",
+      _h_age is not None and 0.3 < _h_age < 5.0, f"算出={_h_age!r}")
+
+# H2：事故本體（PID 路徑）。目標只存在不到 1 秒，卻被宣稱已沉默 1000 秒。
+_h_syscalls = []
+
+
+def _fake_run_h(cmd, **kw):
+    _h_syscalls.append(cmd)
+    return _FakeRunKill()
+
+
+with mock.patch.object(jb, "read_jobscan_state",
+                       return_value={"phase": "running", "pid": _h_victim.pid,
+                                     "run_id": "young_manual", "trigger": "manual"}):
+    with mock.patch.object(jb, "_external_idle_seconds",
+                           return_value=jb.SEARCH_STALL_TIMEOUT + 100):
+        with mock.patch.object(jb, "_we_hold_scan_lock", return_value=False):
+            with mock.patch.object(jb.subprocess, "run", side_effect=_fake_run_h):
+                _h_res = _REAL_KILL_EXTERNAL()
+check("【事故本體】目標年齡 < 1s 卻被宣稱沉默 > 門檻 → 必須拒絕動手（H2）",
+      _h_res is None, f"回傳={_h_res!r}")
+check("（承上）該行程必須還活著 —— 不是只回報拒絕、實際照殺",
+      not wait_dead(_h_victim, 0.5), f"poll={_h_victim.poll()}")
+check("（承上）PID 路徑仍不得呼叫 systemctl（第五輪 F4b 的約束不得回歸）",
+      _h_syscalls == [], f"實際呼叫={_h_syscalls}")
+
+# H3：06:01 真正走的那條路徑（systemd 分支）。unit 只跑了 16 秒。
+_h2_syscalls = []
+
+
+def _fake_run_h2(cmd, **kw):
+    _h2_syscalls.append(cmd)
+    if "ExecMainStartTimestampMonotonic" in cmd:
+        young_us = int((time.monotonic() - 16) * 1_000_000)   # unit 只跑了 16 秒
+        return _FakeRunKill(stdout=f"{young_us}\n")
+    return _FakeRunKill()
+
+
+with mock.patch.object(jb, "read_jobscan_state",
+                       return_value={"phase": "running", "pid": 999999,
+                                     "run_id": "young_timer", "trigger": "systemd-timer"}):
+    with mock.patch.object(jb, "_external_idle_seconds",
+                           return_value=jb.SEARCH_STALL_TIMEOUT + 100):
+        with mock.patch.object(jb, "_we_hold_scan_lock", return_value=False):
+            with mock.patch.object(jb.subprocess, "run", side_effect=_fake_run_h2):
+                _h2_res = _REAL_KILL_EXTERNAL()
+check("【06:01 的真正路徑】unit 只跑了 16s → 不得送出 systemctl kill（H3 回歸保護）",
+      [c for c in _h2_syscalls if "kill" in c] == [], f"實際呼叫={_h2_syscalls}")
+check("（承上）且必須回 None，不得宣稱終止了 jobscan.service",
+      _h2_res is None, f"回傳={_h2_res!r}")
+_h_victim.kill()
+wait_dead(_h_victim)
+
+# H4：fail closed —— 判定不出來的時候必須倒向【不殺】，不是倒向放行。
+# SIGKILL 不可逆，所以「不確定」的唯一安全方向是拒絕。
+_h_dead = subprocess.Popen([sys.executable, "-c", "pass"])
+_h_dead.wait()
+check("_target_runtime_seconds 對已結束的 pid 必須回 None（不猜）",
+      jb._target_runtime_seconds(_h_dead.pid) is None,
+      f"得到={jb._target_runtime_seconds(_h_dead.pid)!r}")
+check("閘門對 runtime=None 必須回拒絕理由，不得回 None 放行（fail closed）",
+      jb._stall_gate_refusal(None, 99999, "x") is not None)
+check("（對照）閘門對恰好達標的 runtime 必須放行",
+      jb._stall_gate_refusal(jb.SEARCH_STALL_TIMEOUT, 99999, "x") is None)
+check("（對照）閘門對差一秒的 runtime 必須拒絕（邊界不得差一格）",
+      jb._stall_gate_refusal(jb.SEARCH_STALL_TIMEOUT - 1, 99999, "x") is not None)
+
+# H5：systemd 查詢拿不到可用值時必須回 None（空字串／非數字／0 都算），
+# 否則閘門會拿到垃圾值去比大小，比出來的結果毫無意義。
+for _bad in ("\n", "activating\n", "0\n", "n/a\n"):
+    with mock.patch.object(jb.subprocess, "run",
+                           side_effect=lambda *a, _s=_bad, **k: _FakeRunKill(stdout=_s)):
+        check(f"_jobscan_unit_runtime_seconds 對 {_bad.strip() or '<空>'} 必須回 None",
+              jb._jobscan_unit_runtime_seconds() is None,
+              f"得到={jb._jobscan_unit_runtime_seconds()!r}")
 
 # ═══ 結果 ════════════════════════════════════════════════════════════════════
 print()

@@ -408,6 +408,69 @@ MUTATIONS = [
          "                    _fm = cfg.get(\"_fired_today\", {})\n"
          "                    already_fired = _fm.get(today_str, [])\n",
          "M32")),
+
+    # ── 第十一輪（2026-10-06 事故）：存活閘門 ────────────────────────────────
+    # 事故：06:00:53 啟動的掃描，06:01:09 被 watchdog SIGKILL，只活 16 秒。
+    # 缺陷本體是「拿自己的讀取時鐘（last_read_at）當對方卡死的依據」，修法是
+    # 加一道閘門：目標自身的年齡不可能小於它沉默的時間。
+    #
+    # 這幾個變異刻意分開，因為它們是【獨立】的失效模式：閘門整個失效、
+    # 只有 systemd 那條鬆掉、只有 PID 那條鬆掉、邊界差一格、失敗時倒向放行、
+    # 資料來源算錯 —— 任何一個單獨發生都不該能全身而退。
+    ("M33", "存活閘門整個失效（_stall_gate_refusal 永遠放行）",
+     lambda t: sub_once(
+         t,
+         '    if runtime is None:\n'
+         '        return (f"[watchdog] 無法判定 {what} 已跑多久 → 不動手"\n',
+         '    return None\n'
+         '    if runtime is None:\n'
+         '        return (f"[watchdog] 無法判定 {what} 已跑多久 → 不動手"\n',
+         "M33")),
+    ("M34", "只拿掉 systemd 路徑的存活閘門（回復 06:01 誤殺）",
+     lambda t: sub_once(
+         t,
+         '            refusal = _stall_gate_refusal(\n'
+         '                _jobscan_unit_runtime_seconds(), idle, "jobscan.service")\n',
+         '            refusal = None\n'
+         '            _stall_gate_refusal(\n'
+         '                _jobscan_unit_runtime_seconds(), idle, "jobscan.service")\n',
+         "M34")),
+    ("M35", "只拿掉 PID 路徑的存活閘門（手動掃描失去唯一的存活判準）",
+     lambda t: sub_once(
+         t,
+         '            refusal = _stall_gate_refusal(\n'
+         '                _target_runtime_seconds(pid), idle, f"pid={pid}")\n',
+         '            refusal = None\n'
+         '            _stall_gate_refusal(\n'
+         '                _target_runtime_seconds(pid), idle, f"pid={pid}")\n',
+         "M35")),
+    ("M36", "存活閘門邊界差一格（< 改成 <=）",
+     lambda t: sub_once(
+         t,
+         '    if runtime < SEARCH_STALL_TIMEOUT:\n',
+         '    if runtime <= SEARCH_STALL_TIMEOUT:\n',
+         "M36")),
+    ("M37", "查不出年齡時倒向放行而不是拒絕（fail open）",
+     lambda t: sub_once(
+         t,
+         '    if runtime is None:\n'
+         '        return (f"[watchdog] 無法判定 {what} 已跑多久 → 不動手"\n'
+         '                f"（state 自稱卡死，但無法排除是看板自己的讀取時鐘過期）")\n',
+         '    if runtime is None:\n'
+         '        runtime = SEARCH_STALL_TIMEOUT + 1\n',
+         "M37")),
+    ("M38", "/proc/<pid>/stat 取錯欄位（starttime 索引 19 → 18）",
+     lambda t: sub_once(
+         t,
+         '        start_ticks = int(fields[19])          # 第 22 欄；扣掉 pid 與 comm 後索引 19\n',
+         '        start_ticks = int(fields[18])          # 第 22 欄；扣掉 pid 與 comm 後索引 19\n',
+         "M38")),
+    ("M39", "systemd 的微秒沒換算成秒（runtime 恆為大負數 → 矯正成不殺）",
+     lambda t: sub_once(
+         t,
+         '    return time.monotonic() - start_us / 1_000_000\n',
+         '    return time.monotonic() - start_us\n',
+         "M39")),
 ]
 
 
@@ -511,7 +574,7 @@ class Suite:
 #   （宣告值 < 呼叫點數 = 這個數字寫錯了）。
 SUITES = (
     Suite("scan", "掃描鎖", "job_board.py", "tests/test_scan_lock.py",
-          tuple(MUTATIONS), frozenset(EXPECTED_ESCAPES), 90),
+          tuple(MUTATIONS), frozenset(EXPECTED_ESCAPES), 104),
     Suite("location-filter", "地點過濾器", "linkedin_job_search.py",
           "tests/test_location_filter.py",
           tuple(LOCATION_FILTER_MUTATIONS), frozenset(), 57),
