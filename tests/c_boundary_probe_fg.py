@@ -37,6 +37,11 @@ def die(msg):
 
 
 # ── 前置檢查（護欄）—— 理由同 c_boundary_probe.py ───────────────────────────
+# ⚠️【第十五輪 NIT-2】那支腳本原本把理由寫成「watchdog 會對生產的 jobscan.service
+# 送出真的 SIGKILL」—— 那個因果不成立（見該檔的完整推導）。這裡的理由同樣是
+# **保護讀數**：watcher 執行緒每 5 秒會 _external_begin() / _external_pump()，
+# 把 _EXTERNAL 換成【真的那一輪】的內容，跟這個腳本自己指的暫存檔互相汙染。
+# 排程那道理由仍然成立（閘門若被打開且種子逾期，子行程真的會去掃描）。
 _state_p = REPO / "logs/search_state.json"
 _sched_p = REPO / ".job_board_schedule.json"
 if _state_p.exists():
@@ -46,7 +51,7 @@ if _state_p.exists():
         die(f"讀不到 {_state_p}（{e!r}）—— 讀不到就不能證明它是安全的")
     if state.get("phase") == "running":
         die(f"{_state_p} 說 phase=running（pid={state.get('pid')}）—— "
-            f"先確認那一輪真的結束了，否則 watchdog 會殺掉它")
+            f"先確認那一輪真的結束了，否則 watcher 執行緒會把讀數汙染掉")
 if _sched_p.exists():
     try:
         sched = json.loads(_sched_p.read_text(encoding="utf-8"))

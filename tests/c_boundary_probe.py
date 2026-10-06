@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""量測 (c) 閘門的界線：情境 A–E —— **「窗口」不是判準，`read_ok` 才是。**
+"""量測 (c) 閘門的界線：情境 A–E（外加與 A 同序列的 H）——
+**「窗口」不是判準，`read_ok` 才是。**
 
 背景：第十三輪審查的 MINOR-1。我在 `job_board.py` 與 `DECISIONS.md` 寫過
 「(c) 拒絕只會發生在 tick 落進 5ms 窗口的那 0.1%」。那句話把兩件不相干的事
@@ -9,6 +10,11 @@
 - A 非窗口，照樣會落到 (c)（`read_ok=False`）；
 - B、E 在窗口內，卻**不會**落到 (c)；
 - C 在窗口內且會落到 (c)。
+
+第十五輪 reviewer 另外自造了一個對照 **H**（非窗口、偵測時本輪已寫完 N bytes、
+之後不再產出），結論是它與 **A 同一序列** —— 所以這裡把它一起收進來跑，用不同的
+N 驗「兩者的正規化狀態相同」。它真正澄清的是：F 的機制（`size == offset`，一個
+位元組都沒被讀到）**不需要窗口**，把它列在「窗口內」只是它剛好那樣發生。
 
 **這個腳本存在的理由**：`DECISIONS.md`〈續四〉那張 A–G 表引用的是 `/tmp` 底下的
 腳本 —— 而 `/tmp` 會隨重開機消失，那份證據就變成不可複查的宣稱。與
@@ -46,9 +52,16 @@ def die(msg):
 
 
 # ── 前置檢查（護欄）─────────────────────────────────────────────────────────
-# import job_board 會啟動 watchdog_loop()。若 state 自稱 running，watchdog 會
-# 對【生產的】jobscan.service 送出真的 SIGKILL（那是這整條修正線要防的事，
-# 不該由量測腳本自己製造出來）。排程也一樣：閘門若被打開且種子逾期，會跑真的爬蟲。
+# import job_board 會啟動 watchdog_loop() 與 jobscan 監看執行緒。
+# ⚠️【第十五輪 NIT-2】這裡原本寫「若 state 自稱 running，watchdog 會對生產的
+# jobscan.service 送出真的 SIGKILL」—— 那個因果**不成立**：探針行程裡
+# `_EXTERNAL["last_read_at"]` 初值是 0.0，`_external_idle_seconds()` 遇到假值回
+# None，而任何偵測都會把 last_read_at 設成當下，所以一個一秒內結束的腳本不可能
+# 湊到 idle > 900（kill 的前置條件）。
+# **真正會被破壞的是讀數**：watcher 執行緒每 5 秒會 _external_begin() /
+# _external_pump()，把 _EXTERNAL 換成【真的那一輪】的內容，而這個腳本已經把
+# JOBSCAN_LIVE 指到自己的暫存檔 —— 兩者互相汙染，量到的就不是表上那些情境了。
+# 排程那道理由仍然成立（閘門若被打開且種子逾期，子行程真的會去掃描）。
 _state_p = REPO / "logs/search_state.json"
 _sched_p = REPO / ".job_board_schedule.json"
 if _state_p.exists():
@@ -58,7 +71,7 @@ if _state_p.exists():
         die(f"讀不到 {_state_p}（{e!r}）—— 讀不到就不能證明它是安全的")
     if state.get("phase") == "running":
         die(f"{_state_p} 說 phase=running（pid={state.get('pid')}）—— "
-            f"先確認那一輪真的結束了，否則 watchdog 會殺掉它")
+            f"先確認那一輪真的結束了，否則 watcher 執行緒會把讀數汙染掉")
 if _sched_p.exists():
     try:
         sched = json.loads(_sched_p.read_text(encoding="utf-8"))
@@ -95,6 +108,23 @@ jb._reset_external_follow(st)                    # tick 偵測到本輪 → 水�
 jb._follow_live_log(); jb._follow_live_log()     # 之後的 tick，檔案不再長大
 show("A 非窗口、第一次讀取前就停止產出    ", f)
 _tmp_a = f.name
+_a_norm = (jb._EXTERNAL["read_ok"], jb._EXTERNAL["offset"] == os.path.getsize(_tmp_a),
+           list(jb._EXTERNAL["lines"]))
+
+# ── H（第十五輪 reviewer 自造的對照，**非窗口**）：與 A 是【同一序列】—— 偵測時本輪
+#    已經寫完 N bytes（水位 = N），之後不再產出。差別只在 N 的大小、以及這裡沒有
+#    先截斷過。刻意用不同的 N 再跑一次，把「H ≡ A」從宣稱變成量到的結果：
+#    offset 的**數值**不同（200 vs 111），但正規化之後的狀態相同。
+f = tempfile.NamedTemporaryFile("w", suffix=".log", delete=False); f.write("H"*111); f.close()
+jb.JOBSCAN_LIVE = f.name
+jb._reset_external_follow(st)                    # 水位 = 111（這之前沒有任何截斷）
+jb._follow_live_log(); jb._follow_live_log()     # 之後不再產出
+show("H 非窗口、偵測時已寫完 111 bytes  ", f)
+_tmp_h = f.name
+_h_norm = (jb._EXTERNAL["read_ok"], jb._EXTERNAL["offset"] == os.path.getsize(_tmp_h),
+           list(jb._EXTERNAL["lines"]))
+print(f"    └ 正規化狀態 (read_ok, offset==size, lines)：A={_a_norm} H={_h_norm}"
+      f" → 相同？ {_a_norm == _h_norm}（offset 數值 200 vs 111 是唯一差別）")
 
 # ── B（窗口內）：舊檔 67 bytes，tick 落在窗口，本輪之後寫 30 bytes（<67）後卡死
 #    截斷造成 size(30) < offset(67) → resync 歸零重讀 → read_ok=**True**
@@ -142,13 +172,22 @@ print(f"E 窗口內、本輪跑得比水位快：read_ok={jb._EXTERNAL['read_ok'
       f"offset={jb._EXTERNAL['offset']!r} 讀進 pending={len(jb._EXTERNAL['pending'])} bytes"
       f" ← 本輪開頭 67 bytes 被跳過（read_ok 仍正確為 True）")
 
-for _p in (_tmp_a, _tmp_b, _tmp_c, _tmp_d, f.name):
+for _p in (_tmp_a, _tmp_h, _tmp_b, _tmp_c, _tmp_d, f.name):
     os.unlink(_p)
 
 print("""
 ※ 讀法（前提：idle 已超過門檻、runtime 可判定 —— 這兩道在 _stall_gate_refusal()
   裡都排在 (c) 之前；少了這個前提，「落到 (c)」就不成立）：
-    read_ok=False ⟺ 偵測水位之後一個本輪的位元組都沒被讀到 ⟺ 閘門回 (c)。
-  A（非窗口）=False、B（窗口內）=True、C（窗口內）=False、D=True、E=True
+    read_ok=False ⟺ 偵測那一刻之後才寫進檔案的位元組一個都沒被讀到 ⟺ 閘門回 (c)。
+    ⚠️ 只能用時間講，不能用位址講：「水位之後」有第二種讀法，而 B 就是它的反例
+    （B 的 read_ok=True 靠 resync 從 0 重讀，讀到位址【低於】水位的位元組，
+      那些位元組是本輪寫的）。第十五輪 NIT-3。
+  A（非窗口）=False、H（非窗口，與 A 同序列）=False、B（窗口內）=True、
+  C（窗口內）=False、D=True、E=True
   ⇒ 窗口【既非充分也非必要】。「會落 (c)」不是窗口的性質，是 read_ok 的性質。
+  三個 read_ok=False 的**成因不同**（別把它們講成同一種）：
+    A、H：偵測之後檔案沒再變動 → 比對時 size == offset → 無事可讀。
+    C   ：偵測之後檔案被截斷且沒有新內容 → size < offset 觸發 resync → 重讀一個
+          空檔案（所以 C 的 size == offset 是【重讀之後】才相等的，不是成因）。
+    F   ：偵測之後檔案被截斷、又寫回**同一個大小** → size == offset → 無事可讀。
 """)
