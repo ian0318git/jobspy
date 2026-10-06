@@ -720,6 +720,14 @@ def _fake_run_pos(cmd, **kw):
     return _FakeRun()
 
 
+# ⚠️【第十一輪 C-1 加入後，這一行也是必要的前提宣告】
+# 新的閘門要求「本輪至少讀到過一次非空輸出」(ever_read)，否則拒絕動手 ——
+# 因為讀不到東西時，idle 量的是【我們自己多久沒讀到】，不是目標沉默多久。
+# 這裡要測的是「目標確實跑了足夠久 + 身分相符 → 必須動手」，前提是本輪讀得到
+# 輸出（否則 idle 不可信）。不宣告的話這幾條會全部倒向拒絕而失敗 ——
+# 那正是閘門該有的行為，所以是【測試的前提沒寫清楚】，不是閘門錯了。
+jb._EXTERNAL["read_ok"] = True
+
 with mock.patch.object(jb, "read_jobscan_state",
                        return_value={"phase": "running", "pid": victim_pid,
                                      "run_id": "pos_manual", "trigger": "manual"}):
@@ -787,6 +795,8 @@ def _fake_run3(cmd, **kw):
         return _FakeRunKill(stdout=_unit_stdout("activating", _F7_AGE))
     return _FakeRunKill()
 
+
+jb._EXTERNAL["read_ok"] = True     # 同 F7a：前提是本輪讀得到輸出（C-1）
 
 with mock.patch.object(jb, "read_jobscan_state",
                        return_value={"phase": "running", "pid": 999999,
@@ -1929,6 +1939,12 @@ def _fake_run_h2(cmd, **kw):
     return _FakeRunKill()
 
 
+# 宣告 ever_read=True 是為了【隔離 (b) 這條判準】：不宣告的話，新的 (c) 檢查
+# 「本輪從未讀到輸出」會先一步拒絕，NIT-2 那句「以『太年輕』為由拒絕」就測不到了。
+# 真實的 06:01 現場是哪一種其實不確定（(b) 與 (c) 都指向拒絕），
+# 所以下面 C-1 那一節會再用 ever_read=False 走一次同一條路徑。
+jb._EXTERNAL["read_ok"] = True
+
 with mock.patch.object(jb, "read_jobscan_state",
                        return_value={"phase": "running", "pid": 999999,
                                      "run_id": "young_timer", "trigger": "systemd-timer"}):
@@ -1952,6 +1968,92 @@ check("（承上）必須真的走到閘門並以『太年輕』為由拒絕，�
 _h_victim.kill()
 wait_dead(_h_victim)
 
+# ═══ C-1（第十一輪 CRITICAL）：讀取時鐘是【本輪的】，但一個字都沒讀到 ═══════════
+#
+# 這一節是第十一輪審查打回來的那個洞。判斷只用了三行算術：
+#   _reset_external_follow() 在【偵測到】一輪時把 last_read_at 設成當下，
+#   而偵測必定晚於該輪啟動 → 只要偵測之後一個 chunk 都沒讀到，就恆有
+#     idle = now − 偵測時刻  <=  now − 啟動時刻 = runtime
+#   → `runtime < idle` 【永遠不成立】→ idle 一過門檻就放行 → 殺掉健康掃描。
+# 這正是 #16 的 C 段（tee 寫不進去 → live log 空的）會製造的狀態。
+#
+# 下面這條是關鍵斷言：**故意讓 runtime 遠大於 idle**（舊判準在這種輸入下必定放行），
+# 只靠 ever_read=False 擋下來。拿掉 ever_read 檢查，這一條就會失敗。
+
+_c1_syscalls = []
+
+
+def _fake_run_c1(cmd, **kw):
+    _c1_syscalls.append(cmd)
+    # systemd 分支要看起來完全正常：unit 在跑、而且已經跑很久（遠超過宣稱的沉默）
+    if "ExecMainStartTimestampMonotonic" in cmd:
+        return _FakeRunKill(stdout=_unit_stdout("activating", 99999))
+    return _FakeRunKill()
+
+
+jb._EXTERNAL["read_ok"] = False          # ← 本輪從未讀到任何輸出（C-1 的觸發條件）
+with mock.patch.object(jb, "read_jobscan_state",
+                       return_value={"phase": "running", "pid": 999999,
+                                     "run_id": "c1_never_read", "trigger": "systemd-timer"}):
+    with mock.patch.object(jb, "_external_idle_seconds", return_value=_F7_IDLE):
+        with mock.patch.object(jb, "_we_hold_scan_lock", return_value=False):
+            with mock.patch.object(jb.subprocess, "run", side_effect=_fake_run_c1):
+                _c1_res = _REAL_KILL_EXTERNAL()
+
+check("【C-1】runtime(99999s) 遠大於 idle(1000s)、但本輪從未讀到輸出 → 必須拒絕動手",
+      _c1_res is None, f"回傳={_c1_res!r}")
+check("【C-1】且不得送出任何 kill（這是殺掉健康掃描的那一步）",
+      [c for c in _c1_syscalls if "kill" in c] == [], f"實際呼叫={_c1_syscalls}")
+check("【C-1】拒絕理由必須指向【讀取路徑】而不是目標太年輕（否則 UI 會誤導排查方向）",
+      "從未從 live log 讀到任何輸出" in jb._STALL_VERDICT["note"],
+      f"判定={jb._STALL_VERDICT['note']!r}")
+
+# 單元層：三種 ever_read 的組合，確認 (c) 是獨立的一條，不是 (b) 的別名。
+check("【C-1】ever_read=False 時，即使 runtime 遠大於 idle 也必須拒絕",
+      jb._stall_gate_refusal(99999, 5000, "x", ever_read=False) is not None)
+check("【C-1】ever_read=False 的拒絕訊息必須是「從未讀到輸出」那一條",
+      "從未從 live log 讀到" in (jb._stall_gate_refusal(99999, 5000, "x", ever_read=False) or ""))
+check("【C-1】ever_read=False 但 idle 未達門檻 → 仍然拒絕（門檻先擋，不吵）",
+      jb._stall_gate_refusal(99999, jb.SEARCH_STALL_TIMEOUT, "x", ever_read=False) is not None)
+check("（對照）同樣的輸入在 ever_read=True 時【必須放行】—— 證明 (c) 真的有在作用，"
+      "不是靠別的條件順便擋下來的",
+      jb._stall_gate_refusal(99999, 5000, "x", ever_read=True) is None)
+
+# ever_read 是【關鍵字且無預設值】：忘了傳就該當場 TypeError，而不是靜默回到誤殺行為。
+try:
+    jb._stall_gate_refusal(99999, 5000, "x")
+    _c1_missing = None
+except TypeError as e:
+    _c1_missing = str(e)
+check("【C-1】ever_read 不得有預設值（忘了傳必須炸，不能靜默 fail-open）",
+      _c1_missing is not None and "ever_read" in _c1_missing, f"得到={_c1_missing!r}")
+
+# 旗標的生命週期：_reset_external_follow 歸零、_follow_live_log 讀到東西才設起。
+# 這兩個是 read_ok 唯一的寫入點，所以要直接驗，不能只靠上面的 mock。
+jb._EXTERNAL["read_ok"] = True
+jb._reset_external_follow({"run_id": "c1_lifecycle", "trigger": "manual",
+                           "started_at": None})
+check("【C-1】開始跟讀新的一輪時 read_ok 必須歸零",
+      jb._EXTERNAL["read_ok"] is False, f"得到={jb._EXTERNAL['read_ok']!r}")
+
+_c1_live = tempfile.NamedTemporaryFile("w", suffix=".log", delete=False)
+_c1_live.write("第一行輸出\n")
+_c1_live.close()
+try:
+    with mock.patch.object(jb, "JOBSCAN_LIVE", _c1_live.name):
+        jb._follow_live_log()
+    check("【C-1】_follow_live_log 讀到非空內容後 read_ok 必須變 True",
+          jb._EXTERNAL["read_ok"] is True, f"得到={jb._EXTERNAL['read_ok']!r}")
+    # 反向：檔案在、但沒有新內容 → 不得把 read_ok 設起來
+    # （若只在「檔案存在」時就設 True，C-1 的防護會整條失效）
+    jb._EXTERNAL["read_ok"] = False
+    with mock.patch.object(jb, "JOBSCAN_LIVE", _c1_live.name):
+        jb._follow_live_log()
+    check("【C-1】沒有新內容時 read_ok 不得被設起（否則防護失效）",
+          jb._EXTERNAL["read_ok"] is False, f"得到={jb._EXTERNAL['read_ok']!r}")
+finally:
+    os.unlink(_c1_live.name)
+
 # H4：fail closed —— 判定不出來的時候必須倒向【不殺】，不是倒向放行。
 # SIGKILL 不可逆，所以「不確定」的唯一安全方向是拒絕。
 _h_dead = subprocess.Popen([sys.executable, "-c", "pass"])
@@ -1960,18 +2062,18 @@ check("_target_runtime_seconds 對已結束的 pid 必須回 None（不猜）",
       jb._target_runtime_seconds(_h_dead.pid) is None,
       f"得到={jb._target_runtime_seconds(_h_dead.pid)!r}")
 check("閘門對 runtime=None 必須回拒絕理由，不得回 None 放行（fail closed）",
-      jb._stall_gate_refusal(None, 99999, "x") is not None)
+      jb._stall_gate_refusal(None, 99999, "x", ever_read=True) is not None)
 # ⚠️【第十輪：這一組是為了抓 M37 而補的】上面那條【不足以】證明 fail-closed。
-# `_stall_gate_refusal(None, 99999)` 在「runtime 未知 → 拒絕」與「runtime 被偷偷
+# `_stall_gate_refusal(None, 99999, ever_read=True)` 在「runtime 未知 → 拒絕」與「runtime 被偷偷
 # 換成某個預設值 901 → 901 < 99999 也拒絕」兩種情況下【都會通過】。
 # 變異測試當場證明過：M37 在這一條之下全身而退。
 # 所以要另外逼出「沒有任何預設值」這件事 —— 一是看它走哪條分支，二是把 idle 放到
 # 剛過門檻，讓任何捏造出來的「夠老」預設值當場穿幫。
 check("runtime 未知時必須走『無法判定』那條分支，不得用預設值代替（本項為訊息層級斷言）",
-      (jb._stall_gate_refusal(None, 99999, "x") or "").startswith("[watchdog] 無法判定"))
+      (jb._stall_gate_refusal(None, 99999, "x", ever_read=True) or "").startswith("[watchdog] 無法判定"))
 check("runtime 未知 + idle 只剛過門檻 → 仍必須拒絕（捏造預設值會在此穿幫）",
-      jb._stall_gate_refusal(None, jb.SEARCH_STALL_TIMEOUT + 1, "x") is not None,
-      f"得到={jb._stall_gate_refusal(None, jb.SEARCH_STALL_TIMEOUT + 1, 'x')!r}")
+      jb._stall_gate_refusal(None, jb.SEARCH_STALL_TIMEOUT + 1, "x", ever_read=True) is not None,
+      f"得到={jb._stall_gate_refusal(None, jb.SEARCH_STALL_TIMEOUT + 1, 'x', ever_read=True)!r}")
 
 # ⚠️⚠️【第十輪審查 MAJOR-1 的迴歸保護 —— 這一條是整輪的核心】⚠️⚠️
 #
@@ -1985,8 +2087,8 @@ check("runtime 未知 + idle 只剛過門檻 → 仍必須拒絕（捏造預設�
 # 而且會讓「改成正確判準」的實驗掛在這一條上。審查者實測：把判準改成
 # `runtime < idle` 之後，全套只有這一條失敗。
 check("【MAJOR-1】runtime 剛好到門檻、卻被宣稱沉默遠久於此 → 必須拒絕",
-      jb._stall_gate_refusal(jb.SEARCH_STALL_TIMEOUT, 99999, "x") is not None,
-      f"得到={jb._stall_gate_refusal(jb.SEARCH_STALL_TIMEOUT, 99999, 'x')!r}")
+      jb._stall_gate_refusal(jb.SEARCH_STALL_TIMEOUT, 99999, "x", ever_read=True) is not None,
+      f"得到={jb._stall_gate_refusal(jb.SEARCH_STALL_TIMEOUT, 99999, 'x', ever_read=True)!r}")
 # 這一條是事故現場的定量重演。兩個數字的來源要分開講清楚：
 #   runtime = 16s  ——【實測】systemd journal：06:00:53.390 Starting →
 #                     06:01:09.774 Sent signal SIGKILL，即 16.4 秒。
@@ -1997,21 +2099,21 @@ check("【MAJOR-1】runtime 剛好到門檻、卻被宣稱沉默遠久於此 →
 #                     （06:01→11:01），不是當時的 idle，別把兩者搞混。
 # 判準的有效性不依賴這個數字：runtime=16s 配上【任何】大於門檻的 idle 都必須拒絕。
 check("【MAJOR-1】runtime=16s（journal 實測）、idle=8 小時（推估，見上）→ 必須拒絕",
-      jb._stall_gate_refusal(16, 8 * 3600, "x") is not None,
-      f"得到={jb._stall_gate_refusal(16, 8 * 3600, 'x')!r}")
+      jb._stall_gate_refusal(16, 8 * 3600, "x", ever_read=True) is not None,
+      f"得到={jb._stall_gate_refusal(16, 8 * 3600, 'x', ever_read=True)!r}")
 
 # 邊界：判準改成拿 idle 當比較對象之後，[恰好相等] 與 [差一秒] 兩個方向都要釘住。
 # 這一組同時守住「矯正成永不開火」—— 真的卡死的掃描（runtime >= idle）必須放行。
 check("（邊界）runtime 恰好等於 idle → 必須放行（不得矯正成永不開火）",
-      jb._stall_gate_refusal(99999, 99999, "x") is None,
-      f"得到={jb._stall_gate_refusal(99999, 99999, 'x')!r}")
+      jb._stall_gate_refusal(99999, 99999, "x", ever_read=True) is None,
+      f"得到={jb._stall_gate_refusal(99999, 99999, 'x', ever_read=True)!r}")
 check("（邊界）runtime 比 idle 少一秒 → 必須拒絕（不得差一格）",
-      jb._stall_gate_refusal(99998, 99999, "x") is not None)
+      jb._stall_gate_refusal(99998, 99999, "x", ever_read=True) is not None)
 check("（邊界）runtime 比 idle 多一秒 → 必須放行",
-      jb._stall_gate_refusal(100000, 99999, "x") is None)
+      jb._stall_gate_refusal(100000, 99999, "x", ever_read=True) is None)
 # (a) 的防禦性分支：idle 自己沒過門檻時，不管 runtime 多大都不該動手。
 check("（防禦）idle 未達門檻時必須拒絕，即使 runtime 很大",
-      jb._stall_gate_refusal(99999, jb.SEARCH_STALL_TIMEOUT, "x") is not None)
+      jb._stall_gate_refusal(99999, jb.SEARCH_STALL_TIMEOUT, "x", ever_read=True) is not None)
 
 # H5：systemd 合併查詢拿不到可用值時必須回 None（空字串／非數字／0 都算），
 # 否則閘門會拿到垃圾值去比大小，比出來的結果毫無意義。

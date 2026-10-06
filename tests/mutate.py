@@ -451,14 +451,17 @@ MUTATIONS = [
     ("M34", "只拿掉 systemd 路徑的存活閘門（回復 06:01 誤殺）",
      lambda t: sub_once(
          t,
-         '            refusal = _stall_gate_refusal(unit_runtime, idle, "jobscan.service")\n',
+         '            refusal = _stall_gate_refusal(\n'
+         '                unit_runtime, idle, "jobscan.service",\n'
+         '                ever_read=_EXTERNAL["read_ok"])\n',
          '            refusal = None\n',
          "M34")),
     ("M35", "只拿掉 PID 路徑的存活閘門（手動掃描失去唯一的存活判準）",
      lambda t: sub_once(
          t,
          '            refusal = _stall_gate_refusal(\n'
-         '                _target_runtime_seconds(pid), idle, f"pid={pid}")\n',
+         '                _target_runtime_seconds(pid), idle, f"pid={pid}",\n'
+         '                ever_read=_EXTERNAL["read_ok"])\n',
          '            refusal = None\n',
          "M35")),
     ("M36", "存活閘門邊界差一格（runtime < idle 改成 <=）",
@@ -541,6 +544,35 @@ MUTATIONS = [
          '        return None, None\n',
          '',
          "M45")),
+
+    # ── 第十一輪退回（C-1 CRITICAL）：本輪根本讀不到任何輸出 ──────────────────
+    # 缺陷是【算術上不可能成立】的那一種，所以不能靠「換個數字再測一次」抓到：
+    #   last_read_at 在【偵測到】一輪時被設成當下，而偵測必定晚於該輪啟動，
+    #   於是「一個 chunk 都沒讀到」時恆有 idle <= runtime
+    #   → runtime < idle 永遠不成立 → 閘門整個不作用。
+    # 真正擋下它的是 read_ok/ever_read。這兩條變異各自拿掉防護的一端：
+    #   M46 拿掉判準端的檢查（就算旗標是 False 也照殺）
+    #   M47 拿掉旗標端的設定（把「讀到非空內容」放寬成「檔案存在」）
+    ("M46", "【第十一輪 C-1】拿掉 ever_read 前置（本輪沒讀到任何輸出也照殺）",
+     lambda t: sub_once(
+         t,
+         '    if not ever_read:\n'
+         '        return (f"[watchdog] 拒絕動手：本輪（{what}）從未從 live log 讀到任何輸出 —— "\n'
+         '                f"無法區分「掃描真的卡死」與「看板的讀取路徑故障」，不動手")\n',
+         '',
+         "M46")),
+    ("M47", "【第十一輪 C-1】旗標的設定點消失（永遠讀不到「本輪讀過東西」這個事實）",
+     lambda t: sub_once(
+         t,
+         '            _EXTERNAL["read_ok"] = True\n',
+         '',
+         "M47")),
+    ("M48", "【第十一輪 C-1】新的一輪沒有把旗標歸零（沿用上一輪的結論）",
+     lambda t: sub_once(
+         t,
+         '            "read_ok": False,\n',
+         '',
+         "M48")),
 ]
 
 

@@ -614,6 +614,7 @@ _EXTERNAL = {
     "pending": "",          # 尚未成行的尾段（檔案正在被寫入）
     "offset": 0,
     "last_read_at": 0.0,    # time.monotonic()；沉默偵測用
+    "read_ok": False,       # 【本輪】是否至少讀到過一次非空輸出（見 _stall_gate_refusal 的 C-1）
     "pre_run_file": None,   # 掃描開始時使用者在看的檔（用來尊重他的選檔）
     "finished": None,       # 最近一次外部掃描的結果
 }
@@ -799,7 +800,16 @@ def _jobscan_unit_props():
 
     state 與 runtime 拿不到是【獨立】的兩件事，呼叫端必須分得出來：
     state 有值但不是 active/activating → unit 不在跑，沒有對象可終止；
-    state 為 None → 查詢失敗，此時【不該動手】（送的是不可逆的 SIGKILL）。
+    state 為 None → **查詢本身失敗，我們不知道 unit 在不在跑**。
+
+    ⚠️【第十一輪 m-2】這裡原本寫「state 為 None → 此時【不該動手】」，但呼叫端
+    並不是這樣做的：它會落到 PID 路徑，只要 cmdline 身分檢查與那邊的存活閘門
+    都過就會真的動手。兩者互相矛盾，而【行為是對的、docstring 是錯的】——
+    PID 路徑有自己的 cmdline 身分檢查，本來就是查詢失敗時合理的退路；
+    而且 systemctl 的暫時性失敗不該讓 watchdog 整個癱瘓。
+    所以修的是這句話，以及呼叫端那句會說謊的日誌（它原本把「查不到」講成
+    「目前為 未知，沒有可終止的掃描」—— 後半句是在宣稱一件我們不知道的事）。
+    真正【不准】動手的是閘門與身分檢查，不是查詢失敗本身。
 
     權威來源是 systemd：unit 自己知道它是何時被啟動的，不受看板自己的
     _EXTERNAL 狀態陳舊影響 —— 那正是 2026-10-06 事故的成因，見
@@ -895,15 +905,21 @@ def _target_runtime_seconds(pid):
             uptime = float(f.read().split()[0])
         boottime_minus_monotonic = (
             time.clock_gettime(time.CLOCK_BOOTTIME) - time.monotonic())
+        # [第十一輪 m-1] sysconf 原本在 try【之外】：它一拋例外就會逃出本函式，
+        # 而 docstring 承諾的是「無法判斷就回 None」。逃出去會讓
+        # kill_stalled_external() 整個拋例外 —— watchdog_loop 只印一行
+        # `[watchdog] Error:`，同一 tick 後面的 reap_orphan_search_lock() 也不會跑。
+        # 本機 Linux 回 100，實務可達性低；但這是「函式自己承諾的契約」問題，
+        # 不是機率問題。它拋的正是 ValueError / OSError，已在下面的 except 之內。
+        hz = os.sysconf("SC_CLK_TCK")
     except (OSError, ValueError, IndexError, AttributeError):
         return None
-    hz = os.sysconf("SC_CLK_TCK")
     if hz <= 0:
         return None
     return uptime - start_ticks / hz - max(0.0, boottime_minus_monotonic)
 
 
-def _stall_gate_refusal(runtime, idle, what):
+def _stall_gate_refusal(runtime, idle, what, *, ever_read):
     """存活閘門。允許動手回 None，否則回【該寫進日誌的拒絕理由】。
 
     【缺陷本體（2026-10-06 事故）】上面算出的 idle 量的是【看板自己的讀取時鐘】
@@ -934,11 +950,38 @@ def _stall_gate_refusal(runtime, idle, what):
     runtime 拿不到一律不動手 —— 要送的是不可逆的 SIGKILL，不確定必須倒向不殺。
     真正卡死的掃描仍有 systemd 的 TimeoutStartSec=5h 當退路（DECISIONS.md 風險 #7）。
 
-    【本修法的代價，誠實記錄】改拿 idle 當比較對象之後，閘門就【依賴
-    _follow_live_log() 真的有在讀目標的 live log】。若它因故讀不到（例如讀錯檔），
-    真的卡死的掃描會因為 idle 一直贏過 runtime 而永遠不被 watchdog 收掉，
-    只剩 5 小時逾時這條退路。這是拿「可回收性」換「不誤殺」，方向是刻意選的：
-    誤殺會殺掉健康掃描並讓當天的資料整個缺一輪，漏殺只是晚五小時。
+    ⚠️【第十一輪審查 CRITICAL-1】光是 (b) 還不夠，而且不夠的方式很隱蔽。
+    `_reset_external_follow()` 在【偵測到】一輪時就把 last_read_at 設成當下，
+    而偵測必定晚於該輪啟動 —— 所以只要「偵測之後一個 chunk 都沒讀到」，就恆有
+    idle = now − 偵測時刻 <= now − 啟動時刻 = runtime，於是 `runtime < idle`
+    【永遠不成立】→ idle 一過 900s 就放行 → 殺掉一個健康、正在產出的掃描。
+
+    而那正是 #16 的 C 段會製造的狀態：tee 寫不進去（磁碟在 state 寫入之後才滿、
+    權限改變、live log 被刪）→ search_current.log 整輪是空的 → 讀不到 →
+    last_read_at 停在偵測那一刻。掃描本身完全健康，卻在 T+900s 被收掉。
+
+    所以判準需要第三個條件：
+      (c) 本輪【至少讀到過一次非空輸出】(ever_read)。
+    沒有 (c)，idle 就不是「目標沉默多久」的證據，而只是「我們自己多久沒讀到東西」——
+    跟 (b) 要防的「時鐘過期」是同一種病，只是換了個起點。
+
+    (c) 必須是【關鍵字引數且無預設值】：這是安全閘門，呼叫端必須明講「本輪的讀取
+    路徑是否已知可用」。給預設值就等於埋一個 fail-open 的坑 —— 忘了傳的呼叫端會
+    靜默地回到誤殺行為。
+
+    【本修法的代價，誠實記錄 —— 第十一輪 MAJOR-1 更正】
+    這道閘門保證的【只有一件事】：當 idle 不足以證明目標沉默時，不殺。
+    它同時【預設讀取路徑為真】，所以兩種壞掉的方向代價不同：
+      - 讀取時鐘停在【上一輪】(b) → idle 被灌大 → 拒絕 → 漏殺（晚 5 小時逾時）
+      - 讀取時鐘是本輪的、之後讀不到 (c) → 拒絕 → 漏殺（晚 5 小時逾時）
+    兩種都倒向「不殺」。這仍是拿「可回收性」換「不誤殺」，但【不是】本版已達成的
+    「絕不誤殺」—— 見下方殘餘風險。方向是刻意選的：誤殺會殺掉健康掃描並讓當天的
+    資料整個缺一輪，漏殺只是晚五小時。
+
+    【殘餘風險，未修】若讀取路徑「看起來正常」但回報的內容與實際脫節 —— 例如
+    _follow_live_log() 讀到了【別的掃描】的輸出（讀錯檔），ever_read 會是 True，
+    idle 也會被推著走，於是閘門形同不存在。修法見 DECISIONS.md：讓 run_scan.sh
+    寫一個獨立的心跳檔，用「心跳新鮮度」而不是看板自己的讀取時鐘當存活證據。
     """
     if runtime is None:
         return (f"[watchdog] 無法判定 {what} 已跑多久 → 不動手"
@@ -946,10 +989,15 @@ def _stall_gate_refusal(runtime, idle, what):
     if idle <= SEARCH_STALL_TIMEOUT:
         return (f"[watchdog] 拒絕動手：{what} 只沉默 {idle:.0f}s，"
                 f"未達門檻 {SEARCH_STALL_TIMEOUT}s")
+    if not ever_read:
+        return (f"[watchdog] 拒絕動手：本輪（{what}）從未從 live log 讀到任何輸出 —— "
+                f"無法區分「掃描真的卡死」與「看板的讀取路徑故障」，不動手")
     if runtime < idle:
-        return (f"[watchdog] 拒絕動手：{what} 只存在 {runtime:.0f}s，"
-                f"短於它被宣稱沉默的 {idle:.0f}s —— 不可能，"
-                f"判定為 last_read_at 過期而非掃描卡死")
+        # runtime 可能因為 BOOTTIME 校正而變成負數，對判斷無妨（更偏拒絕），
+        # 但直接印出來會說「只存在 -3570s」這種讀不懂的話，所以顯示時夾在 0。
+        return (f"[watchdog] 拒絕動手：{what} 只存在 {max(0.0, runtime):.0f}s，"
+                f"短於它被宣稱沉默的 {idle:.0f}s —— 兩者不相容，"
+                f"讀取時鐘不可信，無法判定卡死與否，不動手")
     return None
 
 
@@ -1030,13 +1078,25 @@ def kill_stalled_external():
     verdict = None
 
     def _set_verdict(stalled, note):
-        """先講先贏。systemd 分支的存活判定比 PID 分支的身分判定更貼近「卡死與否」
-        這個問題，不該被後續分支蓋掉 —— H3 就是這樣：systemd 分支正確地以
-        「只存在 16s」拒絕，若讓後面的 PID 分支覆寫，UI 只會看到「cmdline 不符」，
+        """先講先贏 —— 【只適用於推論】。
+        systemd 分支的存活判定比 PID 分支的身分判定更貼近「卡死與否」這個問題，
+        不該被後續分支蓋掉 —— H3 就是這樣：systemd 分支正確地以「只存在 16s」拒絕，
+        若讓後面的 PID 分支覆寫，UI 只會看到「cmdline 不符」，
         『掃描並不卡死』這個真正的結論反而消失了。"""
         nonlocal verdict
         if verdict is None:
             verdict = (stalled, note)
+
+    def _force_verdict(stalled, note):
+        """【實際動手的結果】永遠蓋過較早的推論。
+
+        [第十一輪 m-3] 先講先贏對推論是對的，對「我們真的送了訊號、結果什麼也沒殺到」
+        是錯的 —— 那是【事實】，不是判斷。原版這個情況走 _set_verdict，結論被丟棄：
+        systemd 分支先寫入「unit 太年輕」→ PID 分支的閘門放行 → _kill_tree 回空
+        （pid 在檢查與動手之間消失）→ 「沒有任何行程被終止」被吃掉，UI 只看到
+        systemd 分支的理由，於是畫面與實際發生的事無關。"""
+        nonlocal verdict
+        verdict = (stalled, note)
 
     target = None
     if trigger == "systemd-timer":
@@ -1053,7 +1113,9 @@ def kill_stalled_external():
             # 檢查，沒有任何存活判準 —— 06:01:09 那 16 秒的健康掃描就是死在這裡。
             # 這裡用 unit 自己的啟動時間：要收的是整個 cgroup，而 wrapper 被
             # SIGKILL 之後 /proc 就查不到了，systemd 的答案仍然有效。
-            refusal = _stall_gate_refusal(unit_runtime, idle, "jobscan.service")
+            refusal = _stall_gate_refusal(
+                unit_runtime, idle, "jobscan.service",
+                ever_read=_EXTERNAL["read_ok"])
             if refusal:
                 _log(refusal)
                 _set_verdict(False, refusal)
@@ -1073,12 +1135,19 @@ def kill_stalled_external():
                         # 送出 kill 但 systemd 說沒成功。這【不能】記成「已終止」——
                         # 2026-09-19 實測過對 inactive unit 送 kill 會回 0 卻什麼也沒殺，
                         # 反向的假成功同樣是靜默謊言。
-                        _set_verdict(False, f"systemctl kill 回傳 {r.returncode}，未確認終止")
+                        _force_verdict(False, f"systemctl kill 回傳 {r.returncode}，未確認終止")
                 except (OSError, subprocess.SubprocessError) as e:
                     _log(f"[watchdog] systemctl kill 失敗: {e}")
-                    _set_verdict(False, f"systemctl kill 失敗: {e}")
+                    _force_verdict(False, f"systemctl kill 失敗: {e}")
+        elif act is None:
+            # 查詢失敗 ≠ unit 沒在跑。原本兩者共用同一句話，於是「查不到」被講成
+            # 「目前為 未知，沒有可終止的掃描」—— 後半句是在宣稱一件我們不知道的事。
+            # [第十一輪 m-2] 落回 PID 路徑本身是對的（那裡有 cmdline 身分檢查與
+            # 自己的存活閘門），要修的是這句日誌。
+            _log("[watchdog] 查詢 jobscan.service 狀態失敗 → 無法確認 unit 在不在跑，"
+                 "改走 PID 路徑（並受 cmdline 身分檢查）")
         else:
-            _log(f"[watchdog] jobscan.service 目前為 {act or '未知'}，"
+            _log(f"[watchdog] jobscan.service 目前為 {act}，"
                  f"沒有可終止的掃描 → 改走 PID 路徑（並受 cmdline 身分檢查）")
     if target is None and isinstance(pid, int) and pid > 1 and pid != os.getpid():
         # 第二層：即使 state 自稱 running，pid 也可能在我們讀它之後被回收。送不可逆的
@@ -1088,7 +1157,8 @@ def kill_stalled_external():
             # systemd 分支直接走到這裡，所以在這條路徑上它是【唯一】的存活判準。
             # 來源用 /proc 而不是 systemd，維持這條路徑對 systemd 的獨立性。
             refusal = _stall_gate_refusal(
-                _target_runtime_seconds(pid), idle, f"pid={pid}")
+                _target_runtime_seconds(pid), idle, f"pid={pid}",
+                ever_read=_EXTERNAL["read_ok"])
             if refusal:
                 _log(refusal)
                 _set_verdict(False, refusal)
@@ -1098,7 +1168,7 @@ def kill_stalled_external():
                     target = f"PID {', '.join(str(p) for p in killed)} (run_id={run_id})"
                     _set_verdict(True, f"pid={pid} 已沉默 {idle:.0f}s，判定卡死並終止")
                 else:
-                    _set_verdict(False, f"pid={pid} 沒有任何行程被終止")
+                    _force_verdict(False, f"pid={pid} 沒有任何行程被終止")
         else:
             _log(f"[watchdog] 拒絕對 pid={pid} 動手：cmdline 不屬於 jobspy 掃描"
                  f"（state 可能來自上一輪，pid 已被回收）")
@@ -1119,6 +1189,13 @@ def kill_stalled_external():
 def _reset_external_follow(state):
     """（重新）開始跟讀一次外部掃描。回傳 (run_id, trigger)。"""
     global _LAST_SCAN_SOURCE
+    # [第十一輪 m-4] 上一輪的判定不適用於新的一輪。不清掉的話，新掃描才剛開始、
+    # 畫面就已經掛著「— 已判定卡死，watchdog 將終止」—— 那是上一輪的結論。
+    # 正常情況 60 秒後會被 watchdog 自己的「尚未超過門檻」覆蓋，但前端那個分支
+    # 【不顯示判定年齡】，而且 watchdog 執行緒若死了就永遠不會被覆蓋。
+    # 放在臨界區【之前】：_record_stall_verdict 不碰 _EXTERNAL，不需要鎖，
+    # 先清掉也讓「判定」與「新一輪開始」在時間上不會交錯。
+    _record_stall_verdict(False, "新的一輪剛開始，watchdog 尚未對它作出判定")
     with SEARCH_LOCK:
         _EXTERNAL.update({
             "active": True,
@@ -1130,6 +1207,9 @@ def _reset_external_follow(state):
             "pending": "",
             "offset": 0,
             "last_read_at": time.monotonic(),
+            # 新的一輪 = 我們對它還【一個字都沒讀到】。這個旗標是 C-1 的閘門依據：
+            # 沒有它就分不出「掃描真的卡死」與「看板自己的讀取路徑壞掉」。
+            "read_ok": False,
             # 掃描結束若換檔，會把使用者從他正在看的檔案上踢走。先記下來。
             "pre_run_file": CURRENT_FILE,
         })
@@ -1203,6 +1283,10 @@ def _follow_live_log():
         _EXTERNAL["offset"] = new_off
         if chunk:
             _EXTERNAL["last_read_at"] = now
+            # 讀到【非空】的內容才算「本輪讀得到」。這是 read_ok 唯一的設定點，
+            # 刻意與 last_read_at 綁在同一個 if 裡：兩者都只在真的收到資料時前進，
+            # 所以「read_ok 為真」等價於「last_read_at 有被本輪推過至少一次」。
+            _EXTERNAL["read_ok"] = True
 
 
 def maybe_adopt_new_results(pre_run_file):
@@ -2646,7 +2730,12 @@ async function pollSearchStatus(){
       // 那會出現「畫面說卡死、journal 裡 watchdog 每 60 秒說一次拒絕動手」的分裂。
       // 判定最多 60 秒舊，所以要老實標出它是幾秒前的判定。
       if(s.stalled){
-        txt.textContent+=' — 已判定卡死，watchdog 將終止';
+        // [第十一輪 m-4] 這條分支原本【不顯示判定年齡】，於是它比另一條更會說謊：
+        // 上一輪的「卡死」判定會一直掛在畫面上，而使用者無從得知那是多久以前的。
+        // 兩條分支都要老實標出年齡。
+        const _va=Math.floor(s.stall_verdict_age||0);
+        txt.textContent+=` — 已判定卡死，watchdog 將終止（${_va}s 前的判定）`;
+        if(s.stall_note) txt.title=s.stall_note;
       }else if(s.stall_verdict_age!==null&&s.stall_verdict_age!==undefined&&s.idle_seconds>900){
         const _va=Math.floor(s.stall_verdict_age);
         txt.textContent+=` — 已 ${Math.floor(s.idle_seconds/60)}m 無輸出，但 watchdog 判定未卡死（${_va}s 前的判定）`;
