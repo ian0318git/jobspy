@@ -146,7 +146,9 @@ for _p in (_tmp_a, _tmp_b, _tmp_c, _tmp_d, f.name):
     os.unlink(_p)
 
 print("""
-※ 讀法：read_ok=False ⟺ 偵測水位之後一個本輪的位元組都沒被讀到 ⟺ (c) 會拒絕。
+※ 讀法（前提：idle 已超過門檻、runtime 可判定 —— 這兩道在 _stall_gate_refusal()
+  裡都排在 (c) 之前；少了這個前提，「落到 (c)」就不成立）：
+    read_ok=False ⟺ 偵測水位之後一個本輪的位元組都沒被讀到 ⟺ 閘門回 (c)。
   A（非窗口）=False、B（窗口內）=True、C（窗口內）=False、D=True、E=True
   ⇒ 窗口【既非充分也非必要】。「會落 (c)」不是窗口的性質，是 read_ok 的性質。
 """)
