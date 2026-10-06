@@ -7,7 +7,7 @@
 
   | suite | 生產檔 | 測試檔 | 變異數 |
   |---|---|---|---|
-  | `scan` | `job_board.py` | `tests/test_scan_lock.py` | 48 |
+  | `scan` | `job_board.py` | `tests/test_scan_lock.py` | 52 |
   | `location-filter` | `linkedin_job_search.py` | `tests/test_location_filter.py` | 5 |
   | `location-seek` | `jobspy/seek/__init__.py` | `tests/test_location_filter.py` | 3 |
 
