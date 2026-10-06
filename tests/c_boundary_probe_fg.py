@@ -41,7 +41,11 @@ def die(msg):
 # 送出真的 SIGKILL」—— 那個因果不成立（見該檔的完整推導）。這裡的理由同樣是
 # **保護讀數**：watcher 執行緒每 5 秒會 _external_begin() / _external_pump()，
 # 把 _EXTERNAL 換成【真的那一輪】的內容，跟這個腳本自己指的暫存檔互相汙染。
-# 排程那道理由仍然成立（閘門若被打開且種子逾期，子行程真的會去掃描）。
+# 排程那道檢查是**保守的、預設組態下擋不到東西**（第十六輪 NIT-1 補正）：排程執行緒
+# 只在 `JOB_BOARD_INTERNAL_SCHEDULER=1` 時才跑（預設 `"0"`，job_board.py:83；停用時
+# `scheduler_loop()` 直接 return，每次執行都會印 `[scheduler] … DISABLED`），而且
+# 面板端也拒絕把 `enabled` 重新武裝（job_board.py:2204）。它擋的是「有人手改
+# `.job_board_schedule.json` **又**開了內部排程器」那個組合 —— 留著是保守，不是防線。
 _state_p = REPO / "logs/search_state.json"
 _sched_p = REPO / ".job_board_schedule.json"
 if _state_p.exists():
