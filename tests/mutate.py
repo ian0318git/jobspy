@@ -540,7 +540,12 @@ MUTATIONS = [
      lambda t: sub_once(
          t,
          '    if r.returncode != 0:\n'
-         '        _log(f"[watchdog] 查詢 jobscan.service 狀態失敗（exit={r.returncode}），不接手")\n'
+         # ⚠️ 這一行的措辭在第十二輪被 MINOR-2 改掉了（「不接手」→「無法確認 unit
+         # 在不在跑」）。錨點跟著改 —— 沒跟到的話 harness 會報 ANCHOR-FAIL
+         # （「錨點出現 0 次」），也就是「這一條變異根本沒被套用」。
+         # 第十二輪第一次跑就是這樣抓到的。
+         '        _log(f"[watchdog] 查詢 jobscan.service 狀態失敗（exit={r.returncode}），"\n'
+         '             f"無法確認 unit 在不在跑")\n'
          '        return None, None\n',
          '',
          "M45")),
